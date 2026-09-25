@@ -1,0 +1,823 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>节点画布 - Dola Pool</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a0c0d;color:#e7eeee;overflow:hidden;height:100vh}
+
+/* 顶部工具栏 */
+.topbar{position:fixed;top:0;left:0;right:0;height:48px;background:rgba(20,25,28,0.95);backdrop-filter:blur(10px);border-bottom:1px solid rgba(48,59,62,0.5);display:flex;align-items:center;padding:0 16px;z-index:1000;gap:12px}
+.topbar h1{font-size:16px;color:#fff;margin:0}
+.topbar .spacer{flex:1}
+.topbar button{padding:6px 14px;background:#078d78;color:#fff;border:0;border-radius:4px;cursor:pointer;font-size:13px}
+.topbar button:hover{background:#0ca58c}
+.topbar button.secondary{background:#2a3538;color:#b8c9cc}
+.topbar button.danger{background:#4a2428;color:#ff9b98}
+.topbar .zoom-info{font-size:12px;color:#7a8a8d;min-width:60px;text-align:center}
+
+/* 左侧节点面板 */
+.node-panel{position:fixed;top:48px;left:0;bottom:0;width:200px;background:rgba(15,20,22,0.95);backdrop-filter:blur(10px);border-right:1px solid rgba(48,59,62,0.5);padding:12px;overflow-y:auto;z-index:999}
+.node-panel h3{font-size:12px;color:#7a8a8d;margin-bottom:8px;text-transform:uppercase;letter-spacing:1px}
+.node-item{padding:10px 12px;background:rgba(27,32,33,0.8);border:1px solid rgba(48,59,62,0.5);border-radius:6px;margin-bottom:8px;cursor:grab;transition:all .2s;user-select:none}
+.node-item:hover{border-color:#078d78;background:rgba(7,141,120,0.1)}
+.node-item:active{cursor:grabbing}
+.node-item .icon{font-size:18px;margin-bottom:4px}
+.node-item .name{font-size:13px;color:#e7eeee;font-weight:500}
+.node-item .desc{font-size:11px;color:#7a8a8d;margin-top:2px}
+
+/* 画布 */
+.canvas-container{position:fixed;top:48px;left:200px;right:0;bottom:0;overflow:hidden;cursor:grab}
+.canvas-container.panning{cursor:grabbing}
+.canvas-grid{position:absolute;top:0;left:0;width:100%;height:100%;background-image:radial-gradient(circle,rgba(48,59,62,0.3) 1px,transparent 1px);background-size:20px 20px;pointer-events:none}
+.canvas-world{position:absolute;top:0;left:0;transform-origin:0 0}
+
+/* 节点 */
+.node{position:absolute;min-width:180px;background:rgba(27,32,33,0.95);backdrop-filter:blur(10px);border:1px solid rgba(48,59,62,0.5);border-radius:8px;box-shadow:0 4px 20px rgba(0,0,0,0.3);user-select:none;z-index:10}
+.node.selected{border-color:#078d78;box-shadow:0 0 0 2px rgba(7,141,120,0.3),0 4px 20px rgba(0,0,0,0.3)}
+.node.executing{border-color:#f5a623;animation:pulse 1s infinite}
+.node.success{border-color:#078d78}
+.node.error{border-color:#ff6b6b}
+@keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(245,166,35,0.4)}50%{box-shadow:0 0 0 8px rgba(245,166,35,0)}}
+
+.node-header{padding:10px 12px;border-bottom:1px solid rgba(48,59,62,0.5);cursor:move;display:flex;align-items:center;gap:8px;border-radius:8px 8px 0 0}
+.node-header .icon{font-size:16px}
+.node-header .title{font-size:13px;font-weight:600;color:#fff;flex:1}
+.node-header .delete{color:#7a8a8d;cursor:pointer;font-size:16px;line-height:1}
+.node-header .delete:hover{color:#ff6b6b}
+
+.node-body{padding:12px}
+.node-body textarea,.node-body input,.node-body select{width:100%;background:#111415;border:1px solid #3a484b;color:#e7eeee;border-radius:4px;padding:6px 8px;font-size:12px;font-family:inherit;margin-bottom:8px;resize:vertical}
+.node-body textarea{min-height:60px}
+.node-body label{font-size:11px;color:#9aabad;display:block;margin-bottom:4px}
+.node-body .preview{width:100%;height:80px;background:#0a0c0d;border:1px dashed #3a484b;border-radius:4px;display:flex;align-items:center;justify-content:center;cursor:pointer;margin-bottom:8px;overflow:hidden}
+.node-body .preview img{max-width:100%;max-height:100%;object-fit:cover}
+.node-body .preview span{font-size:11px;color:#5a6a6d}
+.node-body .status{font-size:11px;padding:6px 8px;border-radius:4px;margin-top:8px}
+.node-body .status.running{background:rgba(245,166,35,0.15);color:#f5a623}
+.node-body .status.success{background:rgba(7,141,120,0.15);color:#078d78}
+.node-body .status.error{background:rgba(255,107,107,0.15);color:#ff6b6b}
+
+/* 端口 */
+.port{position:absolute;width:14px;height:14px;background:#2a3538;border:2px solid #5a6a6d;border-radius:50%;cursor:crosshair;z-index:20;transition:all .2s}
+.port:hover{background:#078d78;border-color:#078d78;transform:scale(1.3)}
+.port.input{left:-7px}
+.port.output{right:-7px}
+.port.connected{background:#078d78;border-color:#078d78}
+
+/* 连线SVG */
+.connections-svg{position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:5;overflow:visible}
+.connections-svg path{fill:none;stroke:#3a484b;stroke-width:2;pointer-events:stroke;cursor:pointer}
+.connections-svg path:hover{stroke:#ff6b6b}
+.connections-svg path.active{stroke:#078d78;stroke-width:3}
+.connections-svg path.temp{stroke:#f5a623;stroke-dasharray:5,5}
+
+/* 右侧属性面板 */
+.props-panel{position:fixed;top:48px;right:0;bottom:0;width:260px;background:rgba(15,20,22,0.95);backdrop-filter:blur(10px);border-left:1px solid rgba(48,59,62,0.5);padding:16px;overflow-y:auto;z-index:999;display:none}
+.props-panel.show{display:block}
+.props-panel h3{font-size:14px;color:#fff;margin-bottom:12px}
+.props-panel label{font-size:12px;color:#9aabad;display:block;margin-bottom:4px;margin-top:10px}
+.props-panel input,.props-panel select,.props-panel textarea{width:100%;background:#111415;border:1px solid #3a484b;color:#e7eeee;border-radius:4px;padding:8px;font-size:12px}
+
+/* 提示 */
+.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#078d78;color:#fff;padding:10px 20px;border-radius:6px;z-index:2000;opacity:0;transition:opacity .3s;pointer-events:none}
+.toast.show{opacity:1}
+
+/* 帮助提示 */
+.help-hint{position:fixed;bottom:16px;left:216px;font-size:11px;color:#5a6a6d;z-index:998;pointer-events:none}
+</style>
+</head>
+<body>
+
+<!-- 顶部工具栏 -->
+<div class="topbar">
+    <h1>⚡ 节点画布</h1>
+    <button class="secondary" onclick="location.href='/'">← 返回</button>
+    <div class="spacer"></div>
+    <button class="secondary" onclick="saveWorkflow()">💾 保存</button>
+    <button class="secondary" onclick="loadWorkflow()">📂 加载</button>
+    <button class="danger" onclick="clearCanvas()">🗑 清空</button>
+    <button onclick="executeWorkflow()" style="background:#078d78">▶ 执行工作流</button>
+    <button class="secondary" onclick="zoomReset()">100%</button>
+    <span class="zoom-info" id="zoomInfo">100%</span>
+</div>
+
+<!-- 左侧节点面板 -->
+<div class="node-panel">
+    <h3>输入节点</h3>
+    <div class="node-item" draggable="true" data-type="text_input">
+        <div class="icon">📝</div>
+        <div class="name">文本输入</div>
+        <div class="desc">输入分镜原文/剧本</div>
+    </div>
+    <div class="node-item" draggable="true" data-type="image_input">
+        <div class="icon">🖼️</div>
+        <div class="name">图片输入</div>
+        <div class="desc">上传参考图</div>
+    </div>
+    <div class="node-item" draggable="true" data-type="asset_ref">
+        <div class="icon">📦</div>
+        <div class="name">资产引用</div>
+        <div class="desc">从资产库选择</div>
+    </div>
+    
+    <h3>处理节点</h3>
+    <div class="node-item" draggable="true" data-type="ai_reason">
+        <div class="icon">🤖</div>
+        <div class="name">AI推理</div>
+        <div class="desc">Agens AI推理提示词</div>
+    </div>
+    <div class="node-item" draggable="true" data-type="merge">
+        <div class="icon">🔗</div>
+        <div class="name">合并节点</div>
+        <div class="desc">合并提示词+参考图</div>
+    </div>
+    
+    <h3>输出节点</h3>
+    <div class="node-item" draggable="true" data-type="video_gen">
+        <div class="icon">🎬</div>
+        <div class="name">视频生成</div>
+        <div class="desc">Dola API生成视频</div>
+    </div>
+</div>
+
+<!-- 画布 -->
+<div class="canvas-container" id="canvasContainer">
+    <div class="canvas-grid"></div>
+    <div class="canvas-world" id="canvasWorld">
+        <svg class="connections-svg" id="connectionsSvg"></svg>
+    </div>
+</div>
+
+<!-- 右侧属性面板 -->
+<div class="props-panel" id="propsPanel">
+    <h3 id="propsTitle">节点属性</h3>
+    <div id="propsContent"></div>
+</div>
+
+<!-- 提示 -->
+<div class="toast" id="toast"></div>
+
+<!-- 帮助提示 -->
+<div class="help-hint">空格+拖拽=平移画布 | 滚轮=缩放 | Delete=删除选中 | 从端口拖拽=连线</div>
+
+<script>
+// ==================== 全局状态 ====================
+let nodes = [];
+let connections = [];
+let selectedNode = null;
+let selectedConnection = null;
+let zoom = 1;
+let panX = 0, panY = 0;
+let isPanning = false;
+let panStartX = 0, panStartY = 0;
+let isDraggingNode = false;
+let dragNode = null;
+let dragOffsetX = 0, dragOffsetY = 0;
+let isConnecting = false;
+let connectFrom = null;
+let tempLine = null;
+let nodeIdCounter = 1;
+
+const canvasContainer = document.getElementById('canvasContainer');
+const canvasWorld = document.getElementById('canvasWorld');
+const connectionsSvg = document.getElementById('connectionsSvg');
+
+// ==================== 节点类型定义 ====================
+const NODE_TYPES = {
+    text_input: {
+        name: '文本输入', icon: '📝', color: '#6366f1',
+        inputs: [], outputs: ['text'],
+        create: () => ({ text: '' })
+    },
+    image_input: {
+        name: '图片输入', icon: '🖼️', color: '#ec4899',
+        inputs: [], outputs: ['image'],
+        create: () => ({ image: '' })
+    },
+    asset_ref: {
+        name: '资产引用', icon: '📦', color: '#8b5cf6',
+        inputs: [], outputs: ['image'],
+        create: () => ({ asset_id: '', image: '' })
+    },
+    ai_reason: {
+        name: 'AI推理', icon: '🤖', color: '#078d78',
+        inputs: ['text', 'image'], outputs: ['prompt'],
+        create: () => ({ prompt: '', style: 'cinematic movie quality' })
+    },
+    merge: {
+        name: '合并节点', icon: '🔗', color: '#f59e0b',
+        inputs: ['prompt', 'image'], outputs: ['output'],
+        create: () => ({})
+    },
+    video_gen: {
+        name: '视频生成', icon: '🎬', color: '#ef4444',
+        inputs: ['input'], outputs: ['video'],
+        create: () => ({ model: 'sd2.5', duration: 30, ratio: '9:16', result: '' })
+    }
+};
+
+// ==================== 画布变换 ====================
+function updateTransform() {
+    canvasWorld.style.transform = `translate(${panX}px, ${panY}px) scale(${zoom})`;
+    document.getElementById('zoomInfo').textContent = Math.round(zoom * 100) + '%';
+}
+
+function zoomReset() { zoom = 1; panX = 0; panY = 0; updateTransform(); }
+
+// 滚轮缩放
+canvasContainer.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const delta = e.deltaY > 0 ? 0.9 : 1.1;
+    const newZoom = Math.max(0.2, Math.min(3, zoom * delta));
+    const rect = canvasContainer.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    panX = mx - (mx - panX) * (newZoom / zoom);
+    panY = my - (my - panY) * (newZoom / zoom);
+    zoom = newZoom;
+    updateTransform();
+});
+
+// 空格+拖拽平移
+let spacePressed = false;
+document.addEventListener('keydown', (e) => {
+    if (e.code === 'Space') { spacePressed = true; canvasContainer.style.cursor = 'grab'; }
+    if (e.code === 'Delete' || e.code === 'Backspace') {
+        if (selectedNode) { deleteNode(selectedNode.id); }
+        else if (selectedConnection) { deleteConnection(selectedConnection.id); }
+    }
+});
+document.addEventListener('keyup', (e) => {
+    if (e.code === 'Space') { spacePressed = false; canvasContainer.style.cursor = 'default'; }
+});
+
+canvasContainer.addEventListener('mousedown', (e) => {
+    if (e.target === canvasContainer || e.target.classList.contains('canvas-grid') || e.target === canvasWorld || spacePressed) {
+        isPanning = true;
+        panStartX = e.clientX - panX;
+        panStartY = e.clientY - panY;
+        canvasContainer.classList.add('panning');
+        deselectAll();
+    }
+});
+
+document.addEventListener('mousemove', (e) => {
+    if (isPanning) {
+        panX = e.clientX - panStartX;
+        panY = e.clientY - panStartY;
+        updateTransform();
+    }
+    if (isDraggingNode && dragNode) {
+        const rect = canvasContainer.getBoundingClientRect();
+        dragNode.x = (e.clientX - rect.left - panX) / zoom - dragOffsetX;
+        dragNode.y = (e.clientY - rect.top - panY) / zoom - dragOffsetY;
+        updateNodePosition(dragNode);
+        updateConnections();
+    }
+    if (isConnecting && tempLine) {
+        const rect = canvasContainer.getBoundingClientRect();
+        const x = (e.clientX - rect.left - panX) / zoom;
+        const y = (e.clientY - rect.top - panY) / zoom;
+        updateTempLine(x, y);
+    }
+});
+
+document.addEventListener('mouseup', () => {
+    isPanning = false;
+    canvasContainer.classList.remove('panning');
+    isDraggingNode = false;
+    dragNode = null;
+    if (isConnecting) {
+        isConnecting = false;
+        if (tempLine) { tempLine.remove(); tempLine = null; }
+        connectFrom = null;
+    }
+});
+
+// ==================== 节点拖拽创建 ====================
+document.querySelectorAll('.node-item').forEach(item => {
+    item.addEventListener('dragstart', (e) => {
+        e.dataTransfer.setData('nodeType', item.dataset.type);
+    });
+});
+
+canvasContainer.addEventListener('dragover', (e) => { e.preventDefault(); });
+canvasContainer.addEventListener('drop', (e) => {
+    e.preventDefault();
+    const type = e.dataTransfer.getData('nodeType');
+    if (!type) return;
+    const rect = canvasContainer.getBoundingClientRect();
+    const x = (e.clientX - rect.left - panX) / zoom;
+    const y = (e.clientY - rect.top - panY) / zoom;
+    createNode(type, x, y);
+});
+
+// ==================== 节点操作 ====================
+function createNode(type, x, y) {
+    const typeDef = NODE_TYPES[type];
+    if (!typeDef) return;
+    const node = {
+        id: 'node_' + (nodeIdCounter++),
+        type: type,
+        x: x, y: y,
+        data: typeDef.create()
+    };
+    nodes.push(node);
+    renderNode(node);
+    selectNode(node.id);
+    return node;
+}
+
+function renderNode(node) {
+    const typeDef = NODE_TYPES[node.type];
+    const el = document.createElement('div');
+    el.className = 'node';
+    el.id = node.id;
+    el.style.left = node.x + 'px';
+    el.style.top = node.y + 'px';
+    
+    // 输入端口
+    let inputPorts = '';
+    typeDef.inputs.forEach((port, i) => {
+        const top = 50 + i * 30;
+        inputPorts += `<div class="port input" data-node="${node.id}" data-port="${port}" data-type="input" style="top:${top}px"></div>`;
+    });
+    
+    // 输出端口
+    let outputPorts = '';
+    typeDef.outputs.forEach((port, i) => {
+        const top = 50 + i * 30;
+        outputPorts += `<div class="port output" data-node="${node.id}" data-port="${port}" data-type="output" style="top:${top}px"></div>`;
+    });
+    
+    // 节点内容
+    let bodyContent = '';
+    if (node.type === 'text_input') {
+        bodyContent = `<label>分镜原文</label><textarea placeholder="输入这个镜头的原始分镜文案..." onchange="updateNodeData('${node.id}','text',this.value)">${node.data.text || ''}</textarea>`;
+    } else if (node.type === 'image_input') {
+        bodyContent = `<div class="preview" onclick="document.getElementById('img_${node.id}').click()">${node.data.image ? `<img src="${node.data.image}">` : '<span>点击上传图片</span>'}</div><input type="file" id="img_${node.id}" accept="image/*" style="display:none" onchange="uploadNodeImage('${node.id}',this.files[0])">`;
+    } else if (node.type === 'asset_ref') {
+        bodyContent = `<label>选择资产</label><select onchange="selectAsset('${node.id}',this.value)"><option value="">请选择...</option></select><div class="preview" id="asset_preview_${node.id}"><span>未选择资产</span></div>`;
+        loadAssetsForNode(node.id);
+    } else if (node.type === 'ai_reason') {
+        bodyContent = `<label>推理风格</label><input value="${node.data.style || ''}" onchange="updateNodeData('${node.id}','style',this.value)"><label>生成的提示词</label><textarea readonly placeholder="连接文本输入后点执行..." style="min-height:80px">${node.data.prompt || ''}</textarea>`;
+    } else if (node.type === 'merge') {
+        bodyContent = `<div style="text-align:center;color:#7a8a8d;padding:20px">🔗 自动合并<br><span style="font-size:11px">提示词 + 参考图</span></div>`;
+    } else if (node.type === 'video_gen') {
+        bodyContent = `
+            <label>模型</label>
+            <select onchange="updateNodeData('${node.id}','model',this.value)">
+                <option value="sd2.5" ${node.data.model==='sd2.5'?'selected':''}>官方sd2.5-30秒</option>
+                <option value="sd2.0" ${node.data.model==='sd2.0'?'selected':''}>sd2.0-15秒</option>
+                <option value="sd2.0_10" ${node.data.model==='sd2.0_10'?'selected':''}>sd2.0-10秒</option>
+            </select>
+            <label>比例</label>
+            <select onchange="updateNodeData('${node.id}','ratio',this.value)">
+                <option value="9:16" ${node.data.ratio==='9:16'?'selected':''}>9:16 竖屏</option>
+                <option value="16:9" ${node.data.ratio==='16:9'?'selected':''}>16:9 横屏</option>
+                <option value="1:1" ${node.data.ratio==='1:1'?'selected':''}>1:1 方形</option>
+            </select>
+            <div id="status_${node.id}"></div>`;
+    }
+    
+    el.innerHTML = `
+        <div class="node-header" style="border-left:3px solid ${typeDef.color}">
+            <span class="icon">${typeDef.icon}</span>
+            <span class="title">${typeDef.name}</span>
+            <span class="delete" onclick="deleteNode('${node.id}')">×</span>
+        </div>
+        <div class="node-body">${bodyContent}</div>
+        ${inputPorts}
+        ${outputPorts}
+    `;
+    
+    canvasWorld.appendChild(el);
+    
+    // 节点拖拽
+    el.querySelector('.node-header').addEventListener('mousedown', (e) => {
+        if (e.target.classList.contains('delete')) return;
+        isDraggingNode = true;
+        dragNode = node;
+        const rect = canvasContainer.getBoundingClientRect();
+        dragOffsetX = (e.clientX - rect.left - panX) / zoom - node.x;
+        dragOffsetY = (e.clientY - rect.top - panY) / zoom - node.y;
+        selectNode(node.id);
+        e.stopPropagation();
+    });
+    
+    // 端口连线
+    el.querySelectorAll('.port').forEach(port => {
+        port.addEventListener('mousedown', (e) => {
+            e.stopPropagation();
+            if (port.dataset.type === 'output') {
+                isConnecting = true;
+                connectFrom = { nodeId: node.id, port: port.dataset.port, type: 'output' };
+                const pos = getPortPosition(node.id, port.dataset.port, 'output');
+                tempLine = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+                tempLine.classList.add('temp');
+                connectionsSvg.appendChild(tempLine);
+                updateTempLine(pos.x, pos.y);
+            }
+        });
+        port.addEventListener('mouseup', (e) => {
+            e.stopPropagation();
+            if (isConnecting && connectFrom && port.dataset.type === 'input') {
+                createConnection(connectFrom.nodeId, connectFrom.port, node.id, port.dataset.port);
+            }
+            if (isConnecting && tempLine) { tempLine.remove(); tempLine = null; }
+            isConnecting = false;
+            connectFrom = null;
+        });
+    });
+    
+    // 点击选中
+    el.addEventListener('click', (e) => {
+        if (!e.target.classList.contains('delete') && !e.target.classList.contains('port')) {
+            selectNode(node.id);
+        }
+    });
+}
+
+function updateNodePosition(node) {
+    const el = document.getElementById(node.id);
+    if (el) { el.style.left = node.x + 'px'; el.style.top = node.y + 'px'; }
+}
+
+function updateNodeData(nodeId, key, value) {
+    const node = nodes.find(n => n.id === nodeId);
+    if (node) { node.data[key] = value; }
+}
+
+function deleteNode(nodeId) {
+    nodes = nodes.filter(n => n.id !== nodeId);
+    connections = connections.filter(c => c.from_node !== nodeId && c.to_node !== nodeId);
+    const el = document.getElementById(nodeId);
+    if (el) el.remove();
+    if (selectedNode === nodeId) selectedNode = null;
+    updateConnections();
+    hideProps();
+    toast('节点已删除');
+}
+
+function selectNode(nodeId) {
+    deselectAll();
+    selectedNode = nodeId;
+    const el = document.getElementById(nodeId);
+    if (el) el.classList.add('selected');
+    showProps(nodeId);
+}
+
+function deselectAll() {
+    selectedNode = null;
+    selectedConnection = null;
+    document.querySelectorAll('.node.selected').forEach(el => el.classList.remove('selected'));
+    document.querySelectorAll('.connections-svg path.active').forEach(el => el.classList.remove('active'));
+    hideProps();
+}
+
+// ==================== 连线操作 ====================
+function createConnection(fromNode, fromPort, toNode, toPort) {
+    if (fromNode === toNode) return;
+    const exists = connections.find(c => c.from_node === fromNode && c.from_port === fromPort && c.to_node === toNode && c.to_port === toPort);
+    if (exists) return;
+    const conn = { id: 'conn_' + Date.now(), from_node: fromNode, from_port: fromPort, to_node: toNode, to_port: toPort };
+    connections.push(conn);
+    updateConnections();
+    toast('已连接');
+}
+
+function deleteConnection(connId) {
+    connections = connections.filter(c => c.id !== connId);
+    updateConnections();
+    selectedConnection = null;
+}
+
+function getPortPosition(nodeId, portName, portType) {
+    const node = nodes.find(n => n.id === nodeId);
+    if (!node) return { x: 0, y: 0 };
+    const typeDef = NODE_TYPES[node.type];
+    const ports = portType === 'input' ? typeDef.inputs : typeDef.outputs;
+    const idx = ports.indexOf(portName);
+    return { x: node.x + (portType === 'input' ? 0 : 180), y: node.y + 50 + idx * 30 + 7 };
+}
+
+function updateConnections() {
+    connectionsSvg.innerHTML = '';
+    connections.forEach(conn => {
+        const from = getPortPosition(conn.from_node, conn.from_port, 'output');
+        const to = getPortPosition(conn.to_node, conn.to_port, 'input');
+        const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+        const dx = Math.abs(to.x - from.x) * 0.5;
+        path.setAttribute('d', `M ${from.x} ${from.y} C ${from.x + dx} ${from.y}, ${to.x - dx} ${to.y}, ${to.x} ${to.y}`);
+        path.dataset.id = conn.id;
+        if (selectedConnection === conn.id) path.classList.add('active');
+        path.addEventListener('click', () => {
+            selectedConnection = conn.id;
+            updateConnections();
+        });
+        connectionsSvg.appendChild(path);
+    });
+    
+    // 更新端口连接状态
+    document.querySelectorAll('.port').forEach(port => {
+        port.classList.remove('connected');
+        const nodeId = port.dataset.node;
+        const portName = port.dataset.port;
+        const portType = port.dataset.type;
+        const connected = connections.some(c => 
+            (portType === 'output' && c.from_node === nodeId && c.from_port === portName) ||
+            (portType === 'input' && c.to_node === nodeId && c.to_port === portName)
+        );
+        if (connected) port.classList.add('connected');
+    });
+}
+
+function updateTempLine(x, y) {
+    if (!tempLine || !connectFrom) return;
+    const from = getPortPosition(connectFrom.nodeId, connectFrom.port, 'output');
+    const dx = Math.abs(x - from.x) * 0.5;
+    tempLine.setAttribute('d', `M ${from.x} ${from.y} C ${from.x + dx} ${from.y}, ${x - dx} ${y}, ${x} ${y}`);
+}
+
+// ==================== 属性面板 ====================
+function showProps(nodeId) {
+    const node = nodes.find(n => n.id === nodeId);
+    if (!node) return;
+    const typeDef = NODE_TYPES[node.type];
+    document.getElementById('propsTitle').textContent = typeDef.icon + ' ' + typeDef.name;
+    let html = `<label>节点ID</label><input value="${node.id}" readonly style="background:#0a0c0d">`;
+    html += `<label>X 位置</label><input type="number" value="${Math.round(node.x)}" onchange="moveNode('${node.id}','x',this.value)">`;
+    html += `<label>Y 位置</label><input type="number" value="${Math.round(node.y)}" onchange="moveNode('${node.id}','y',this.value)">`;
+    
+    if (node.type === 'video_gen') {
+        html += `<label>时长（秒）</label><input type="number" value="${node.data.duration || 30}" onchange="updateNodeData('${node.id}','duration',Number(this.value))">`;
+    }
+    
+    document.getElementById('propsContent').innerHTML = html;
+    document.getElementById('propsPanel').classList.add('show');
+}
+
+function hideProps() {
+    document.getElementById('propsPanel').classList.remove('show');
+}
+
+function moveNode(nodeId, axis, value) {
+    const node = nodes.find(n => n.id === nodeId);
+    if (node) { node[axis] = Number(value); updateNodePosition(node); updateConnections(); }
+}
+
+// ==================== 图片上传 ====================
+async function uploadNodeImage(nodeId, file) {
+    if (!file) return;
+    const fd = new FormData();
+    fd.append('file', file);
+    try {
+        const r = await fetch('/api/upload-image', { method: 'POST', body: fd });
+        const d = await r.json();
+        if (d.url) {
+            const node = nodes.find(n => n.id === nodeId);
+            if (node) {
+                node.data.image = d.url;
+                const preview = document.querySelector(`#${nodeId} .preview`);
+                if (preview) preview.innerHTML = `<img src="${d.url}">`;
+            }
+            toast('图片上传成功');
+        }
+    } catch (e) { toast('上传失败: ' + e.message); }
+}
+
+// ==================== 资产加载 ====================
+async function loadAssetsForNode(nodeId) {
+    try {
+        const r = await fetch('/api/assets');
+        const assets = await r.json();
+        const select = document.querySelector(`#${nodeId} select`);
+        if (select) {
+            assets.forEach(a => {
+                const opt = document.createElement('option');
+                opt.value = a.id;
+                opt.textContent = `[${a.type}] ${a.name}`;
+                select.appendChild(opt);
+            });
+        }
+    } catch (e) {}
+}
+
+function selectAsset(nodeId, assetId) {
+    if (!assetId) return;
+    fetch('/api/assets').then(r => r.json()).then(assets => {
+        const asset = assets.find(a => a.id == assetId);
+        if (asset) {
+            const node = nodes.find(n => n.id === nodeId);
+            if (node) {
+                node.data.asset_id = asset.id;
+                node.data.image = asset.path;
+                const preview = document.getElementById('asset_preview_' + nodeId);
+                if (preview) preview.innerHTML = `<img src="${asset.path}" style="max-width:100%;max-height:100%;object-fit:cover">`;
+            }
+        }
+    });
+}
+
+// ==================== 工作流执行 ====================
+async function executeWorkflow() {
+    toast('开始执行工作流...');
+    
+    // 拓扑排序
+    const sorted = topoSort();
+    if (!sorted) { toast('错误：检测到循环依赖'); return; }
+    
+    const nodeOutputs = {};
+    
+    for (const nodeId of sorted) {
+        const node = nodes.find(n => n.id === nodeId);
+        if (!node) continue;
+        
+        const el = document.getElementById(nodeId);
+        if (el) { el.classList.add('executing'); el.classList.remove('success', 'error'); }
+        
+        try {
+            const result = await executeNode(node, nodeOutputs);
+            nodeOutputs[nodeId] = result;
+            if (el) { el.classList.remove('executing'); el.classList.add('success'); }
+        } catch (e) {
+            if (el) { el.classList.remove('executing'); el.classList.add('error'); }
+            const statusEl = document.getElementById('status_' + nodeId);
+            if (statusEl) statusEl.innerHTML = `<div class="status error">❌ ${e.message}</div>`;
+            toast('执行失败: ' + e.message);
+            return;
+        }
+    }
+    
+    toast('✅ 工作流执行完成！');
+}
+
+function topoSort() {
+    const inDegree = {};
+    const adj = {};
+    nodes.forEach(n => { inDegree[n.id] = 0; adj[n.id] = []; });
+    connections.forEach(c => {
+        adj[c.from_node].push(c.to_node);
+        inDegree[c.to_node]++;
+    });
+    const queue = nodes.filter(n => inDegree[n.id] === 0).map(n => n.id);
+    const result = [];
+    while (queue.length) {
+        const id = queue.shift();
+        result.push(id);
+        adj[id].forEach(next => {
+            inDegree[next]--;
+            if (inDegree[next] === 0) queue.push(next);
+        });
+    }
+    return result.length === nodes.length ? result : null;
+}
+
+async function executeNode(node, nodeOutputs) {
+    const typeDef = NODE_TYPES[node.type];
+    
+    // 获取输入数据
+    const inputs = {};
+    typeDef.inputs.forEach(port => {
+        const conn = connections.find(c => c.to_node === node.id && c.to_port === port);
+        if (conn && nodeOutputs[conn.from_node]) {
+            inputs[port] = nodeOutputs[conn.from_node][conn.from_port];
+        }
+    });
+    
+    if (node.type === 'text_input') {
+        return { text: node.data.text || '' };
+    }
+    
+    if (node.type === 'image_input' || node.type === 'asset_ref') {
+        return { image: node.data.image || '' };
+    }
+    
+    if (node.type === 'ai_reason') {
+        const text = inputs.text || '';
+        const image = inputs.image || '';
+        if (!text) throw new Error('AI推理需要文本输入');
+        
+        const statusEl = document.getElementById('status_' + node.id);
+        if (statusEl) statusEl.innerHTML = `<div class="status running">🤖 AI推理中...</div>`;
+        
+        const r = await fetch('/api/ai-reason', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ script: text, style: node.data.style, image_url: image })
+        });
+        const d = await r.json();
+        if (d.error) throw new Error(d.error);
+        
+        node.data.prompt = d.prompt || d.result || '';
+        const textarea = document.querySelector(`#${node.id} textarea[readonly]`);
+        if (textarea) textarea.value = node.data.prompt;
+        
+        if (statusEl) statusEl.innerHTML = `<div class="status success">✅ 推理完成</div>`;
+        return { prompt: node.data.prompt };
+    }
+    
+    if (node.type === 'merge') {
+        return {
+            output: {
+                prompt: inputs.prompt || '',
+                image: inputs.image || ''
+            }
+        };
+    }
+    
+    if (node.type === 'video_gen') {
+        const inputData = inputs.input || {};
+        const prompt = inputData.prompt || '';
+        const image = inputData.image || '';
+        
+        if (!prompt) throw new Error('视频生成需要提示词输入');
+        
+        const statusEl = document.getElementById('status_' + node.id);
+        if (statusEl) statusEl.innerHTML = `<div class="status running">🎬 生成视频中...（可能需要几分钟）</div>`;
+        
+        const model = node.data.model === 'sd2.5' ? 'seedance_v2.5' : 'seedance_v2.0';
+        const duration = node.data.model === 'sd2.0_10' ? 10 : (node.data.model === 'sd2.0' ? 15 : 30);
+        
+        const r = await fetch('/api/tasks', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                prompt: prompt,
+                model: model,
+                duration: duration,
+                ratio: node.data.ratio || '9:16',
+                ref_images: image
+            })
+        });
+        const d = await r.json();
+        if (d.error) throw new Error(d.error);
+        
+        node.data.result = d.id || '已提交';
+        if (statusEl) statusEl.innerHTML = `<div class="status success">✅ 任务已提交（ID: ${d.id}）<br>在任务页面查看进度</div>`;
+        
+        return { video: d.id };
+    }
+    
+    return {};
+}
+
+// ==================== 保存/加载 ====================
+function saveWorkflow() {
+    const data = { nodes: nodes, connections: connections, zoom: zoom, panX: panX, panY: panY };
+    localStorage.setItem('dola_node_workflow', JSON.stringify(data));
+    toast('工作流已保存到本地');
+}
+
+function loadWorkflow() {
+    const data = localStorage.getItem('dola_node_workflow');
+    if (!data) { toast('没有保存的工作流'); return; }
+    try {
+        const wf = JSON.parse(data);
+        clearCanvas(false);
+        wf.nodes.forEach(n => {
+            nodes.push(n);
+            renderNode(n);
+            if (n.id.includes('node_')) {
+                const num = parseInt(n.id.split('_')[1]);
+                if (num >= nodeIdCounter) nodeIdCounter = num + 1;
+            }
+        });
+        connections = wf.connections;
+        zoom = wf.zoom || 1;
+        panX = wf.panX || 0;
+        panY = wf.panY || 0;
+        updateTransform();
+        updateConnections();
+        toast('工作流已加载');
+    } catch (e) { toast('加载失败: ' + e.message); }
+}
+
+function clearCanvas(confirm = true) {
+    if (confirm && !confirm('确定清空画布？')) return;
+    nodes = [];
+    connections = [];
+    document.querySelectorAll('.node').forEach(el => el.remove());
+    connectionsSvg.innerHTML = '';
+    selectedNode = null;
+    hideProps();
+    if (confirm) toast('画布已清空');
+}
+
+// ==================== 工具函数 ====================
+function toast(msg) {
+    const t = document.getElementById('toast');
+    t.textContent = msg;
+    t.classList.add('show');
+    setTimeout(() => t.classList.remove('show'), 2500);
+}
+
+// 初始化
+updateTransform();
+toast('从左侧拖拽节点到画布，连接端口后点执行');
+</script>
+</body>
+</html>
