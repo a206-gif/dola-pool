@@ -44,6 +44,38 @@ HIDDEN = [
 ]
 
 
+def preflight() -> None:
+    """打包前的环境自检：把常见的失败原因提前说清楚。"""
+    problems = []
+    if platform.system() == "Linux":
+        import sysconfig
+        libdir = sysconfig.get_config_var("LIBDIR") or ""
+        ver = "%d.%d" % sys.version_info[:2]
+        candidates = [os.path.join(libdir, "libpython%s.so.1.0" % ver),
+                      os.path.join(libdir, "libpython%s.so" % ver)]
+        if sysconfig.get_config_var("Py_ENABLE_SHARED") and not any(os.path.exists(p) for p in candidates):
+            problems.append(
+                "当前 Python 缺少 libpython%s.so（Debian/Ubuntu 的系统 Python 常见）。\n"
+                "    解决办法二选一：\n"
+                "      · 安装共享库： sudo apt install libpython%s\n"
+                "      · 或换用官方安装包 / pyenv / conda 的 Python 再打包" % (ver, ver))
+    try:
+        import PyInstaller  # noqa: F401
+    except ImportError:
+        problems.append("缺少 PyInstaller，请先执行： pip install pyinstaller")
+    try:
+        import webview  # noqa: F401
+    except ImportError:
+        problems.append("缺少 pywebview，请先执行： pip install -r requirements-desktop.txt")
+
+    if problems:
+        print("[build] ⚠ 打包前自检发现问题：", flush=True)
+        for p in problems:
+            print("    · " + p, flush=True)
+        print("[build] 提示：也可以在 GitHub 上用 .github/workflows/build-desktop.yml 云端打包，"
+              "无需本地环境。", flush=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="打包 Dola Pool 桌面版")
     parser.add_argument("--onefile", action="store_true", help="生成单文件版本")
@@ -51,6 +83,7 @@ def main() -> int:
     parser.add_argument("--name", default=NAME, help="产物名称")
     args = parser.parse_args()
 
+    preflight()
     if args.clean:
         for d in ("build", "dist"):
             shutil.rmtree(os.path.join(ROOT, d), ignore_errors=True)
@@ -87,8 +120,8 @@ def main() -> int:
         cmd += ["--osx-bundle-identifier", "com.dolapool.desktop"]
     cmd.append(ENTRY)
 
-    print("[build] 当前平台：%s / Python %s" % (platform.system(), platform.python_version()))
-    print("[build] 执行：PyInstaller …（首次打包约 1-3 分钟）")
+    print("[build] 当前平台：%s / Python %s" % (platform.system(), platform.python_version()), flush=True)
+    print("[build] 执行：PyInstaller …（首次打包约 1-3 分钟）", flush=True)
     proc = subprocess.run(cmd, cwd=ROOT)
     if proc.returncode != 0:
         print("[build] ❌ 打包失败，请检查上面的 PyInstaller 输出")

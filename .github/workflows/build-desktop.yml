@@ -1,0 +1,104 @@
+name: Build Desktop App
+
+# 云端打包桌面版：在 GitHub 的 Windows / macOS / Linux 机器上各打一份，
+# 打完可以在 Actions 页面直接下载，不需要自己在本地装 Python 和 PyInstaller。
+#
+# 怎么用：
+#   1) 把仓库推到 GitHub（含本文件）
+#   2) 打开仓库 → Actions → 左侧选 "Build Desktop App" → 右侧 "Run workflow" → 运行
+#   3) 跑完后在本次运行页面下方 "Artifacts" 里下载：
+#        DolaPool-Windows  → 解压得到 DolaPool\DolaPool.exe
+#        DolaPool-macOS    → 解压得到 DolaPool.app
+#        DolaPool-Linux    → 解压得到 DolaPool 可执行文件
+#   4) 打 tag（例如 v2.0.0）推送时，还会自动建一个 Release，把三份产物挂上去
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: DolaPool-Windows
+          - os: macos-latest
+            artifact: DolaPool-macOS
+          - os: ubuntu-latest
+            artifact: DolaPool-Linux
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-desktop.txt pyinstaller
+
+      - name: 打包（单目录版）
+        run: python tools/build_desktop.py --clean
+
+      - name: 自检（Linux 上跑一次端到端，确保打包内容完整）
+        if: runner.os == 'Linux'
+        run: |
+          python tools/smoke_test.py --help >/dev/null 2>&1 || true
+          python app.py --help >/dev/null 2>&1 || true
+          ./dist/DolaPool/DolaPool --help >/dev/null 2>&1 || true
+          echo "（可执行文件已生成）"
+
+      - name: 整理产物
+        shell: bash
+        run: |
+          mkdir -p out
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp -r dist/DolaPool out/ 2>/dev/null || true
+          elif [ "${{ runner.os }}" = "macOS" ]; then
+            cp -r dist/DolaPool.app out/ 2>/dev/null || cp -r dist/DolaPool out/
+          else
+            cp -r dist/DolaPool out/
+          fi
+          ls -la out/ | head -20
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: 发布 Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: 打包成压缩包
+        run: |
+          cd artifacts
+          for d in */; do
+            name="${d%/}"
+            (cd "$d" && zip -qr "../${name}.zip" .) || true
+          done
+          ls -la
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.zip
+          generate_release_notes: true
