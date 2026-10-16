@@ -406,7 +406,9 @@ class Control:
             if try_cookie:
                 # 先摆一个「正在准备」页，别让用户对着空白窗口猜
                 try:
-                    win.load_html(_WAIT_HTML, "")
+                    # 不传 base_uri：各后端默认值不同（Windows 忽略、macOS 拿它建
+                    # NSURL），让它用 pywebview 自己的默认更稳
+                    win.load_html(_WAIT_HTML)
                 except Exception as exc:  # noqa: BLE001
                     print(f"[desktop] 显示等待页失败（不影响后续）：{exc}")
                 # 把 Cookie 写进内核，再打开真正的 dola.com（放后台线程，

@@ -161,6 +161,7 @@ class FakePyWindow:
 
     def load_html(self, html, base_uri=None):
         self.html_shown = html
+        self.html_base = base_uri      # 期望 None：base_uri 各后端语义不同，别乱传
 
     def destroy(self):
         pass
@@ -242,6 +243,8 @@ def cookie_injection_checks():
         check("注入期间先显示「正在准备」页（不是空白窗口）",
               "正在用该账号的登录态打开" in (getattr(win, "html_shown", "") or ""),
               (getattr(win, "html_shown", "") or "")[:40])
+        check("要等待页时不给 pywebview 传 base_uri（macOS 会拿它建 NSURL）",
+              getattr(win, "html_base", "没调用") is None, getattr(win, "html_base", "没调用"))
         check("注入成功后才打开真实 dola.com（中间不停留在空白页）",
               win.loaded[:1] == ["https://www.dola.com/chat/"], win.loaded)
         check("标题栏标明走的是真站", win.title.endswith("· dola.com"), win.title)
