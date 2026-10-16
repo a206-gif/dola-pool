@@ -183,6 +183,115 @@ class _WebWindowApi:
 
 
 # --------------------------------------------------------------------------
+# 把账号 Cookie 直接写进浏览器内核（Windows / WebView2）
+#
+# 为什么要有这段：本地代理页虽然能把 Cookie 加在请求里，但地址是
+# http://127.0.0.1:端口/dola-web/2/chat/ —— Dola 前端按路径做路由，
+# 路径对不上就渲染成白屏。直接把 Cookie 写进内核的 Cookie 存储，
+# 就能打开**真正的 www.dola.com**，页面本身是官网，不存在改写问题。
+# --------------------------------------------------------------------------
+# 等内核就绪的最长时间（测试会把它调小）
+_INJECT_TIMEOUT = 15.0
+
+
+def _can_inject_cookies() -> bool:
+    """只有 Windows（Edge WebView2 后端）能直接写内核 Cookie 存储。"""
+    return platform.system() == "Windows"
+
+
+def _parse_cookie_pairs(raw: str) -> list:
+    """'a=1; b=2' -> [('a', '1'), ('b', '2')]"""
+    pairs = []
+    for part in (raw or "").split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        name, _, value = part.partition("=")
+        name = name.strip()
+        if name:
+            pairs.append((name, value.strip()))
+    return pairs
+
+
+def _ui_invoke(ctrl, fn) -> None:
+    """在浏览器内核的 UI 线程上执行 fn（WinForms 的控件只能从 UI 线程碰）。"""
+    from System import Func, Type  # pythonnet，Windows 上装 pywebview 时自带
+    ctrl.Invoke(Func[Type](fn))
+
+
+def _clr_ready() -> tuple:
+    """pythonnet（clr）是否可用 —— 只有 Windows 的 WebView2 后端才有。"""
+    try:
+        import clr  # noqa: F401
+        return True, ""
+    except Exception as exc:  # noqa: BLE001
+        return False, str(exc)
+
+
+def _webview2_core(window):
+    """返回 (控件, CoreWebView2)；拿不到就返回 None。"""
+    native = getattr(window, "native", None)
+    if native is None:
+        return None
+    for holder in (native, getattr(native, "browser", None)):
+        if holder is None:
+            continue
+        ctrl = getattr(holder, "webview", None)
+        core = getattr(ctrl, "CoreWebView2", None) if ctrl is not None else None
+        if core is not None:
+            return ctrl, core
+    return None
+
+
+def _inject_webview2_cookies(window, cookie: str, domain: str = ".dola.com",
+                             timeout: float = 15.0) -> tuple:
+    """等内核就绪后把 Cookie 写进去。返回 (是否成功, 说明)。"""
+    pairs = _parse_cookie_pairs(cookie)
+    if not pairs:
+        return False, "Cookie 为空"
+    ready, why = _clr_ready()
+    if not ready:  # 尽早失败：pythonnet 不在就说明不是 Windows/WebView2 后端
+        return False, "非 Windows 内核（%s）" % why
+
+    deadline = time.time() + max(0.0, timeout)
+    got = None
+    while True:
+        got = _webview2_core(window)
+        if got or time.time() >= deadline:
+            break
+        time.sleep(0.2)
+    if not got:
+        return False, "没等到浏览器内核就绪（拿不到 CoreWebView2）"
+    ctrl, core = got
+
+    state = {"done": False, "err": "", "count": 0}
+
+    def _write():
+        try:
+            manager = core.CookieManager
+            for name, value in pairs:
+                c = manager.CreateCookie(name, value, domain, "/")
+                for attr, val in (("IsHttpOnly", True), ("IsSecure", True)):
+                    try:
+                        setattr(c, attr, val)
+                    except Exception:  # noqa: BLE001
+                        pass
+                manager.AddOrUpdateCookie(c)
+                state["count"] += 1
+            state["done"] = True
+        except Exception as exc:  # noqa: BLE001
+            state["err"] = str(exc)
+
+    try:
+        _ui_invoke(ctrl, _write)
+    except Exception as exc:  # noqa: BLE001
+        return False, "写入时出错（%s）" % exc
+    if not state["done"]:
+        return False, "写入失败（%s）" % (state["err"] or "未知原因")
+    return True, "已写入 %d 个 Cookie（域 %s）" % (state["count"], domain)
+
+
+# --------------------------------------------------------------------------
 # 控制信号（切换运行模式 / 退出应用 / 打开账号网页窗口）
 # --------------------------------------------------------------------------
 class Control:
@@ -191,6 +300,7 @@ class Control:
         self.window = None
         self.base_url = ""          # 后端地址，main() 里设置，用于把 /dola-web/… 补成绝对地址
         self.web_windows = []       # 「打开账号网页」开出的窗口
+        self.web_account = None     # 当前账号网页窗口对应的账号 id（内核 Cookie 是共享的）
 
     def __call__(self, action: str, payload=None) -> None:
         """由后端接口触发。"""
@@ -220,6 +330,10 @@ class Control:
         if url.startswith("/"):
             url = (self.base_url or "").rstrip("/") + url
         title = str(payload.get("title") or "Dola 账号网页")
+        real = str(payload.get("real") or "").strip()          # 真实 dola.com 地址（可空）
+        cookie = str(payload.get("cookie") or "").strip()      # 该账号的 Cookie
+        domain = str(payload.get("domain") or "").strip() or ".dola.com"
+        account_id = payload.get("account_id")
         try:
             import webview
         except Exception as exc:  # noqa: BLE001
@@ -232,9 +346,18 @@ class Control:
             print("[desktop] 当前没有原生窗口环境，改用系统浏览器打开账号网页")
             _open_in_browser(url)
             return
+        # 浏览器内核的 Cookie 存储是所有窗口共用的：换账号时先把上一个账号窗口关掉，
+        # 否则两个窗口会互相顶掉登录态
+        if account_id is not None and self.web_account not in (None, account_id) and self.web_windows:
+            print("[desktop] 换了账号：先关掉上一个账号窗口（内核 Cookie 是共享的）")
+            self.close_web_windows()
+        if account_id is not None:
+            self.web_account = account_id
+        # 能注入 Cookie 就直接开真站；否则退回本机代理页
+        try_cookie = bool(real and cookie and _can_inject_cookies())
         try:
             win = webview.create_window(
-                title, url,
+                title, "about:blank" if try_cookie else url,
                 width=1180, height=860,
                 min_size=(720, 520),
                 text_select=True,
@@ -245,10 +368,44 @@ class Control:
                 win.events.closed += lambda: self.web_windows.remove(win) if win in self.web_windows else None
             except Exception:
                 pass
-            print(f"[desktop] 已打开账号网页窗口：{title}")
+            if try_cookie:
+                # 先把 Cookie 写进内核，再打开真正的 dola.com（写在后台线程里，
+                # 免得等内核就绪把接口调用卡住）
+                threading.Thread(
+                    target=self._finish_cookie_window,
+                    args=(win, url, real, cookie, domain, title),
+                    daemon=True,
+                ).start()
+            else:
+                print(f"[desktop] 已打开账号网页窗口（本机代理页）：{title}")
         except Exception as exc:  # noqa: BLE001
             print(f"[desktop] 打开账号网页窗口失败（{exc}），改用系统浏览器")
             _open_in_browser(url)
+
+    def _finish_cookie_window(self, win, proxy_url: str, real_url: str,
+                              cookie: str, domain: str, title: str) -> None:
+        """注入 Cookie 成功就打开真实 dola.com，失败就退回本机代理页。"""
+        ok, note = _inject_webview2_cookies(win, cookie, domain, timeout=_INJECT_TIMEOUT)
+        if ok:
+            print(f"[desktop] {note}；打开真实站点：{real_url}")
+            self._set_win_title(win, title + " · dola.com")
+            target = real_url
+        else:
+            print(f"[desktop] Cookie 注入不可用（{note}），改用本机代理页：{proxy_url}")
+            self._set_win_title(win, title + " · 本机代理页")
+            target = proxy_url
+        try:
+            win.load_url(target)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[desktop] 打开 {target} 失败：{exc}")
+
+    @staticmethod
+    def _set_win_title(win, text: str) -> None:
+        """标题栏写明用的是真站还是本机代理页，方便一眼看出走的哪条路。"""
+        try:
+            win.title = text
+        except Exception:  # noqa: BLE001
+            pass
 
     def close_web_windows(self) -> None:
         """主窗口关闭时把账号网页窗口一起收掉。

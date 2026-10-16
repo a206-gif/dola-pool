@@ -54,7 +54,7 @@ from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
                                RedirectResponse, Response)
 from fastapi.staticfiles import StaticFiles
 
-VERSION = "2.0.7"
+VERSION = "2.0.8"
 
 # --------------------------------------------------------------------------
 # 目录与配置
@@ -1985,6 +1985,24 @@ _PROXY_JS = r"""/* Dola Pool 本地代理：注入页面的运行时脚本（单
     var r = e && e.reason;
     report('errors', 'Promise 未捕获 ' + ((r && (r.message || r)) || ''));
   });
+  // 前端框架把渲染失败往往只写进 console.error（页面白屏但没有任何异常抛出），
+  // 所以这里也接一下，白屏时点 ⚠ 才看得到真正原因
+  try {
+    if (window.console && window.console.error) {
+      var _cerr = window.console.error;
+      window.console.error = function () {
+        try {
+          var parts = [];
+          for (var i = 0; i < arguments.length; i++) {
+            var a = arguments[i];
+            parts.push(a && a.message ? a.message : String(a));
+          }
+          report('errors', '控制台报错 ' + parts.join(' '));
+        } catch (e3) {}
+        return _cerr.apply(window.console, arguments);
+      };
+    }
+  } catch (e4) {}
 
   // ---------------------------------------------------------------- 网络拦截
   try {
@@ -2421,14 +2439,22 @@ def api_account_web(account_id: int):
         return JSONResponse({"error": "该账号没有可用的 Cookie，先补上再打开网页"}, 400)
     url = _proxy_prefix(account_id) + "/"
     title = "Dola · #%s %s" % (account_id, (account.get("name") or "").strip())
+    # 桌面版会把这串 Cookie 直接写进浏览器内核的 Cookie 存储，然后打开**真正的 dola.com** ——
+    # 官网页面本身不需要本机代理改写，也就不会出现「按路径路由渲染出白屏」的问题
+    host = urllib.parse.urlparse(DOLA_WEB_BASE).hostname or "www.dola.com"
+    bits = host.split(".")
+    cookie_domain = "." + ".".join(bits[-2:]) if len(bits) >= 2 else host
+    real = DOLA_WEB_BASE.rstrip("/") + (WEB_PROXY_START or "/")
     audit("account.web", "id=%s" % account_id)
     if DESKTOP_MODE and _control_hook:
         try:
             # pywebview 要求「start() 之后 + 非主线程」才会立刻建窗口，
             # 这里和 restart / quit 一样丢到线程里执行
-            threading.Thread(target=_control_hook, args=("open_web", {"url": url, "title": title}),
-                             daemon=True).start()
-            return {"ok": True, "mode": "desktop", "url": url, "title": title}
+            payload = {"url": url, "title": title, "real": real,
+                       "cookie": cookie, "domain": cookie_domain, "account_id": account_id}
+            threading.Thread(target=_control_hook, args=("open_web", payload), daemon=True).start()
+            return {"ok": True, "mode": "desktop", "url": url, "title": title, "real": real,
+                    "cookie_domain": cookie_domain}
         except Exception as exc:  # noqa: BLE001
             log.warning("桌面窗口打开失败，退回浏览器：%s", exc)
     return {"ok": True, "mode": "browser", "url": url, "title": title}

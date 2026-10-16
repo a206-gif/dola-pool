@@ -828,7 +828,12 @@ function openAccountWeb(id){
   // 非桌面版要自己开标签页：先占位再填地址，否则异步回调里的 window.open 会被拦截
   const pre = IS_DESKTOP ? null : window.open('', '_blank');
   api('api/accounts/' + id + '/web', {method:'POST'}).then(r => {
-    if (r.mode === 'desktop') { if (pre) pre.close(); toast('已在新窗口打开 #' + id + ' 的 Dola 页面'); }
+    if (r.mode === 'desktop') {
+      if (pre) pre.close();
+      // 桌面版优先把该账号 Cookie 写进浏览器内核、直接开真站；
+      // 注入不了才退回本机代理页 —— 窗口标题栏会写明走的是哪条
+      toast('已在原生窗口打开 #' + id + '（标题栏写着 dola.com 就是真站）');
+    }
     else if (pre) { pre.location = r.url; }
     else { window.open(r.url, '_blank'); }
   }).catch(e => { if (pre) pre.close(); toast(e.message, true); });

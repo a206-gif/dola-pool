@@ -173,6 +173,19 @@ t('提示条已生成', barOk, true);
 t('提示条含「用系统浏览器打开」', btnOk, true);
 t('提示条含错误日志面板（展开能看到白屏原因）', logOk, true);
 
+// 前端框架渲染失败往往只写 console.error（页面白屏但没有任何异常抛出），
+// 所以注入脚本必须把它也记进诊断面板，否则白屏时点 ⚠ 什么都看不到
+const badgeBefore = (d.getElementById('dlp-badge') || {}).textContent || '';
+w.console.error('测试用的白屏报错信息');
+const badgeAfter = (d.getElementById('dlp-badge') || {}).textContent || '';
+t('console.error 会让提示条上的 ⚠ 计数增加',
+  /⚠/.test(badgeAfter) && badgeAfter !== badgeBefore, true);
+// 真实的排查动作：点开 ⚠ 才看得到具体是哪条报错
+d.getElementById('dlp-badge').dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+const panelText = (d.getElementById('dlp-log') || {}).textContent || '';
+t('点开 ⚠ 能看到 console.error 的内容（白屏时靠这个定位）',
+  panelText.includes('测试用的白屏报错信息'), true);
+
 console.log('===== 注入脚本行为测试 =====');
 let bad = 0;
 for (const [name, ok, got, want] of out) {

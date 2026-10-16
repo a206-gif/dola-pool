@@ -11,7 +11,7 @@
   3. /api/desktop/config 反映当前模式
   4. 切换模式 → 服务自动重启 → 新进程以新模式运行（核心行为）
   5. /api/desktop/reveal 路径映射与越权拦截
-  6. 退出接口
+  6. 账号窗口：把 Cookie 写进浏览器内核（用假的 WebView2 对象验证，不需要真 GUI）
 """
 from __future__ import annotations
 
@@ -68,6 +68,182 @@ def live_proxy_check(acc_id):
         return False
 
 
+# ---------------------------------------------------------------------------
+# 7. 账号窗口的 Cookie 注入（假 WebView2 对象；真机上是 Windows 的 WebView2）
+# ---------------------------------------------------------------------------
+class FakeCookie:
+    def __init__(self, name, value, domain, path):
+        self.Name, self.Value, self.Domain, self.Path = name, value, domain, path
+        self.IsHttpOnly = self.IsSecure = False
+
+
+class FakeCookieManager:
+    def __init__(self):
+        self.added = []
+
+    def CreateCookie(self, name, value, domain, path):
+        return FakeCookie(name, value, domain, path)
+
+    def AddOrUpdateCookie(self, cookie):
+        self.added.append(cookie)
+
+
+class FakeCore:
+    def __init__(self):
+        self.CookieManager = FakeCookieManager()
+
+
+class FakeControl:
+    def __init__(self, core=None):
+        self.CoreWebView2 = core
+
+    def Invoke(self, fn):  # 真机上这里是 WinForms 的 Invoke(委托)
+        raise AssertionError("测试里应该走 _ui_invoke 接缝")
+
+
+class FakeBrowserView:
+    def __init__(self, core):
+        self.webview = FakeControl(core)
+
+
+class FakeWin:
+    def __init__(self, core=None, have_native=True):
+        self.native = FakeBrowserView(core) if have_native else None
+        self.loaded = []
+
+    def load_url(self, url):
+        self.loaded.append(url)
+
+
+class FakeEvents:
+    def __init__(self):
+        self.closed = self
+
+    def __iadd__(self, other):
+        return self
+
+
+class FakePyWindow:
+    """模拟 pywebview.create_window 返回的 Window。"""
+
+    def __init__(self, title, url):
+        self.title, self.url = title, url
+        self.events = FakeEvents()
+        self.loaded = []
+        core = FakeCore() if _FAKE_INJECT_OK[0] else None
+        self.native = FakeBrowserView(core)
+
+    def load_url(self, url):
+        self.loaded.append(url)
+        self.url = url
+
+    def destroy(self):
+        pass
+
+
+_FAKE_INJECT_OK = [True]
+
+
+def fake_webview_module():
+    import types
+    mod = types.ModuleType("webview")
+    mod.guilib = object()          # 假装 GUI 循环已就绪
+    mod.windows = []
+
+    def create_window(title, url, **kwargs):
+        win = FakePyWindow(title, url)
+        mod.windows.append(win)
+        return win
+
+    mod.create_window = create_window
+    return mod
+
+
+def cookie_injection_checks():
+    """把 desktop.py 的注入逻辑放进假环境里跑，验证成功/失败两条路。"""
+    sys.path.insert(0, ROOT)
+    import desktop  # noqa: E402
+
+    # a) Cookie 解析
+    pairs = desktop._parse_cookie_pairs("sessionid=abc;  sid_guard=x=y ; ;bad; t=1")
+    check("Cookie 解析：忽略空项/无等号项，保留值里的等号",
+          pairs == [("sessionid", "abc"), ("sid_guard", "x=y"), ("t", "1")], pairs)
+
+    # b) 非 Windows（拿不到 clr）→ 明确失败，不抛异常
+    ok, why = desktop._inject_webview2_cookies(FakeWin(FakeCore()), "a=1", timeout=0.2)
+    check("非 Windows 环境下注入被明确拒绝（不抛异常）", ok is False and "内核" in why, why)
+
+    # 后面走接缝：假装 clr 可用 + 直接在「UI 线程」同步执行
+    desktop._clr_ready = lambda: (True, "")
+    desktop._ui_invoke = lambda ctrl, fn: fn()
+    desktop._can_inject_cookies = lambda: True   # 本测试跑在 Linux 上，手动打开注入开关
+    desktop._INJECT_TIMEOUT = 0.5               # 真机是 15 秒；测试别干等
+
+    # c) 正常注入：域名 / HttpOnly / Secure 都要设上
+    win = FakeWin(FakeCore())
+    ok, why = desktop._inject_webview2_cookies(win, "sessionid=abc; sid_guard=xyz", ".dola.com", timeout=1)
+    added = win.native.webview.CoreWebView2.CookieManager.added
+    check("注入成功并返回数量", ok is True and "2 个" in why, why)
+    check("Cookie 的域名/路径/HttpOnly/Secure 都对",
+          [c.Name for c in added] == ["sessionid", "sid_guard"]
+          and all(c.Domain == ".dola.com" and c.Path == "/" for c in added)
+          and all(c.IsHttpOnly and c.IsSecure for c in added),
+          [(c.Name, c.Value, c.Domain) for c in added])
+
+    # d) 内核迟迟不给 CoreWebView2 → 超时返回失败（不卡死）
+    ok, why = desktop._inject_webview2_cookies(FakeWin(None, have_native=False), "a=1", timeout=0.3)
+    check("拿不到内核时超时返回失败并说明原因", ok is False and "就绪" in why, why)
+
+    # e) 整条路：Control.open_web → 注入成功 → 打开的是真实 dola.com
+    import types
+    real_mod = sys.modules.get("webview")
+    try:
+        _FAKE_INJECT_OK[0] = True
+        sys.modules["webview"] = fake_webview_module()
+        ctl = desktop.Control()
+        ctl.base_url = "http://127.0.0.1:8099/"
+        ctl.open_web({"url": "/dola-web/2/", "title": "Dola · #2 测试号",
+                      "real": "https://www.dola.com/chat/",
+                      "cookie": "sessionid=abc", "domain": ".dola.com", "account_id": 2})
+        win = sys.modules["webview"].windows[-1]
+        for _ in range(50):                     # 注入在后台线程里做，等一下
+            if win.loaded:
+                break
+            time.sleep(0.1)
+        check("开始先在 about:blank 上等内核（而不是直接加载本地代理页）",
+              win.loaded[:1] == ["https://www.dola.com/chat/"], win.loaded)
+        check("标题栏标明走的是真站", win.title.endswith("· dola.com"), win.title)
+
+        # f) 注入失败 → 自动退回本机代理页
+        _FAKE_INJECT_OK[0] = False
+        sys.modules["webview"].windows.clear()
+        ctl.open_web({"url": "/dola-web/3/", "title": "Dola · #3 测试号",
+                      "real": "https://www.dola.com/chat/",
+                      "cookie": "sessionid=abc", "domain": ".dola.com", "account_id": 3})
+        win2 = sys.modules["webview"].windows[-1]
+        for _ in range(50):
+            if win2.loaded:
+                break
+            time.sleep(0.1)
+        check("注入失败时退回本机代理页",
+              win2.loaded[:1] == ["http://127.0.0.1:8099/dola-web/3/"], win2.loaded)
+        check("标题栏标明走的是本机代理页", win2.title.endswith("· 本机代理页"), win2.title)
+
+        # g) 换账号时先关旧窗口（内核 Cookie 是共享的，两个账号会同归于尽）
+        _FAKE_INJECT_OK[0] = True
+        before = list(ctl.web_windows)
+        ctl.open_web({"url": "/dola-web/4/", "title": "Dola · #4",
+                      "real": "https://www.dola.com/chat/",
+                      "cookie": "sessionid=zzz", "domain": ".dola.com", "account_id": 4})
+        check("换账号时上一个账号窗口被关掉",
+              bool(before) and len(ctl.web_windows) == 1, [w.title for w in ctl.web_windows])
+    finally:
+        if real_mod is not None:
+            sys.modules["webview"] = real_mod
+        else:
+            sys.modules.pop("webview", None)
+
+
 def wait_up(should_be_up=True, timeout=45):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -121,8 +297,12 @@ def main():
             lines = [l for l in out.splitlines() if f":{PORT}" in l]
             # ss 输出格式：State Recv-Q Send-Q Local:Port Peer:Port Process
             locals_ = [l.split()[3] for l in lines if len(l.split()) > 4]
-            check("端口 %d 仅绑定 127.0.0.1（本机）" % PORT,
-                  bool(locals_) and all(a.startswith("127.0.0.1:") for a in locals_),
+            # 169.254.0.21 是沙箱预览转发层自己镜像的监听，不是程序绑的；
+            # 真正要防的是程序绑到 0.0.0.0（对外暴露）
+            external = [a for a in locals_
+                        if a.startswith("0.0.0.0:") or a.startswith("[::]:")]
+            check("端口 %d 没有对外绑定（0.0.0.0/::），只监听本机" % PORT,
+                  bool(locals_) and not external and any(a.startswith("127.0.0.1:") for a in locals_),
                   "本地地址：" + "，".join(locals_))
         except FileNotFoundError:
             check("ss 不可用，跳过监听地址检查", True, "（非 Linux 环境正常）")
@@ -170,7 +350,10 @@ def main():
         check("静态 URL 被解析到成片目录（无文件时返回打开失败而非越权）",
               status in (200, 500) and "允许范围" not in str(res), str(res)[:120])
 
-        print("\n== 6. 退出接口 ==")
+        print("\n== 6. 账号窗口的 Cookie 注入（假 WebView2）==")
+        cookie_injection_checks()
+
+        print("\n== 7. 退出接口 ==")
         status, res = call("POST", "/api/desktop/quit")
         check("退出请求被接受", status == 200 and isinstance(res, dict) and res.get("ok"), res)
         gone, _ = wait_up(should_be_up=False, timeout=20)
