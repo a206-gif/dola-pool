@@ -85,7 +85,48 @@ Linux   ：终端执行  ./start-linux.sh
 
 六、出问题了怎么办
 ----------------------------------------------------------------
-· 提示没有 Python        → 装 Python 3.10+ 并勾选 Add to PATH
+
+【最常见】双击 start-windows.bat 后，黑窗口一闪就没了 / 完全没反应
+   <重要> 请务必先【解压】压缩包，再到解压出来的文件夹里双击。
+          直接在压缩包预览窗口里双击，程序找不到自己的文件，必然出错。
+
+   然后按顺序试：
+
+   1) 在文件夹空白处按住 Shift + 右键 → "在此处打开 PowerShell 窗口"
+      （或地址栏输入 cmd 回车），手动敲这两行看具体报错：
+
+          python --version
+          start-windows.bat
+
+      窗口会停住不关闭，把报错内容截图即可。
+
+   2) 如果 python --version 报错或弹出应用商店：
+      说明没装 Python。到 https://www.python.org/downloads/ 下载安装，
+      安装第一屏【务必勾选】 "Add Python to PATH"（或"Add python.exe to PATH"）。
+
+   3) 如果提示"已被系统阻止 / 已保护你的电脑"：
+      Windows 给下载来的文件加了标记。右键 start-windows.bat →
+      属性 → 底部勾选"解除锁定" → 确定，再双击。
+      或点"更多信息" → "仍要运行"。
+
+   4) 如果之前运行到一半失败过，可能留下坏的 .venv 文件夹：
+      删掉文件夹里的 .venv 目录再试（新版启动器已能自动重建）。
+
+   5) 手动完整流程（最可靠，任何情况都能用）：
+
+          cd /d 你的解压目录\DolaPool
+          python -m venv .venv
+          .venv\Scripts\python.exe -m pip install -r requirements-desktop.txt
+          .venv\Scripts\python.exe desktop.py
+
+      界面出不来时，最后一行换成：
+          .venv\Scripts\python.exe desktop.py --browser
+      会用系统默认浏览器打开界面，同样能用。
+
+
+【其它】
+· start-windows.bat 里的提示是英文的 → 因为中文写在批处理里会导致乱码
+  甚至窗口闪退（编码问题），所以批处理里只用英文；中文说明就是本文件。
 · 提示 GTK/QT 加载失败    → Linux 缺 GUI 库，用 --browser 参数先跑起来
                            或 sudo apt install python3-gi gir1.2-webkit2-4.1
 · 任务一直是"失败"        → 检查【账号池】里有没有导入可用 Cookie
