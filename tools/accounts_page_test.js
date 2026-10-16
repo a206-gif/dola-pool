@@ -1,0 +1,140 @@
+#!/usr/bin/env node
+/**
+ * 账号池页面回归自检（jsdom，不需要真浏览器）。
+ *
+ * 覆盖用户 v2.0.12 提的新需求：
+ *   ① 能导出账号池 CK（按钮 + 三种格式 + 真的会下载）
+ *   ② 能改已添加账号的 ID 名称 / 今日用量 / 每日上限（编辑弹窗）
+ *   ③ 能把账号窗口「后台挂起」（列表里显示 运行中 / 已挂起 / 已关闭）
+ *
+ * 用法：DOLA_BASE=http://127.0.0.1:8000 node tools/accounts_page_test.js
+ */
+const { JSDOM, VirtualConsole } = require('jsdom');
+const BASE = process.env.DOLA_BASE || 'http://127.0.0.1:8000';
+
+(async () => {
+  // 服务端不再造数据：直接在 jsdom 里用假的接口数据驱动界面
+  const html = await (await fetch(BASE + '/')).text();
+  const errors = [];
+  const calls = [];
+  const vc = new VirtualConsole();
+  vc.on('jsdomError', e => errors.push('jsdomError: ' + ((e.detail && e.detail.message) || e.message)));
+
+  const accounts = [
+    { id: 1, name: '主号 A', note: '竖屏', status: 'active', today_usage: 2, quota: 15,
+      daily_limit: 5, usage_manual_today: true, check_state: 'local_ready', check_detail: '本地格式检查通过',
+      last_checked: '', cookie: '••••••' },
+    { id: 2, name: '小号 B', note: '', status: 'ready', today_usage: 0, quota: 15,
+      daily_limit: 0, usage_manual_today: false, check_state: 'ready', check_detail: '', last_checked: '', cookie: '••••••' },
+  ];
+  let sessions = { mode: 'web', can_manage: false, sessions: [] };
+
+  const dom = new JSDOM(html, {
+    url: BASE + '/', runScripts: 'dangerously', pretendToBeVisual: true, virtualConsole: vc,
+    beforeParse(w) {
+      w.fetch = async (u, o) => {
+        const url = String(u);
+        calls.push((o && o.method ? o.method + ' ' : 'GET ') + url);
+        const body = url.includes('api/desktop/sessions') ? sessions
+          : url.includes('api/accounts/export') ? 'sessionid=abc\nsessionid=def\n'
+          : /api\/accounts\/\d+\/update/.test(url) ? { ok: true, account: accounts[0] }
+          : url.includes('api/accounts') ? accounts
+          : url.includes('api/queue') ? { queue_depth: 0, active: 0, workers: 4 }
+          : url.includes('api/tasks') ? []
+          : [];
+        const text = typeof body === 'string' ? body : JSON.stringify(body);
+        return {
+          ok: true, status: 200,
+          headers: { get: () => 'attachment; filename="dola-ck-2-20261017.json"' },
+          text: async () => text, json: async () => body,
+          blob: async () => ({ size: 64, type: 'application/json' }),
+        };
+      };
+      w.alert = () => {}; w.confirm = () => true; w.prompt = () => 'x';
+      w.URL.createObjectURL = () => 'blob:fake';
+      w.URL.revokeObjectURL = () => {};
+      w.HTMLAnchorElement.prototype.click = function () { calls.push('下载 ' + this.download); };
+      w.console.error = (...a) => errors.push('console.error: ' + a.join(' ').slice(0, 200));
+    },
+  });
+  const w = dom.window, d = w.document;
+  const $ = id => d.getElementById(id);
+  await new Promise(r => setTimeout(r, 800));
+
+  await w.eval("go('accounts')");
+  await new Promise(r => setTimeout(r, 700));
+
+  const out = [];
+  out.push(['账号池渲染出表格', !!d.querySelector('table'), '']);
+  out.push(['有「导出 CK」按钮', !!$('exportCk'), '']);
+  out.push(['每行都有「编辑」按钮（改名称/用量）',
+            d.querySelectorAll('button[onclick^="editAccount("]').length === 2,
+            d.querySelectorAll('button[onclick^="editAccount("]').length + ' 个']);
+  out.push(['有「窗口」列（挂起/运行中/已关闭）',
+            /窗口/.test(d.querySelector('thead').textContent), '']);
+  out.push(['网页版提示：没有可挂起的原生窗口',
+            /网页版/.test(d.body.textContent), '']);
+  out.push(['今日用量显示手动标记', d.body.textContent.indexOf('手动') >= 0, '']);
+
+  // ① 导出 CK：点按钮 → 选格式 → 真的发起下载
+  $('exportCk').click();
+  await new Promise(r => setTimeout(r, 200));
+  const fmtBtn = d.querySelector('[data-fmt="txt"]');
+  out.push(['导出弹窗里给出 txt / csv / json 三种格式',
+            !!fmtBtn && !!d.querySelector('[data-fmt="csv"]') && !!d.querySelector('[data-fmt="json"]'), '']);
+  fmtBtn.click();
+  await new Promise(r => setTimeout(r, 600));
+  out.push(['点 TXT 后真的调用了导出接口',
+            calls.some(c => c.includes('api/accounts/export?format=txt')), calls.filter(c => c.includes('export')).join(',')]);
+  out.push(['下载被触发（a.download 带文件名）',
+            calls.some(c => c.startsWith('下载 ')), calls.filter(c => c.startsWith('下载')).join(',')]);
+  if (d.querySelector('.modal')) w.eval('closeModal()');
+
+  // ② 编辑账号：改名称 + 今日用量
+  w.eval('editAccount(1)');
+  await new Promise(r => setTimeout(r, 200));
+  const nameInput = d.querySelector('#mform input, #mform textarea');
+  out.push(['编辑弹窗打开且带当前名称', !!nameInput && nameInput.value === '主号 A', nameInput ? nameInput.value : '']);
+  out.push(['编辑弹窗有「今日用量」与「每日上限」两项',
+            /今日用量/.test(d.body.textContent) && /每日上限/.test(d.body.textContent), '']);
+  const form = $('mform');
+  form.querySelector('input').value = '改过的名字';
+  const fields = form.querySelectorAll('input, select, textarea');
+  // daily_limit / today_usage 是第 3、4 个字段
+  fields[2].value = '7';
+  fields[3].value = '3';
+  form.dispatchEvent(new w.Event('submit', { bubbles: true, cancelable: true }));
+  await new Promise(r => setTimeout(r, 500));
+  out.push(['提交编辑 → 调用了 update 接口',
+            calls.some(c => c.includes('api/accounts/1/update')), calls.filter(c => c.includes('update')).join(',')]);
+
+  // ③ 会话列表：桌面版模式下显示 运行中 / 已挂起 / 已关闭 + 挂起按钮
+  sessions = { mode: 'desktop', can_manage: true, sessions: [
+    { account_id: 1, name: '主号 A', state: 'running', note: '前台显示中（真站已渲染）', title: '', updated_at: '' },
+    { account_id: 2, name: '小号 B', state: 'parked', note: '已挂起在后台（真站页面已就绪，切换秒开）', title: '', updated_at: '' },
+  ] };
+  await w.eval('refreshSessions()');
+  await new Promise(r => setTimeout(r, 300));
+  const cells = $('sess-1').textContent + ' ' + $('sess-2').textContent;
+  out.push(['桌面版：窗口列显示「前台显示中」和「后台挂起」',
+            /前台显示中/.test(cells) && /后台挂起/.test(cells), cells.slice(0, 60)]);
+  out.push(['运行中的行有「挂起」按钮，挂起的行有「切换过去」',
+            /挂起/.test(cells) && /切换过去/.test(cells), '']);
+  out.push(['会话总览列出运行中/已挂起',
+            /运行中/.test($('sessionBox').textContent) && /已挂起/.test($('sessionBox').textContent),
+            $('sessionBox').textContent.slice(0, 50)]);
+  calls.length = 0;
+  await w.eval("sessionAction(2, 'activate')");
+  await new Promise(r => setTimeout(r, 400));
+  out.push(['点「切换过去」→ 调用会话接口 activate',
+            calls.some(c => /api\/accounts\/2\/session/.test(c)), calls.join('|').slice(0, 120)]);
+  out.push(['无 JS 错误', errors.length === 0, errors.slice(0, 2).join(' | ')]);
+
+  let bad = 0;
+  for (const [name, ok, detail] of out) {
+    if (!ok) bad++;
+    console.log((ok ? '✅ ' : '❌ ') + name + (detail ? '  → ' + detail : ''));
+  }
+  console.log(bad ? `\n❌ 账号池自检 ${bad} 项失败` : '\n✅ 账号池自检全部通过（导出 CK / 编辑账号 / 窗口挂起）');
+  process.exit(bad ? 1 : 0);
+})();

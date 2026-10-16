@@ -53,7 +53,7 @@ from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
                                RedirectResponse, Response)
 from fastapi.staticfiles import StaticFiles
 
-VERSION = "2.0.11"
+VERSION = "2.0.12"
 
 # --------------------------------------------------------------------------
 # 目录与配置
@@ -170,6 +170,9 @@ def init_db() -> None:
         "alter table tasks add column ref_images text default ''",
         "alter table tasks add column updated_at text",
         "alter table accounts add column note text default ''",
+        "alter table accounts add column daily_limit integer default 0",       # 0 = 用全局默认
+        "alter table accounts add column usage_manual integer default 0",      # 手动设置的今日用量
+        "alter table accounts add column usage_manual_date text default ''",   # 上面那个值是哪天的
         "alter table proxies add column region text default ''",
         "alter table proxies add column created_at text",
     ):
@@ -293,7 +296,28 @@ _STOP = threading.Event()
 
 _ai_module = None
 _memory_ai_key = AI_API_KEY or ""
-_control_hook = None          # 桌面版注入：切换运行模式 / 退出应用
+_control_hook = None          # 桌面版注入：切换运行模式 / 退出应用 / 开账号窗口
+# 账号网页的「会话」状态（桌面版才有窗口；网页版永远 closed）。
+# 状态：closed 没开 / preparing 正在准备 / running 前台显示中 / parked 后台挂起 / stale 挂起但登录态被顶掉
+_desktop_sessions: dict = {}
+SESSION_STATES = ("closed", "preparing", "running", "parked", "stale")
+
+
+def session_update(account_id, state: str, note: str = "", title: str = "", url: str = "") -> None:
+    """桌面版窗口会话状态回写（由 desktop.py 调用）。"""
+    try:
+        account_id = int(account_id)
+    except (TypeError, ValueError):
+        return
+    if state == "closed":
+        _desktop_sessions.pop(account_id, None)
+        return
+    if state not in SESSION_STATES:
+        state = "closed"
+    _desktop_sessions[account_id] = {
+        "state": state, "note": note, "title": title, "url": url, "updated_at": utcnow(),
+    }
+
 
 
 def set_control_hook(hook) -> None:
@@ -320,17 +344,37 @@ def _today() -> str:
 
 
 def account_usage(conn: sqlite3.Connection, account_id: int) -> int:
+    """今日用量。
+
+    优先用手动设置值（用户在账号池里改的「今日用量」，或点过「重置为 0」），
+    没设过就按 tasks 表真实统计。手动值带上日期，过了今天自动失效。
+    """
+    row = conn.execute(
+        "select usage_manual, usage_manual_date from accounts where id=?", (account_id,)
+    ).fetchone()
+    if row is not None and (row["usage_manual_date"] or "") == _today():
+        return int(row["usage_manual"] or 0)
     return conn.execute(
         "select count(*) from tasks where account_id=? and date(created_at)=?",
         (account_id, _today()),
     ).fetchone()[0]
 
 
+def account_quota(row) -> int:
+    """该账号的每日上限：单账号设了就用它，否则用全局设置。"""
+    try:
+        limit = int(row["daily_limit"] or 0)
+    except (KeyError, IndexError, TypeError, ValueError):
+        limit = 0
+    return limit if limit > 0 else MAX_DAILY_PER_ACCOUNT
+
+
 def select_account_for_task():
     """智能选号：跳过正在跑任务的号，选今日用量最少的可用号。"""
     conn = db()
     accounts = conn.execute(
-        "select id,name,status,cookie from accounts where status in ('active','ready') and cookie != ''"
+        "select id,name,status,cookie,daily_limit,usage_manual,usage_manual_date "
+        "from accounts where status in ('active','ready') and cookie != ''"
     ).fetchall()
     if not accounts:
         conn.close()
@@ -344,14 +388,14 @@ def select_account_for_task():
         if running > 0:
             continue  # 每个号同时只跑一个任务，避免同 IP 并发触发风控
         usage = account_usage(conn, acc["id"])
-        if usage >= MAX_DAILY_PER_ACCOUNT:
+        if usage >= account_quota(acc):
             continue
         if best_usage is None or usage < best_usage:
             best, best_usage = acc, usage
     conn.close()
     if best is None:
         return None, "所有账号都在运行中或今日额度已用完"
-    return best, f"今日已用 {best_usage}/{MAX_DAILY_PER_ACCOUNT}"
+    return best, f"今日已用 {best_usage}/{account_quota(best)}"
 
 
 # ---------------------------------------------------------------- Cookie 归一化
@@ -1119,9 +1163,16 @@ def api_accounts() -> list:
     accounts = [dict(r) for r in conn.execute("select * from accounts order by id desc")]
     for acc in accounts:
         acc["today_usage"] = account_usage(conn, acc["id"])
-        acc["quota"] = MAX_DAILY_PER_ACCOUNT
+        acc["quota"] = account_quota(acc)
+        acc["daily_limit"] = int(acc.get("daily_limit") or 0)
+        acc["usage_manual_today"] = (acc.get("usage_manual_date") or "") == _today()
+        acc["session"] = _desktop_sessions.get(int(acc["id"])) or {"state": "closed", "note": "", "updated_at": ""}
     conn.close()
-    return [_mask(a) for a in accounts]
+    out = [_mask(a) for a in accounts]
+    for acc in out:                      # usage_manual 是内部字段，不进界面
+        acc.pop("usage_manual", None)
+        acc.pop("usage_manual_date", None)
+    return out
 
 
 @app.post("/api/accounts")
@@ -1142,6 +1193,147 @@ async def api_add_account(request: Request):
     audit("account.create", name)
     result = local_account_check(account_id, deep=bool(x.get("verify")))
     return {"ok": True, "id": account_id, "check": result}
+
+
+@app.get("/api/accounts/export")
+def api_export_accounts(format: str = "json") -> Response:
+    """导出账号池里的 Cookie（完整 Cookie，供本人备份/迁移）。
+
+    format=json 完整字段（名字/备注/每日上限保留，导回来名字不丢）
+    format=csv  name,cookie,note（Excel 直接打开）
+    format=txt  每行一个 Cookie（最通用，也能再导回本站）
+    """
+    fmt = (format or "json").strip().lower()
+    if fmt not in ("json", "csv", "txt"):
+        return JSONResponse({"error": "format 只支持 json / csv / txt"}, 400)
+    conn = db()
+    rows = [dict(r) for r in conn.execute(
+        "select id,name,cookie,note,status,daily_limit,created_at from accounts "
+        "where cookie != '' order by id")]
+    conn.close()
+    if not rows:
+        return JSONResponse({"error": "账号池里还没有带 Cookie 的账号"}, 400)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    if fmt == "json":
+        body = json.dumps([
+            {"name": r["name"], "cookie": r["cookie"], "note": r["note"] or "",
+             "daily_limit": int(r["daily_limit"] or 0), "status": r["status"],
+             "created_at": r["created_at"], "id": r["id"]}
+            for r in rows], ensure_ascii=False, indent=2)
+        media, ext = "application/json", "json"
+    elif fmt == "csv":
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(["name", "cookie", "note"])
+        for r in rows:
+            writer.writerow([r["name"], r["cookie"], r["note"] or ""])
+        body, media, ext = "\ufeff" + buf.getvalue(), "text/csv", "csv"
+    else:
+        body = "".join((r["cookie"] or "").strip() + "\n" for r in rows)
+        media, ext = "text/plain", "txt"
+    audit("account.export", "format=%s count=%d" % (fmt, len(rows)))
+    filename = "dola-ck-%d-%s.%s" % (len(rows), stamp, ext)
+    return Response(content=body, media_type=media,
+                    headers={"Content-Disposition": "attachment; filename=\"%s\"" % filename,
+                             "Cache-Control": "no-store"})
+
+
+@app.post("/api/accounts/{account_id}/update")
+async def api_update_account(account_id: int, request: Request):
+    """改账号：ID 名称 / 备注 / 每日上限 / 今日用量 / 状态。"""
+    x = await request.json()
+    conn = db()
+    row = conn.execute("select * from accounts where id=?", (account_id,)).fetchone()
+    if row is None:
+        conn.close()
+        return JSONResponse({"error": "账号不存在"}, 404)
+    sets, args, changed = [], [], []
+    if "name" in x:
+        name = str(x.get("name") or "").strip()
+        if not name:
+            conn.close()
+            return JSONResponse({"error": "名称不能为空"}, 400)
+        sets.append("name=?"); args.append(name[:80]); changed.append("名称")
+    if "note" in x:
+        sets.append("note=?"); args.append(str(x.get("note") or "")[:500]); changed.append("备注")
+    if "daily_limit" in x:
+        try:
+            limit = int(x.get("daily_limit") or 0)
+        except (TypeError, ValueError):
+            conn.close()
+            return JSONResponse({"error": "每日上限要填整数（0 = 用全局默认）"}, 400)
+        if limit < 0 or limit > 1000:
+            conn.close()
+            return JSONResponse({"error": "每日上限范围 0-1000（0 = 用全局默认）"}, 400)
+        sets.append("daily_limit=?"); args.append(limit); changed.append("每日上限")
+    if "today_usage" in x:
+        raw = x.get("today_usage")
+        if raw in (None, ""):
+            sets.append("usage_manual_date=?"); args.append(""); changed.append("今日用量")
+        else:
+            try:
+                used = int(raw)
+            except (TypeError, ValueError):
+                conn.close()
+                return JSONResponse({"error": "今日用量要填整数"}, 400)
+            if used < 0 or used > 100000:
+                conn.close()
+                return JSONResponse({"error": "今日用量范围 0-100000"}, 400)
+            sets.append("usage_manual=?"); args.append(used)
+            sets.append("usage_manual_date=?"); args.append(_today())
+            changed.append("今日用量")
+    if "status" in x:
+        status = str(x.get("status") or "").strip()
+        if status not in ("active", "ready", "invalid", "paused"):
+            conn.close()
+            return JSONResponse({"error": "状态只支持 active/ready/invalid/paused"}, 400)
+        sets.append("status=?"); args.append(status); changed.append("状态")
+    if not sets:
+        conn.close()
+        return JSONResponse({"error": "没有要修改的字段"}, 400)
+    args.append(account_id)
+    conn.execute("update accounts set " + ",".join(sets) + " where id=?", args)
+    conn.commit()
+    acc = dict(conn.execute("select * from accounts where id=?", (account_id,)).fetchone())
+    acc["today_usage"] = account_usage(conn, account_id)
+    acc["quota"] = account_quota(acc)
+    conn.close()
+    audit("account.update", "id=%s %s" % (account_id, "/".join(changed)))
+    result = _mask(acc)
+    result["usage_manual_today"] = (acc.get("usage_manual_date") or "") == _today()
+    result.pop("usage_manual", None)
+    result.pop("usage_manual_date", None)
+    return {"ok": True, "account": result}
+
+
+@app.post("/api/accounts/{account_id}/usage")
+async def api_account_usage(account_id: int, request: Request):
+    """只改今日用量的快捷入口：{"today_usage": 3} 或 {"reset": true}。"""
+    x = await request.json()
+    if x.get("reset"):
+        x = {"today_usage": 0}
+    if "today_usage" not in x:
+        return JSONResponse({"error": "要传 today_usage 或 reset"}, 400)
+    conn = db()
+    row = conn.execute("select id from accounts where id=?", (account_id,)).fetchone()
+    if row is None:
+        conn.close()
+        return JSONResponse({"error": "账号不存在"}, 404)
+    if x.get("today_usage") in (None, ""):
+        conn.execute("update accounts set usage_manual_date=? where id=?", ("", account_id))
+    else:
+        try:
+            used = max(0, min(100000, int(x["today_usage"])))
+        except (TypeError, ValueError):
+            conn.close()
+            return JSONResponse({"error": "今日用量要填整数"}, 400)
+        conn.execute("update accounts set usage_manual=?, usage_manual_date=? where id=?",
+                     (used, _today(), account_id))
+    conn.commit()
+    usage = account_usage(conn, account_id)
+    conn.close()
+    audit("account.usage", "id=%s usage=%s" % (account_id, usage))
+    return {"ok": True, "id": account_id, "today_usage": usage}
 
 
 @app.post("/api/accounts/{account_id}/check")
@@ -2482,20 +2674,20 @@ async def api_dola_web(account_id: int, request: Request, rest: str = ""):
     return await _serve_dola_proxy(account_id, rest, request)
 
 
-@app.post("/api/accounts/{account_id}/web")
-def api_account_web(account_id: int):
-    """在 webview（桌面版）或新标签页（Web 版）里打开该账号的 Dola 页面。"""
+def _account_web_payload(account_id: int):
+    """拼出「打开这个账号的 Dola 页面」需要的一切（桌面窗口与网页版共用）。"""
     if not WEB_PROXY:
-        return JSONResponse({"error": "本地代理已关闭（DOLA_WEB_PROXY=0）"}, 400)
+        return None, JSONResponse({"error": "本地代理已关闭（DOLA_WEB_PROXY=0）"}, 400)
     conn = db()
-    row = conn.execute("select id,name,cookie from accounts where id=?", (account_id,)).fetchone()
+    row = conn.execute("select id,name,cookie from accounts where id=?",
+                       (account_id,)).fetchone()
     conn.close()
     if row is None:
-        return JSONResponse({"error": "账号不存在"}, 404)
+        return None, JSONResponse({"error": "账号不存在"}, 404)
     account = dict(row)
     cookie, _note = sanitize_cookie(account.get("cookie") or "")
     if not cookie:
-        return JSONResponse({"error": "该账号没有可用的 Cookie，先补上再打开网页"}, 400)
+        return None, JSONResponse({"error": "该账号没有可用的 Cookie，先补上再打开网页"}, 400)
     url = _proxy_prefix(account_id) + "/"
     title = "Dola · #%s %s" % (account_id, (account.get("name") or "").strip())
     # 桌面版会把这串 Cookie 直接写进浏览器内核的 Cookie 存储，然后打开**真正的 dola.com** ——
@@ -2504,19 +2696,84 @@ def api_account_web(account_id: int):
     bits = host.split(".")
     cookie_domain = "." + ".".join(bits[-2:]) if len(bits) >= 2 else host
     real = DOLA_WEB_BASE.rstrip("/") + (WEB_PROXY_START or "/")
+    return {"url": url, "title": title, "real": real, "cookie": cookie,
+            "domain": cookie_domain, "account_id": account_id}, None
+
+
+@app.post("/api/accounts/{account_id}/web")
+def api_account_web(account_id: int):
+    """在 webview（桌面版）或新标签页（Web 版）里打开该账号的 Dola 页面。"""
+    payload, err = _account_web_payload(account_id)
+    if err is not None:
+        return err
     audit("account.web", "id=%s" % account_id)
     if DESKTOP_MODE and _control_hook:
         try:
             # pywebview 要求「start() 之后 + 非主线程」才会立刻建窗口，
             # 这里和 restart / quit 一样丢到线程里执行
-            payload = {"url": url, "title": title, "real": real,
-                       "cookie": cookie, "domain": cookie_domain, "account_id": account_id}
-            threading.Thread(target=_control_hook, args=("open_web", payload), daemon=True).start()
-            return {"ok": True, "mode": "desktop", "url": url, "title": title, "real": real,
-                    "cookie_domain": cookie_domain}
+            payload = dict(payload, action="open")
+            threading.Thread(target=_control_hook, args=("session", payload), daemon=True).start()
+            return {"ok": True, "mode": "desktop", "url": payload["url"], "title": payload["title"],
+                    "real": payload["real"], "cookie_domain": payload["domain"]}
         except Exception as exc:  # noqa: BLE001
             log.warning("桌面窗口打开失败，退回浏览器：%s", exc)
-    return {"ok": True, "mode": "browser", "url": url, "title": title}
+    return {"ok": True, "mode": "browser", "url": payload["url"], "title": payload["title"]}
+
+
+@app.post("/api/accounts/{account_id}/session")
+async def api_account_session(account_id: int, request: Request):
+    """账号窗口的会话操作：前台打开 open / 后台挂起 suspend / 切换过去 activate / 关闭 close。
+
+    桌面版才有真窗口；网页版返回 mode=browser，由前端自己开/关标签页。
+    """
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    action = str((body or {}).get("action") or "open").strip().lower()
+    if action not in ("open", "suspend", "activate", "close"):
+        return JSONResponse({"error": "action 只支持 open / suspend / activate / close"}, 400)
+    conn = db()
+    exists = conn.execute("select 1 from accounts where id=?", (account_id,)).fetchone()
+    conn.close()
+    if exists is None:
+        return JSONResponse({"error": "账号不存在"}, 404)
+    if action == "close":
+        # 关窗口不需要 Cookie（Cookie 被删掉/清空时也得能关）
+        payload = {"url": _proxy_prefix(account_id) + "/", "title": "Dola · #%s" % account_id,
+                   "real": DOLA_WEB_BASE.rstrip("/") + (WEB_PROXY_START or "/"),
+                   "account_id": account_id, "cookie": "", "domain": ".dola.com"}
+    else:
+        payload, err = _account_web_payload(account_id)
+        if err is not None:
+            return err
+    audit("account.session", "id=%s action=%s" % (account_id, action))
+    if not (DESKTOP_MODE and _control_hook):
+        return {"ok": True, "mode": "browser", "action": action,
+                "url": payload["url"], "title": payload["title"]}
+    try:
+        payload = dict(payload, action=action)
+        threading.Thread(target=_control_hook, args=("session", payload), daemon=True).start()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("桌面会话操作失败：%s", exc)
+        return JSONResponse({"error": "桌面窗口操作失败：%s" % exc}, 500)
+    return {"ok": True, "mode": "desktop", "action": action, "url": payload["url"],
+            "title": payload["title"], "real": payload["real"]}
+
+
+@app.get("/api/desktop/sessions")
+def api_desktop_sessions() -> dict:
+    """账号窗口会话总览（账号池页面用它画「前台显示 / 后台挂起 / 已关闭」列表）。"""
+    conn = db()
+    names = {int(r["id"]): (r["name"] or "") for r in conn.execute("select id,name from accounts")}
+    conn.close()
+    items = []
+    for account_id, info in sorted(_desktop_sessions.items()):
+        items.append({"account_id": account_id, "name": names.get(account_id, ""),
+                      "state": info.get("state") or "closed", "note": info.get("note") or "",
+                      "title": info.get("title") or "", "updated_at": info.get("updated_at") or ""})
+    return {"mode": "desktop" if (DESKTOP_MODE and _control_hook) else "web",
+            "can_manage": bool(DESKTOP_MODE and _control_hook), "sessions": items}
 
 
 _RE_PROXY_REFERER = re.compile(

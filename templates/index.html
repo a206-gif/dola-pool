@@ -466,9 +466,9 @@ function retryAllFailed(){
 }
 
 /* ==================== 生成页 ==================== */
+/* 生成页：先渲染骨架，之后只刷新动态区域——绝不整页重渲染，
+   否则每 4 秒会把已经填好的提示词、上传的参考图全清掉（也会闪）。*/
 async function pageGenerate(){
-  const [queue, tasks] = await Promise.all([api('api/queue'), api('api/tasks?limit=6')]);
-  const latest = tasks.find(t => t.video_url);
   view.innerHTML =
   '<div class="grid g2" style="grid-template-columns:minmax(0,1.15fr) minmax(0,.85fr)">' +
     '<div class="panel"><h2>✧ 新建视频任务 <small>每行一条提示词即为批量</small></h2>' +
@@ -484,35 +484,44 @@ async function pageGenerate(){
         '<div style="width:150px"><label class="f">每条重复次数</label><input id="genCopies" type="number" min="1" max="20" value="1"></div>' +
         '<div style="flex:1;min-width:200px"><label class="f">指定账号（留空自动选号）</label><input id="genAccount" type="number" placeholder="账号 ID，可留空"></div>' +
       '</div>' +
-      '<div style="margin-top:12px"><label class="f">参考图（可选，最多 9 张）</label>' +
+      '<div style="margin-top:12px"><label class="f">参考图（可选，最多 9 张，上传后不会丢）</label>' +
         '<input type="file" id="genRefs" accept="image/*" multiple>' +
-        '<div id="refThumbs" class="row" style="margin-top:8px"></div></div>' +
+        '<div id="refThumbs" class="row" style="margin-top:8px;flex-wrap:wrap;gap:6px"></div>' +
+        '<div class="dim" id="refHint" style="font-size:12px;margin-top:6px"></div></div>' +
       '<div class="row" style="margin-top:16px"><button class="btn primary" id="genSubmit">✧ 提交任务</button>' +
         '<button class="btn" onclick="openAiAssist()">✦ AI 帮我写提示词</button>' +
         '<span class="dim" id="genHint"></span></div>' +
     '</div>' +
-    '<div><div class="panel"><h2>☷ 队列状态</h2>' +
-      '<div class="grid g2">' +
-        '<div class="card"><div class="k muted">排队中</div><div style="font-size:22px;font-weight:700">' + queue.queue_depth + '</div></div>' +
-        '<div class="card"><div class="k muted">执行中</div><div style="font-size:22px;font-weight:700;color:#7bc8e2">' + queue.active + '/' + queue.workers + '</div></div>' +
-      '</div></div>' +
-      '<div class="panel"><h2>▶ 最近成片</h2><div class="video-box" id="latestBox">' +
-        (latest ? '<video src="' + latest.video_url + '" controls></video>' : '暂无成片') + '</div></div>' +
+    '<div><div class="panel"><h2>☷ 队列状态</h2><div id="genQueueBox"></div></div>' +
+      '<div class="panel"><h2>▶ 最近成片</h2><div class="video-box" id="genLatestBox">加载中…</div></div>' +
     '</div>' +
   '</div>' +
-  '<div class="panel"><h2>最近任务</h2>' + taskTable(tasks, true) + '</div>';
+  '<div class="panel"><h2>最近任务</h2><div id="genTasksBox"><span class="dim">加载中…</span></div></div>';
 
-  const refs = [];
+  // 参考图：状态存在 state 上，页内任何局部刷新都不会丢
+  state.genRefs = state.genRefs || [];
+  const paintRefs = () => {
+    $('refThumbs').innerHTML = state.genRefs.map(r => '<img class="thumb" src="' + esc(r.url) + '">').join('');
+    $('refHint').textContent = state.genRefs.length ? ('已上传 ' + state.genRefs.length + ' 张：' + state.genRefs.map(r => r.path.split(/[\\/]/).pop()).join('、')) : '还没有参考图';
+  };
+  paintRefs();
   $('genRefs').onchange = async (e) => {
-    for (const f of e.target.files){
+    const files = Array.from(e.target.files || []);
+    e.target.value = '';                       // 允许再次选同一张
+    if (!files.length) return;
+    for (const f of files){
+      if (state.genRefs.length >= 9){ toast('最多 9 张参考图', true); break; }
       const fd = new FormData(); fd.append('file', f);
       try {
+        $('refHint').textContent = '正在上传 ' + f.name + ' …';
         const r = await api('api/upload-image', {method:'POST', body: fd});
-        refs.push(r.path);
-        $('refThumbs').insertAdjacentHTML('beforeend', '<img class="thumb" src="' + r.url + '">');
-      } catch(err){ toast('上传失败：' + err.message, true); }
+        state.genRefs.push({path: r.path, url: r.url});
+        paintRefs();
+      } catch(err){
+        paintRefs();
+        toast('上传失败：' + err.message, true);
+      }
     }
-    toast('已上传 ' + refs.length + ' 张参考图');
   };
   $('genSubmit').onclick = async () => {
     const lines = $('genPrompt').value.split('\n').map(s => s.trim()).filter(Boolean);
@@ -527,13 +536,31 @@ async function pageGenerate(){
       const r = await api('api/tasks', {method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({tasks: items, model: $('genModel').value, duration: Number($('genDuration').value),
           ratio: $('genRatio').value, quality: $('genQuality').value, account_id: accountId,
-          ref_images: refs.join(',')})});
+          ref_images: state.genRefs.map(x => x.path).join(',')})});
       toast('已提交 ' + r.count + ' 个任务，队列 ' + r.queue_depth);
       state.page = 'tasks'; render();
     } catch(e){ toast(e.message, true); }
     finally { const b = $('genSubmit'); if (b) b.disabled = false; }
   };
-  setTimers([pageGenerate]);
+
+  await refreshGenDynamic();
+  // 只刷新队列/成片/最近任务这三块，不再碰表单
+  setTimers([refreshGenDynamic]);
+}
+
+async function refreshGenDynamic(){
+  const [queue, tasks] = await Promise.all([api('api/queue'), api('api/tasks?limit=6')]);
+  const qb = $('genQueueBox'); if (!qb) return;      // 已经切走了就别动
+  const latest = tasks.find(t => t.video_url);
+  qb.innerHTML =
+    '<div class="grid g2">' +
+      '<div class="card"><div class="k muted">排队中</div><div style="font-size:22px;font-weight:700">' + queue.queue_depth + '</div></div>' +
+      '<div class="card"><div class="k muted">执行中</div><div style="font-size:22px;font-weight:700;color:#7bc8e2">' + queue.active + '/' + queue.workers + '</div></div>' +
+    '</div>';
+  const lb = $('genLatestBox');
+  if (lb) lb.innerHTML = latest ? '<video src="' + esc(latest.video_url) + '" controls></video>' : '暂无成片';
+  const tb = $('genTasksBox');
+  if (tb) tb.innerHTML = taskTable(tasks, true);
 }
 function openAiAssist(){
   formModal('AI 生成提示词', [
@@ -754,36 +781,187 @@ async function silentRefreshTasks(){
 
 /* ==================== 账号池 ==================== */
 async function pageAccounts(){
-  const accounts = await api('api/accounts');
+  const [accounts, sess] = await Promise.all([api('api/accounts'), api('api/desktop/sessions')]);
   state.accounts = accounts;
+  state.sessions = {};
+  (sess.sessions || []).forEach(s => { state.sessions[s.account_id] = s; });
+  state.canManageWindows = !!(sess.can_manage || sess.mode === 'desktop');
   view.innerHTML =
     '<div class="panel"><h2>♧ 账号池 <small>每个账号同时只跑一个任务，按今日用量自动轮询</small></h2>' +
       '<div class="row">' +
         '<button class="btn primary" onclick="addAccount()">+ 新增账号</button>' +
         '<button class="btn" onclick="importAccounts()">⇧ 批量导入</button>' +
+        '<button class="btn" id="exportCk" title="把账号池里的完整 Cookie 导出成文件（只有你自己能拿到）">⤓ 导出 CK</button>' +
         '<button class="btn" id="checkAll">✓ 一键验活</button>' +
         '<button class="btn" onclick="render()">↻ 刷新</button>' +
         '<span class="chip">共 ' + accounts.length + ' 个</span>' +
+        '<span class="dim" style="font-size:12px">窗口：' + (state.canManageWindows
+          ? '桌面版可「前台打开 / 后台挂起 / 切换」多个账号，挂起的窗口不占屏幕，切换秒开'
+          : '网页版没有原生窗口，点「网页」在新标签页打开') + '</span>' +
       '</div></div>' +
     '<div class="panel">' + (accounts.length ? '<div class="scroll-x"><table><thead><tr>' +
-      '<th>ID</th><th>名称</th><th>状态</th><th>今日用量</th><th>验活</th><th>最近检查</th><th>操作</th>' +
+      '<th>ID</th><th>名称</th><th>状态</th><th>今日用量</th><th>验活</th><th>窗口</th><th>操作</th>' +
       '</tr></thead><tbody>' + accounts.map(a =>
-        '<tr><td class="mono">#' + a.id + '</td><td>' + esc(a.name) + '</td>' +
-        '<td><span class="badge ' + (a.status === 'ready' ? 'ok' : a.status === 'invalid' ? 'bad' : 'dim') + '">' + esc(a.status) + '</span></td>' +
-        '<td style="min-width:140px"><div class="row"><span class="mono">' + (a.today_usage || 0) + '/' + (a.quota || 0) + '</span>' +
-          '<div class="bar" style="flex:1"><i style="width:' + Math.min(100, Math.round(100 * (a.today_usage||0) / (a.quota||1))) + '%"></i></div></div></td>' +
+        '<tr><td class="mono">#' + a.id + '</td>' +
+        '<td>' + esc(a.name) + (a.note ? '<div class="dim" style="font-size:11px">' + esc(a.note) + '</div>' : '') + '</td>' +
+        '<td><span class="badge ' + (a.status === 'ready' ? 'ok' : a.status === 'invalid' ? 'bad' : a.status === 'paused' ? 'dim' : 'dim') + '">' + esc(a.status) + '</span></td>' +
+        '<td style="min-width:150px"><div class="row"><span class="mono" title="' + (a.usage_manual_today ? '手动手动设置的今日用量' : '按任务统计的今日用量') + '">' + (a.today_usage || 0) + '/' + (a.quota || 0) + '</span>' +
+          '<div class="bar" style="flex:1"><i style="width:' + Math.min(100, Math.round(100 * (a.today_usage||0) / (a.quota||1))) + '%"></i></div>' +
+          (a.usage_manual_today ? '<span class="badge dim">手动</span>' : '') + '</div></td>' +
         '<td><span class="badge ' + (a.check_state === 'ready' || a.check_state === 'local_ready' ? 'ok' : a.check_state === 'invalid' ? 'bad' : 'dim') + '">' +
           esc(a.check_state || 'unchecked') + '</span><div class="dim" style="font-size:11px">' + esc((a.check_detail || '').slice(0, 40)) + '</div></td>' +
-        '<td class="dim mono">' + fmtTime(a.last_checked) + '</td>' +
-        '<td style="white-space:nowrap"><button class="btn sm" onclick="checkAccount(' + a.id + ')" title="联网校验这个账号的 Cookie">验活</button> ' +
-        '<button class="btn sm" onclick="openAccountWeb(' + a.id + ')" title="在新窗口里打开这个账号的 Dola 页面（登录态已带好）">🌐 网页</button> ' +
-        '<button class="btn sm danger" onclick="delAccount(' + a.id + ')">删除</button></td></tr>').join('') +
-      '</tbody></table></div>' : '<div class="empty">还没有账号。点击「批量导入」粘贴 Dola Cookie（每行一个）</div>') + '</div>';
+        '<td id="sess-' + a.id + '" style="min-width:210px">' + sessionCell(a) + '</td>' +
+        '<td style="white-space:nowrap"><button class="btn sm" onclick="editAccount(' + a.id + ')" title="改 ID 名称 / 备注 / 每日上限 / 今日用量">✎ 编辑</button> ' +
+        '<button class="btn sm" onclick="checkAccount(' + a.id + ')" title="联网校验这个账号的 Cookie">验活</button> ' +
+        '<button class="btn sm" onclick="openAccountWeb(' + a.id + ')" title="打开这个账号的 Dola 页面（登录态已带好）">🌐 网页</button> ' +
+        '<button class="btn sm danger" onclick="delAccount(' + a.id + ')" title="从账号池里删掉">删除</button></td></tr>').join('') +
+      '</tbody></table></div>' : '<div class="empty">还没有账号。点击「批量导入」粘贴 Dola Cookie（每行一个）</div>') + '</div>' +
+    '<div class="panel"><h2>窗口会话 <small>「后台挂起」= 窗口建好但不显示，登录态与页面先在后台准备好，切换时不用等</small></h2>' +
+      '<div id="sessionBox">' + sessionList() + '</div></div>';
   $('checkAll').onclick = async () => {
     const r = await api('api/accounts/check-all', {method:'POST'});
     toast('已检查 ' + r.count + ' 个账号'); render();
   };
+  $('exportCk').onclick = exportAccounts;
+  // 后台挂起时窗口是慢慢准备好的：只刷新这两块，别整页重渲染
+  setTimers([refreshSessions]);
 }
+
+function sessionCell(a){
+  if (!state.canManageWindows) {
+    return '<span class="dim" style="font-size:12px">网页版：点「网页」开新标签</span>';
+  }
+  const s = (state.sessions && state.sessions[a.id]) || {state:'closed'};
+  const st = s.state || 'closed';
+  const label = {closed:'已关闭', preparing:'正在准备', running:'前台显示中', parked:'后台挂起', stale:'挂起（需重连）'}[st] || st;
+  const cls = st === 'running' ? 'ok' : st === 'parked' ? 'dim' : st === 'stale' ? 'bad' : st === 'preparing' ? 'dim' : 'dim';
+  let btns = '';
+  if (st === 'closed') {
+    btns = '<button class="btn sm" onclick="sessionAction(' + a.id + ',\'open\')" title="弹出原生窗口显示真站">前台打开</button> ' +
+           '<button class="btn sm" onclick="sessionAction(' + a.id + ',\'suspend\')" title="不弹窗，先把登录态和页面准备好">后台挂起</button>';
+  } else if (st === 'running') {
+    btns = '<button class="btn sm" onclick="sessionAction(' + a.id + ',\'suspend\')" title="收进后台，页面保持存活">挂起</button> ' +
+           '<button class="btn sm danger" onclick="sessionAction(' + a.id + ',\'close\')" title="关掉这个账号的窗口">关闭</button>';
+  } else {
+    btns = '<button class="btn sm primary" onclick="sessionAction(' + a.id + ',\'activate\')" title="显示这个账号的窗口（必要时自动重连登录态）">切换过去</button> ' +
+           '<button class="btn sm danger" onclick="sessionAction(' + a.id + ',\'close\')">关闭</button>';
+  }
+  return '<span class="badge ' + cls + '">' + label + '</span>' +
+    '<div style="white-space:nowrap;margin-top:4px">' + btns + '</div>' +
+    (s.note ? '<div class="dim" style="font-size:11px">' + esc(s.note) + '</div>' : '');
+}
+
+function sessionList(){
+  const items = Object.values(state.sessions || {});
+  if (!state.canManageWindows) return '<div class="dim">当前是网页版：账号页面在新标签页里打开，没有可挂起的原生窗口。桌面版（exe / desktop.py）才有这条能力。</div>';
+  if (!items.length) return '<div class="dim">还没有打开任何账号窗口。点某一行的「后台挂起」可以在不弹窗的情况下先把账号挂到后台。</div>';
+  const order = {running:0, preparing:1, parked:2, stale:3, closed:4};
+  return '<div class="row" style="flex-wrap:wrap;gap:8px">' + items
+    .sort((x, y) => (order[x.state] ?? 9) - (order[y.state] ?? 9) || x.account_id - y.account_id)
+    .map(s => {
+      const st = s.state || 'closed';
+      const label = {running:'▶ 运行中', preparing:'◌ 准备中', parked:'❚❚ 已挂起', stale:'⚠ 需重连'}[st] || st;
+      const cls = st === 'running' ? 'ok' : st === 'stale' ? 'bad' : 'dim';
+      const acc = (state.accounts || []).find(a => a.id === s.account_id) || {};
+      const act = st === 'running'
+        ? '<button class="btn sm" onclick="sessionAction(' + s.account_id + ',\'suspend\')">挂起</button>'
+        : '<button class="btn sm primary" onclick="sessionAction(' + s.account_id + ',\'activate\')">切换过去</button>';
+      return '<div class="card" style="min-width:220px"><div class="row between"><b>#' + s.account_id + ' ' +
+        esc(acc.name || s.name || '') + '</b><span class="badge ' + cls + '">' + label + '</span></div>' +
+        '<div class="dim" style="font-size:11px;margin-top:4px">' + esc(s.note || '') + '</div>' +
+        '<div class="row" style="margin-top:6px">' + act +
+        ' <button class="btn sm danger" onclick="sessionAction(' + s.account_id + ',\'close\')">关闭</button></div></div>';
+    }).join('') + '</div>';
+}
+
+async function refreshSessions(){
+  const r = await api('api/desktop/sessions');
+  state.sessions = {};
+  (r.sessions || []).forEach(s => { state.sessions[s.account_id] = s; });
+  state.canManageWindows = !!(r.can_manage || r.mode === 'desktop');
+  (state.accounts || []).forEach(a => {                 // 只换单元格内容，页面不重建
+    const td = $('sess-' + a.id);
+    if (td) td.innerHTML = sessionCell(a);
+  });
+  const box = $('sessionBox');
+  if (box) box.innerHTML = sessionList();
+}
+
+async function sessionAction(id, action){
+  try {
+    const r = await api('api/accounts/' + id + '/session', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({action: action})});
+    if (r.mode === 'browser') {          // 网页版：没有原生窗口，退回开标签页
+      if (action === 'open' || action === 'activate') { window.open(r.url, '_blank'); }
+      else { toast('网页版没有可挂起的原生窗口'); }
+    } else {
+      const msg = {open:'已在原生窗口打开（标题栏写着 dola.com 就是真站）',
+                   suspend:'已挂到后台（不弹窗，登录态和页面先在后台准备好）',
+                   activate:'已切到这个账号（登录态被顶掉时会自动重连）',
+                   close:'已关闭这个账号的窗口'}[action] || '完成';
+      toast(msg);
+    }
+    await refreshSessions();
+  } catch(e){ toast(e.message, true); }
+}
+
+function exportAccounts(){
+  openModal('导出账号 CK', '<p class="muted">导出的是<b>完整 Cookie</b>（不做打码）。文件只保存到你本机，别发给别人 —— 拿到 Cookie 等于拿到这些账号。</p>' +
+    '<div class="row" style="margin-top:10px">' +
+      '<button class="btn primary" data-fmt="json">⤓ JSON（名字/备注/上限都保留，可再导入）</button>' +
+      '<button class="btn" data-fmt="txt">⤓ TXT（每行一个 Cookie）</button>' +
+      '<button class="btn" data-fmt="csv">⤓ CSV（Excel 可开）</button>' +
+    '</div>' +
+    '<div class="foot"><button class="btn" onclick="closeModal()">取消</button></div>');
+  document.querySelectorAll('[data-fmt]').forEach(b => {
+    b.onclick = () => downloadCk(b.dataset.fmt);
+  });
+}
+
+async function downloadCk(fmt){
+  try {
+    const res = await fetch('/api/accounts/export?format=' + encodeURIComponent(fmt), {
+      headers: {'X-Admin-Token': localStorage.getItem('dola_token') || ''}});
+    if (!res.ok) {
+      let msg = 'HTTP ' + res.status;
+      try { msg = (await res.json()).error || msg; } catch(e){}
+      throw new Error(msg);
+    }
+    const blob = await res.blob();
+    const cd = res.headers.get('Content-Disposition') || '';
+    const m = cd.match(/filename="?([^";]+)"?/);
+    const name = m ? m[1] : ('dola-ck.' + fmt);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = name;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+    toast('已导出：' + name + '（' + Math.round(blob.size / 1024) + ' KB，存在下载文件夹）');
+    closeModal();
+  } catch(e){ toast('导出失败：' + e.message, true); }
+}
+
+function editAccount(id){
+  const a = (state.accounts || []).find(x => x.id === id) || {};
+  formModal('编辑账号 #' + id, [
+    {key:'name', label:'ID 名称（自己看得懂就行）', value: a.name || '', placeholder:'例：主号 A'},
+    {key:'note', label:'备注', value: a.note || '', placeholder:'例：这个号只跑竖屏'},
+    {key:'daily_limit', label:'这个号的每日上限（0 = 用全局默认 ' + (a.quota || '') + '）', value: String(a.daily_limit || 0)},
+    {key:'today_usage', label:'今日用量（留空 = 按任务统计；填数字 = 手动设置，明天自动失效）',
+     value: a.usage_manual_today ? String(a.today_usage || 0) : '', placeholder:'例：0（等于今天不再用它）'},
+    {key:'status', label:'状态', type:'select', value: a.status || 'active',
+     options:['active','ready','paused','invalid']},
+  ], async (d) => {
+    const body = {name: d.name, note: d.note, status: d.status,
+                  daily_limit: Number(d.daily_limit) || 0};
+    body.today_usage = String(d.today_usage || '').trim() === '' ? null : Number(d.today_usage);
+    await api('api/accounts/' + id + '/update', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    toast('账号 #' + id + ' 已更新');
+    render();
+  });
+}
+
 function addAccount(){
   formModal('新增 Dola 账号', [
     {key:'name', label:'名称', placeholder:'例：账号 A'},

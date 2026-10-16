@@ -93,6 +93,60 @@ def main():
     status, accounts = call("GET", "/api/accounts")
     check("账号列表含今日用量字段", status == 200 and "today_usage" in accounts[0])
 
+    print("\n== 导出 CK / 改账号 / 窗口会话（v2.0.12 新增）==")
+    status, txt = call("GET", "/api/accounts/export?format=txt", raw=True)
+    check("导出 TXT：每行一个完整 Cookie（不打码）",
+          status == 200 and b"sessionid=smoke" in txt and b"\xe2\x80\xa2" not in txt,
+          txt[:60])
+    status, js = call("GET", "/api/accounts/export?format=json", raw=True)
+    try:
+        parsed = json.loads(js)
+    except Exception:  # noqa: BLE001
+        parsed = []
+    check("导出 JSON：带 name/cookie 字段，能再导回来",
+          status == 200 and parsed and "cookie" in parsed[0] and "name" in parsed[0],
+          (parsed[0].get("name") if parsed else ""))
+    status, csv_body = call("GET", "/api/accounts/export?format=csv", raw=True)
+    check("导出 CSV：有表头 name,cookie,note", status == 200 and b"name,cookie,note" in csv_body, csv_body[:40])
+    status, bad_fmt = call("GET", "/api/accounts/export?format=exe")
+    check("导出格式非法 → 明确报错（400）", status == 400, bad_fmt)
+
+    status, upd = call("POST", "/api/accounts/%s/update" % account_id,
+                       {"name": "改名后的号", "note": "自检备注", "daily_limit": 3})
+    check("改 ID 名称 + 每日上限", status == 200 and upd["account"]["name"] == "改名后的号"
+          and upd["account"]["quota"] == 3, upd.get("account", {}).get("name"))
+    status, upd2 = call("POST", "/api/accounts/%s/update" % account_id, {"today_usage": 2})
+    check("手动设置今日用量", status == 200 and upd2["account"]["today_usage"] == 2
+          and upd2["account"].get("usage_manual_today") is True,
+          upd2.get("account", {}).get("today_usage"))
+    status, upd3 = call("POST", "/api/accounts/%s/update" % account_id, {"today_usage": ""})
+    check("留空 → 回到按任务真实统计", status == 200 and upd3["account"]["today_usage"] == 0,
+          upd3.get("account", {}).get("today_usage"))
+    status, reset = call("POST", "/api/accounts/%s/usage" % account_id, {"reset": True})
+    check("快捷重置今日用量（reset）", status == 200 and reset["today_usage"] == 0, reset)
+    status, acc_now = call("GET", "/api/accounts")
+    row = next(a for a in acc_now if a["id"] == account_id)
+    check("账号列表带 daily_limit / 手动标记 / 窗口会话字段",
+          row.get("daily_limit") == 3 and row.get("usage_manual_today") is True
+          and isinstance(row.get("session"), dict), (row.get("daily_limit"), row.get("session")))
+    check("列表里不下发 cookie 明文（仍然是打码的）",
+          row.get("cookie") in ("••••••", ""), row.get("cookie"))
+    status, plain = call("POST", "/api/accounts", {"name": "", "cookie": "sessionid=empty"})
+    check("新增账号时空名称会被自动命名", status == 200 and plain.get("ok"), plain)
+    if status == 200:
+        call("DELETE", "/api/accounts/%s" % plain["id"])
+    status, sess = call("GET", "/api/desktop/sessions")
+    check("会话总览接口可用（网页版 can_manage=False）",
+          status == 200 and "sessions" in sess and sess.get("can_manage") is False, sess)
+    status, act = call("POST", "/api/accounts/%s/session" % account_id, {"action": "open"})
+    check("会话动作：网页版返回 mode=browser（由前端开标签）",
+          status == 200 and act.get("mode") == "browser" and act.get("url"), act)
+    status, close_act = call("POST", "/api/accounts/%s/session" % account_id, {"action": "close"})
+    check("关窗口即使没有 Cookie 也能执行（不会被 400 挡住）",
+          status == 200 and close_act.get("action") == "close", close_act)
+    status, bad_act = call("POST", "/api/accounts/%s/session" % account_id, {"action": "乱写"})
+    check("会话动作非法 → 400", status == 400, bad_act)
+
     print("\n== 任务全流程 ==")
     status, created = call("POST", "/api/tasks", {"prompt": "自检：雨夜霓虹街道慢动作水花", "duration": 15, "ratio": "9:16"})
     check("提交单条任务", status == 200 and created.get("count") == 1, created)

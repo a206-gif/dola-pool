@@ -120,6 +120,9 @@ def pick_port(preferred: int = 0) -> int:
         return s.getsockname()[1]
 
 
+_APP_MODULE = None          # Backend.start() 里赋值；Control 用它回写会话状态
+
+
 class Backend:
     """在后台线程里跑 FastAPI（uvicorn），窗口关掉就跟着退出。"""
 
@@ -153,6 +156,8 @@ class Backend:
         import app as app_module  # noqa: E402  （依赖上面的环境变量）
 
         self.app_module = app_module
+        global _APP_MODULE
+        _APP_MODULE = app_module          # 供 Control 回写账号会话状态
         app_module.set_control_hook(restart_hook)
 
         config = uvicorn.Config(
@@ -237,6 +242,29 @@ def _ui_invoke(holder, fn) -> None:
     """把 fn 丢到 UI 线程上同步执行（WinForms 的窗体/控件只能从 UI 线程碰）。"""
     from System import Func, Type  # pythonnet，Windows 上装 pywebview 时自带
     holder.Invoke(Func[Type](fn))
+
+
+def _ui_invoke_bounded(holder, fn, timeout: float = 3.0) -> bool:
+    """`_ui_invoke` 的带超时版本：UI 线程万一卡住，调用方不会跟着一起卡死。
+
+    （真机上吃过一次亏：pywebview 的 evaluate_js 会永久阻塞；凡是「等 UI 线程回话」
+      的地方都得有上限。）
+    """
+    box = {}
+
+    def worker():
+        try:
+            _ui_invoke(holder, fn)
+            box["ok"] = True
+        except Exception as exc:  # noqa: BLE001
+            box["error"] = str(exc)
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    thread.join(max(0.05, timeout))
+    if thread.is_alive():
+        box["timeout"] = True
+    return bool(box.get("ok"))
 
 
 def _clr_ready() -> tuple:
@@ -586,64 +614,283 @@ def _judge_real_site(report, host: str = "dola.com") -> tuple:
         html_len, len(text), report.get("status"))
 
 
-def _inspect_loop(win, timeout: float, poll: float, host: str) -> dict:
-    deadline = time.time() + max(0.0, timeout)
-    report, err = {}, ""
-    while True:
-        try:                      # pywebview 的 evaluate_js 内部会切到 UI 线程，可放心调用
-            report = win.evaluate_js(_PROBE_JS) or {}
-            err = ""
-        except Exception as exc:  # noqa: BLE001 （页面还没加载好 / 内核还没注入脚本）
-            report, err = {}, str(exc)[:160]
-        if isinstance(report, str):        # 有的后端把结果当字符串给回来
-            try:
-                report = json.loads(report)
-            except Exception:  # noqa: BLE001
-                report = {}
-        ok, why = _judge_real_site(report, host)
-        if ok or time.time() >= deadline:
-            return {"ok": ok, "why": why, "report": report if isinstance(report, dict) else {},
-                    "error": err}
-        time.sleep(poll)
+# WebErrorStatus（.NET 枚举）→ 人话。窗口打不开真站时，这一行就是答案。
+_NAV_ERROR_HINTS = {
+    "HostNameNotResolved": "域名解析失败（DNS 没解析出来：没网 / 被拦 / hosts 有问题）",
+    "CannotConnectToProxy": "连不上代理（代理地址或端口不对，或者代理要账号密码）",
+    "ProxyAuthenticationRequired": "代理要认证（把账号密码写进 config.json 的 proxy）",
+    "Timeout": "超时（网络太慢，或者这条链路被挡住了）",
+    "ConnectionAborted": "连接被中断（链路被重置：常见于该走代理却直连、或代理不稳）",
+    "ConnectionReset": "连接被重置（同上）",
+    "ConnectionRefused": "连接被拒绝（对方端口没开 / 本机防火墙拦了）",
+    "ServerUnreachable": "服务器不可达（网络不通）",
+    "Disconnected": "网络断开",
+    "NavigationCanceled": "导航被取消（页面自己取消了，或者被拦截）",
+    "OperationCanceled": "操作被取消",
+    "BlockedByClient": "请求被本机拦截（防火墙 / 杀软 / 广告拦截）",
+    "BlockedByResponse": "响应被拦截",
+    "HttpInvalidServerResponse": "服务器返回了不合法的响应",
+    "RedirectFailed": "跳转失败",
+    "UnexpectedError": "未预期错误",
+    "ValidAuthenticationCredentialsRequired": "站点要求登录认证",
+    "ValidAuthenticationCredentialsOptional": "站点想要认证信息",
+    "CertificateCommonNameIsIncorrect": "证书域名不匹配",
+    "CertificateExpired": "证书过期",
+    "ClientCertificateContainsErrors": "客户端证书有问题",
+}
 
 
-def _inspect_real_site(win, timeout: float = _SITE_TIMEOUT, poll: float = 0.5,
-                       host: str = "dola.com") -> dict:
-    """轮询窗口里的 JS，直到真站渲染出来或超时。
+def _hint_for_nav_error(code: str) -> str:
+    name = str(code or "").split(".")[-1].strip()
+    if not name:
+        return ""
+    return _NAV_ERROR_HINTS.get(name, "内核报的错误码：%s" % name)
 
-    整段放进带看门狗的线程里：pywebview 的 evaluate_js 是同步等内核回话的，
-    万一内核卡住，这里也不会把开窗口的那个线程一起拖死。
+
+def _install_page_probe(window, log=print) -> dict:
+    """在 UI 线程上装两样东西：.NET 的导航事件监听 + 一个不依赖 pywebview 的 JS 探针。
+
+    为什么要自己写，而不用 pywebview 的 evaluate_js：
+    它的实现是 `self.webview.Invoke(...ExecuteScriptAsync(...).ContinueWith(
+        lambda task: _callback(json.loads(task.Result)), syncContextScheduler))`，
+    再加一句 `semaphore.acquire()` —— 只要那个 continuation 里出一点意外
+    （脚本报错时 task.Result 可能是 null，json.loads(None) 直接抛），
+    信号量就永远不放，调用线程**永久卡死**。真机上就是这么卡住的：
+    诊断页写出「脚本通道：evaluate_js 一直没返回」。
+    所以这里改成：自己拿 CoreWebView2，异步读结果、解析失败也只记一笔，绝不阻塞。
     """
-    result = {}
+    holder = _webview_holder(window)
+    if holder is None:
+        return {}
+    state = {"ready": False, "source": "", "started": "", "done": False, "ok": None,
+             "http": None, "error_code": "", "js": None, "js_error": "", "js_seq": 0, "js_at": 0.0}
 
-    def worker():
-        result["info"] = _inspect_loop(win, timeout, poll, host)
+    def _read_core():
+        ctrl = getattr(holder, "webview", None)
+        if ctrl is None:
+            browser = getattr(holder, "browser", None)
+            ctrl = getattr(browser, "webview", None) if browser is not None else None
+        core = getattr(ctrl, "CoreWebView2", None) if ctrl is not None else None
+        return core
 
-    thread = threading.Thread(target=worker, name="dola-site-probe", daemon=True)
-    thread.start()
-    thread.join(max(0.0, timeout) + _PROBE_HARD_LIMIT)
-    if thread.is_alive():
-        return {"ok": False, "why": "浏览器内核没回话（自检超时）",
-                "report": {}, "error": "evaluate_js 一直没返回"}
-    return result.get("info") or {"ok": False, "why": "自检没拿到结果", "report": {}, "error": ""}
+    def _setup():
+        """只在 UI 线程上跑。"""
+        try:
+            core = _read_core()
+            if core is None:
+                return
+            if not state.get("hooked"):
+                state["hooked"] = True
+
+                def on_started(sender, args):
+                    try:
+                        state["started"] = str(args.Uri)
+                    except Exception:  # noqa: BLE001
+                        pass
+
+                def on_done(sender, args):
+                    try:
+                        state["source"] = str(sender.Source)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    try:
+                        state["ok"] = bool(args.IsSuccess)
+                    except Exception:  # noqa: BLE001
+                        state["ok"] = None
+                    try:
+                        state["http"] = int(args.HttpStatusCode)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    try:
+                        state["error_code"] = str(args.WebErrorStatus)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    state["done"] = True
+
+                core.NavigationStarting += on_started
+                core.NavigationCompleted += on_done
+            try:
+                state["source"] = str(core.Source)
+            except Exception:  # noqa: BLE001
+                pass
+            state["ready"] = True
+        except Exception as exc:  # noqa: BLE001
+            state["js_error"] = "读内核失败：%s" % exc
+
+    def _start_js():
+        """在 UI 线程上发起一次 ExecuteScriptAsync（不阻塞等结果）。"""
+        try:
+            core = _read_core()
+            if core is None:
+                return
+            task = core.ExecuteScriptAsync(_PROBE_JS)
+
+            def _cb(t):
+                try:
+                    raw = t.Result
+                except Exception as exc:  # noqa: BLE001
+                    state["js_error"] = "脚本通道报错：%s" % exc
+                    return
+                if raw is None:
+                    state["js_error"] = "内核返回空（脚本没执行）"
+                    return
+                try:
+                    state["js"] = json.loads(str(raw))
+                    state["js_error"] = ""
+                except Exception as exc:  # noqa: BLE001
+                    state["js_error"] = "解析脚本结果失败：%s" % exc
+
+            try:
+                from System import Action
+                from System.Threading.Tasks import Task
+                task.ContinueWith(Action[Task](_cb))
+            except Exception:  # noqa: BLE001 （pythonnet 不在就退化成轮询）
+                try:
+                    raw = task.Result
+                    state["js"] = json.loads(str(raw)) if raw is not None else None
+                    if raw is None:
+                        state["js_error"] = "内核返回空（脚本没执行）"
+                except Exception as exc:  # noqa: BLE001
+                    state["js_error"] = "等待脚本结果失败：%s" % exc
+            state["js_at"] = time.time()
+        except Exception as exc:  # noqa: BLE001
+            state["js_error"] = "发起脚本失败：%s" % exc
+
+    # 先把「怎么再发起一次脚本」和宿主存好（哪怕下面装监听没成功，也还能继续用）
+    state["_start_js"] = _start_js
+    state["_holder"] = holder
+    if not _ui_invoke_bounded(holder, _setup, timeout=4.0):
+        state["js_error"] = "内核没回话（装导航监听超时）"
+    return state
+
+
+def _page_state(state: dict, do_js: bool = True) -> dict:
+    """把探针状态整理成「页面的样子」（线程安全：只读普通字典）。"""
+    report = {}
+    js = state.get("js")
+    if isinstance(js, dict):
+        report = js
+    href = str((report.get("href") if isinstance(report, dict) else "") or "")
+    source = str(state.get("source") or "")
+    return {
+        "report": report if isinstance(report, dict) else {},
+        "href": href or source,
+        "source": source,
+        "started": str(state.get("started") or ""),
+        "nav_done": bool(state.get("done")),
+        "nav_ok": state.get("ok"),
+        "http": state.get("http"),
+        "error_code": str(state.get("error_code") or ""),
+        "error_hint": _hint_for_nav_error(state.get("error_code") or ""),
+        "js_ok": isinstance(js, dict),
+        "js_error": str(state.get("js_error") or ""),
+        "js_at": float(state.get("js_at") or 0.0),
+        "core_ready": bool(state.get("ready")),
+    }
+
+
+def _judge_page_state(page: dict, host: str = "dola.com") -> tuple:
+    """(成功?, 一句话原因) —— 依据 .NET 的导航结果 + JS 探针，两边都能解释清楚。"""
+    href = str(page.get("href") or "").strip()
+    report = page.get("report") or {}
+    http = page.get("http")
+    nav_done = page.get("nav_done")
+    nav_ok = page.get("nav_ok")
+    if "chromewebdata" in href or "edge-error" in href:
+        return False, "导航失败：内核跳到了错误页（%s）" % href[:70]
+    if not href or href in ("about:blank", "about:blank#blocked"):
+        return False, ("地址还是 about:blank —— 内核没把 %s 打开（导航都没开始，或一开始就被取消）"
+                       % (host or "真站"))
+    if host and host not in href:
+        return False, "地址被跳到了 %s（不是 %s）" % (href[:70], host)
+    if nav_done and nav_ok is False:
+        hint = page.get("error_hint") or ""
+        return False, "导航失败：%s%s" % (page.get("error_code") or "内核报错",
+                                     ("（%s）" % hint) if hint else "")
+    if isinstance(http, int) and http >= 400:
+        return False, "站上返回了 HTTP %d（页面是错误页）" % http
+    # 导航这一层没问题了，再看页面里到底有没有东西
+    html_len = report.get("html_len")
+    text = str(report.get("text") or "")
+    if page.get("js_ok"):
+        if len(text) >= 2:
+            return True, "标题「%s」，可见文字 %d 字，HTML %s 字符，HTTP %s" % (
+                (report.get("title") or ""), len(text), html_len if html_len is not None else "?",
+                (report.get("status") or http or "?"))
+        if isinstance(html_len, int) and html_len >= 4000:
+            return True, "标题「%s」，HTML %d 字符（页面无文字节点，按渲染成功算）" % (
+                (report.get("title") or ""), html_len)
+        return False, "页面打开了但内容几乎是空的（HTML %s 字符、可见文字 %d 字，HTTP %s）" % (
+            html_len if html_len is not None else "?", len(text), (report.get("status") or http or "?"))
+    # JS 通道没回话：导航成功就算成功，但要在原因里写清楚只验证到哪一步
+    if nav_done and nav_ok is True:
+        return True, "导航成功（HTTP %s）—— 脚本通道没回话，只验证到导航这一层" % (
+            http if http is not None else "?")
+    if nav_done and nav_ok is None:
+        return True, "导航结束（内核没给出成败标志，HTTP %s）" % (http if http is not None else "?")
+    return False, "导航还没结束（HTTP %s）" % (http if http is not None else "?")
+
+
+def _inspect_real_site(win, timeout: float = _SITE_TIMEOUT, poll: float = 0.4,
+                       host: str = "dola.com") -> dict:
+    """看真站到底渲染出来没有。
+
+    不再用 pywebview 的 evaluate_js（它会永久卡死，见 _install_page_probe 的注释）：
+    - 主证据：.NET 的 NavigationCompleted 事件（地址、成败、HTTP 码、WebErrorStatus）；
+    - 辅助证据：我们自己的 ExecuteScriptAsync 探针（页面的标题 / 正文长度 / 可见文字）。
+    两条路都是「发起后不等」，不会把线程卡住。
+    """
+    state = _install_page_probe(win)
+    if not state:
+        return {"ok": False, "why": "拿不到浏览器内核（窗口还没建好）", "report": {},
+                "error": "no core", "page": {}}
+    start_js = state.get("_start_js")
+    deadline = time.time() + max(0.0, timeout)
+    last_js = 0.0
+    page = _page_state(state)
+    while True:
+        page = _page_state(state)
+        ok, why = _judge_page_state(page, host)
+        if ok:
+            return {"ok": True, "why": why, "report": page.get("report") or {},
+                    "error": page.get("js_error") or "", "page": page}
+        if time.time() >= deadline:
+            break
+        # 定期重发 JS 探针（页面还在加载时拿不到 DOM；通道坏了也只是记一笔，不阻塞）
+        now = time.time()
+        if start_js is not None and now - last_js >= 0.7:
+            last_js = now
+            if not _ui_invoke_bounded(state["_holder"], start_js, timeout=3.0):
+                state["js_error"] = "内核没回话（发起脚本超时）"
+        time.sleep(poll)
+    page = _page_state(state)
+    ok, why = _judge_page_state(page, host)
+    return {"ok": ok, "why": why, "report": page.get("report") or {},
+            "error": page.get("js_error") or "", "page": page}
 
 
 def _format_report(info: dict, proxy_url: str, version: str) -> str:
     """把自检结果排成一段可以直接复制发出来的文字。"""
     rep = info.get("report") or {}
+    page = info.get("page") or {}
+    if page.get("nav_done"):
+        nav = "成功" if page.get("nav_ok") else ("失败：%s" % (page.get("error_code") or "内核报错"))
+    elif page.get("started"):
+        nav = "还没结束"
+    else:
+        nav = "从未开始"
     lines = [
         "  · 结论：%s" % info.get("why", ""),
-        "  · 地址：%s ｜ readyState=%s ｜ HTTP=%s ｜ 用时=%sms" % (
-            rep.get("href") or "(空)", rep.get("ready") or "?", rep.get("status", "?"),
-            rep.get("ms", "?")),
+        "  · 地址：%s" % (page.get("href") or rep.get("href") or "(空)"),
+        "  · 导航：%s ｜ HTTP=%s ｜ 就绪=%s" % (nav, page.get("http", "?"), rep.get("ready") or "?"),
+        "  · 脚本通道：%s" % ("可用" if page.get("js_ok") else (page.get("js_error") or "没回话")),
         "  · 标题：%s" % (rep.get("title") or "(空)"),
-        "  · 正文：HTML %s 字符，可见文字 %s 字" % (rep.get("html_len", "?"),
-                                           len(str(rep.get("text") or ""))),
+        "  · 正文：HTML %s 字符，可见文字 %s 字" % (
+            rep.get("html_len") if rep.get("html_len") is not None else "?",
+            len(str(rep.get("text") or ""))),
         "  · 本机代理页：%s" % proxy_url,
+        "  · 启动器版本：v%s" % (version or "?",),
     ]
-    if info.get("error"):
-        lines.append("  · 脚本通道报错：%s" % info["error"])
-    lines.append("  · 启动器版本：v%s" % (version or "?",))
     return "\n".join(lines)
 
 
@@ -663,15 +910,26 @@ def _diagnose_html(info: dict, real_url: str, proxy_url: str, title: str,
     base = (base_url or "").rstrip("/")
     open_endpoint = (base + "/api/desktop/open-external?url="
                      + urllib.parse.quote(proxy_url or "", safe="")) if base else (proxy_url or "")
+    rep = info.get("report") or {}
+    page = info.get("page") or {}
+    nav = "从未开始（内核没发起导航）"
+    if page.get("nav_done"):
+        nav = "成功" if page.get("nav_ok") else ("失败：%s%s" % (
+            page.get("error_code") or "内核报错",
+            ("（%s）" % page.get("error_hint")) if page.get("error_hint") else ""))
+    elif page.get("started"):
+        nav = "还没结束（正在连 %s）" % str(page.get("started"))[:60]
+    js_state = "可用" if page.get("js_ok") else ("没回话：%s" % (page.get("js_error") or "未知原因"))
+    http = page.get("http") if page.get("http") is not None else rep.get("status", "?")
     rows = [
         ("结论", info.get("why", "")),
-        ("地址", rep.get("href") or "(空)"),
-        ("HTTP 状态", str(rep.get("status", "?"))),
-        ("就绪状态", str(rep.get("ready") or "?")),
+        ("地址", page.get("href") or rep.get("href") or "(空)"),
+        ("导航结果", nav),
+        ("HTTP 状态", str(http)),
         ("页面标题", rep.get("title") or "(空)"),
-        ("HTML 长度", "%s 字符" % rep.get("html_len", "?")),
+        ("HTML 长度", "%s 字符" % (rep.get("html_len") if rep.get("html_len") is not None else "?")),
         ("可见文字", "%s 字" % len(str(rep.get("text") or ""))),
-        ("脚本通道", info.get("error") or "正常"),
+        ("脚本通道", js_state),
         ("内核网络", net_note or "（见黑窗口日志）"),
         ("启动器版本", "v%s" % (version or "?")),
     ]
@@ -836,6 +1094,8 @@ class Control:
         self.base_url = ""          # 后端地址，main() 里设置，用于把 /dola-web/… 补成绝对地址
         self.web_windows = []       # 「打开账号网页」开出的窗口
         self.web_account = None     # 当前账号网页窗口对应的账号 id（内核 Cookie 是共享的）
+        self._sessions = {}         # account_id → 会话记录（窗口/登录态/状态）
+        self._kernel_account = None # 内核 Cookie 里现在是谁的登录态
         self.net_note = ""          # 内核网络说明（代理还是直连），写进诊断页
         self.demo = False           # 演示模式：账号窗口不碰真站，走本机代理页
 
@@ -843,6 +1103,9 @@ class Control:
         """由后端接口触发。"""
         if action == "open_web":
             self.open_web(payload or {})
+            return
+        if action == "session":
+            self.session(payload or {})
             return
         if action == "open_external":
             # 账号窗口里的「用系统浏览器打开」：走本机 HTTP 端点进来，不经任何 JS 桥
@@ -861,88 +1124,325 @@ class Control:
             except Exception as exc:
                 print(f"[desktop] 关闭窗口失败：{exc}")
 
+    # ---------------- 账号会话：前台打开 / 后台挂起 / 切换 / 关闭 ----------------
+    def session(self, payload: dict) -> None:
+        """账号窗口的会话指令入口（由后端 /api/accounts/{id}/session 触发）。"""
+        payload = payload or {}
+        action = str(payload.get("action") or "open").strip().lower()
+        if action == "close":
+            self.close_session(payload.get("account_id"))
+            return
+        if action == "suspend":
+            self.suspend_web(payload)
+            return
+        if action == "activate":
+            info = self._prepare_payload(payload, hidden=False)
+            if info is None:
+                return
+            rec = self._sessions.get(info["account_id"])
+            if rec is not None and self._win_alive(rec.get("win")):
+                self._activate(rec, info)
+            else:
+                self._create_window(info, hidden=False)
+            return
+        self.open_web(payload)
+
+    def _prepare_payload(self, payload: dict, hidden: bool = False):
+        url = str(payload.get("url") or "")
+        if not url:
+            return None
+        if url.startswith("/"):
+            url = (self.base_url or "").rstrip("/") + url
+        account_id = payload.get("account_id")
+        try:
+            account_id = int(account_id) if account_id is not None else None
+        except (TypeError, ValueError):
+            account_id = None
+        return {
+            "url": url,
+            "title": str(payload.get("title") or "Dola 账号网页"),
+            "real": str(payload.get("real") or "").strip(),          # 真实 dola.com 地址（可空）
+            "cookie": str(payload.get("cookie") or "").strip(),      # 该账号的 Cookie
+            "domain": str(payload.get("domain") or "").strip() or ".dola.com",
+            "account_id": account_id,
+            "hidden": bool(hidden),
+        }
+
     def open_web(self, payload: dict) -> None:
-        """开一个原生窗口看某个账号在 Dola 的页面。
+        """前台打开账号网页：已有窗口就直接显示（秒切），没有才建。"""
+        info = self._prepare_payload(payload, hidden=False)
+        if info is None:
+            return
+        rec = self._sessions.get(info["account_id"])
+        if rec is not None and self._win_alive(rec.get("win")):
+            rec.update({"cookie": info["cookie"] or rec.get("cookie"),
+                        "real": info["real"] or rec.get("real"),
+                        "url": info["url"] or rec.get("url"),
+                        "title": info["title"] or rec.get("title"),
+                        "domain": info["domain"] or rec.get("domain")})
+            self._activate(rec, info)
+            return
+        self._create_window(info, hidden=False)
+
+    def suspend_web(self, payload: dict) -> None:
+        """后台挂起：窗口建好但不显示（hidden），先把登录态和真站页面准备好。
+
+        这样切到这个账号时只是「把窗口显示出来」，不用等加载。
+        注意内核（WebView2）的 Cookie 存储是所有窗口共用的：别的账号写入登录态后，
+        挂起的窗口会变成 stale，切回来自动重连（注入 Cookie + 刷新）。
+        """
+        info = self._prepare_payload(payload, hidden=True)
+        if info is None:
+            return
+        rec = self._sessions.get(info["account_id"])
+        if rec is not None and self._win_alive(rec.get("win")):
+            rec.update({"cookie": info["cookie"] or rec.get("cookie"),
+                        "real": info["real"] or rec.get("real"),
+                        "title": info["title"] or rec.get("title")})
+            self._hide(rec.get("win"))
+            state = "parked"
+            note = "已挂起在后台（内核登录态还是它，切换秒开）"
+            if rec.get("injected") and self._kernel_account != info["account_id"]:
+                state, note = "stale", "已挂起在后台（登录态被别的账号顶掉，切换时会自动重连）"
+            self._publish(rec, state, note=note)
+            return
+        self._create_window(info, hidden=True)
+
+    def close_session(self, account_id) -> None:
+        """关掉某个账号的窗口（会话记录一起清掉）。"""
+        try:
+            account_id = int(account_id) if account_id is not None else None
+        except (TypeError, ValueError):
+            account_id = None
+        if account_id is None:
+            return
+        rec = self._sessions.get(account_id)
+        if rec is None:
+            self._publish_closed(account_id)
+            return
+        win = rec.get("win")
+        self._forget(rec)
+        try:
+            win.destroy()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[desktop] 关闭账号窗口失败：{exc}")
+
+    def _forget(self, rec: dict) -> None:
+        """把窗口从会话表里摘掉（用户自己关窗 / 我们主动关，都走这里）。"""
+        win = rec.get("win")
+        if win in self.web_windows:
+            self.web_windows.remove(win)
+        account_id = rec.get("account_id")
+        if account_id is not None and self._sessions.get(account_id) is rec:
+            self._sessions.pop(account_id, None)
+            self._publish_closed(account_id)
+        if self.web_account == account_id:
+            self.web_account = None
+        if self._kernel_account == account_id:
+            self._kernel_account = None
+
+    def _publish_closed(self, account_id) -> None:
+        try:
+            if _APP_MODULE is not None:
+                _APP_MODULE.session_update(account_id, "closed")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[desktop] 会话状态回写失败（不影响窗口）：{exc}")
+
+    def _publish(self, rec: dict, state: str, note: str = "") -> None:
+        """把会话状态写给后端（账号池页面用它显示「前台/挂起/已关闭」）。"""
+        rec["state"] = state
+        if note:
+            rec["note"] = note
+        account_id = rec.get("account_id")
+        if account_id is None:
+            return
+        try:
+            if _APP_MODULE is not None:
+                _APP_MODULE.session_update(account_id, state, note=rec.get("note") or "",
+                                           title=rec.get("title") or "",
+                                           url=rec.get("real") or rec.get("url") or "")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[desktop] 会话状态回写失败（不影响窗口）：{exc}")
+
+    @staticmethod
+    def _win_alive(win) -> bool:
+        return win is not None and hasattr(win, "load_url")
+
+    def _show(self, win) -> None:
+        try:
+            win.show()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[desktop] 显示窗口失败（{exc}）")
+
+    def _hide(self, win) -> None:
+        try:
+            win.hide()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[desktop] 挂起窗口失败（{exc}）")
+
+    def _hide_others(self, keep_rec: dict) -> None:
+        """切到某个账号时，把别的账号窗口收进后台（不销毁，切回去更快）。"""
+        for aid, rec in list(self._sessions.items()):
+            if rec is keep_rec or not self._win_alive(rec.get("win")):
+                continue
+            self._hide(rec.get("win"))
+            if rec.get("state") == "running":
+                state = "parked"
+                note = "已挂起在后台（切回去很快）"
+                if rec.get("injected") and self._kernel_account != aid:
+                    state, note = "stale", "已挂起（登录态被别的账号顶掉，切回自动重连）"
+                self._publish(rec, state, note=note)
+
+    def _mark_kernel_owner(self, account_id) -> None:
+        """记住内核 Cookie 里现在是谁的登录态；别的账号窗口标记为「需重连」。"""
+        self._kernel_account = account_id
+        if account_id is None:
+            return
+        for aid, rec in list(self._sessions.items()):
+            if aid == account_id or not rec.get("injected"):
+                continue
+            if rec.get("state") in ("running", "parked", "preparing"):
+                self._publish(rec, "stale",
+                              note="登录态被账号 #%s 顶掉，切回它时会自动重连" % account_id)
+
+    def _create_window(self, info: dict, hidden: bool = False):
+        """新建账号窗口（hidden=True 就是「后台挂起打开」）。
 
         注意：pywebview 只有在 start() 之后、且从非主线程调用 create_window，
         新窗口才会立刻出现（见 pywebview 源码 create_window 末尾）。
         这里的调用来自后端 uvicorn 线程，正好满足条件。
         """
-        url = str(payload.get("url") or "")
-        if not url:
-            return
-        if url.startswith("/"):
-            url = (self.base_url or "").rstrip("/") + url
-        title = str(payload.get("title") or "Dola 账号网页")
-        real = str(payload.get("real") or "").strip()          # 真实 dola.com 地址（可空）
-        cookie = str(payload.get("cookie") or "").strip()      # 该账号的 Cookie
-        domain = str(payload.get("domain") or "").strip() or ".dola.com"
-        account_id = payload.get("account_id")
+        account_id = info["account_id"]
         try:
             import webview
         except Exception as exc:  # noqa: BLE001
             print(f"[desktop] 没装 pywebview（{exc}），改用系统浏览器")
-            _open_in_browser(url)
-            return
+            _open_in_browser(info["url"])
+            return None
         if getattr(webview, "guilib", None) is None:
             # --headless / --browser / 原生窗口启动失败时没有 GUI 循环，
             # 此时 create_window 只会静默返回一个不显示的窗口，所以直接走浏览器
             print("[desktop] 当前没有原生窗口环境，改用系统浏览器打开账号网页")
-            _open_in_browser(url)
-            return
-        # 浏览器内核的 Cookie 存储是所有窗口共用的：换账号时先把上一个账号窗口关掉，
-        # 否则两个窗口会互相顶掉登录态
-        if account_id is not None and self.web_account not in (None, account_id) and self.web_windows:
-            print("[desktop] 换了账号：先关掉上一个账号窗口（内核 Cookie 是共享的）")
-            self.close_web_windows()
-        if account_id is not None:
-            self.web_account = account_id
+            _open_in_browser(info["url"])
+            return None
+        # 浏览器内核的 Cookie 存储是所有窗口共用的：换账号时把上一个账号的窗口收进后台，
+        # 免得两个窗口的登录态互相顶（切回去时再自动重连）
+        if account_id is not None and self.web_account not in (None, account_id):
+            self._hide_others(None)
         # 能注入 Cookie 就直接开真站；否则退回本机代理页
         # （演示模式不碰外网：不写内核 Cookie、不开真站）
-        try_cookie = bool(real and cookie and _can_inject_cookies() and not self.demo)
-        if self.demo and real and cookie:
+        try_cookie = bool(info["real"] and info["cookie"] and _can_inject_cookies() and not self.demo)
+        if self.demo and info["real"] and info["cookie"]:
             print("[desktop] 演示模式：账号窗口用本机代理页（演示模式不访问真站）")
         try:
             # 真站窗口连注入脚本也不要有（页面里不留 window.pywebview）
             _wrap_injection_skip()
-            # 注意：这里**故意不传 js_api** —— 见上面那段注释，暴露 Python 对象会被
-            # pywebview 的注入桥递归遍历、把进程搞崩。诊断页用普通链接就够了。
+            # 注意：这里**故意不传 js_api** —— 暴露 Python 对象会被 pywebview 的
+            # 注入桥递归遍历、把进程搞崩（v2.0.11 已修的崩溃根因）。
             win = webview.create_window(
-                title, "about:blank" if try_cookie else url,
+                info["title"], "about:blank" if try_cookie else info["url"],
                 width=1180, height=860,
                 min_size=(720, 520),
                 text_select=True,
+                hidden=bool(hidden),
             )
             _skip_injection_for(win)     # 标记：这个窗口的页面别再注入 pywebview
-            self.web_windows.append(win)
-            try:  # 用户自己关掉窗口后从列表里摘掉，免得 accumulate
-                win.events.closed += lambda: self.web_windows.remove(win) if win in self.web_windows else None
-            except Exception:
-                pass
-            if try_cookie:
-                # 先摆一个「正在准备」页，别让用户对着空白窗口猜
-                try:
-                    # 不传 base_uri：各后端默认值不同（Windows 忽略、macOS 拿它建
-                    # NSURL），让它用 pywebview 自己的默认更稳
-                    win.load_html(_WAIT_HTML.replace(
-                        "<!--VER-->", "启动器 v%s · 桌面版" % (_app_version() or "?")))
-                except Exception as exc:  # noqa: BLE001
-                    print(f"[desktop] 显示等待页失败（不影响后续）：{exc}")
-                # 把 Cookie 写进内核，再打开真正的 dola.com（放后台线程，
-                # 免得等内核就绪把接口调用卡住）
-                threading.Thread(
-                    target=self._finish_cookie_window,
-                    args=(win, url, real, cookie, domain, title),
-                    daemon=True,
-                ).start()
-            else:
-                print(f"[desktop] 已打开账号网页窗口（本机代理页）：{title}")
         except Exception as exc:  # noqa: BLE001
             print(f"[desktop] 打开账号网页窗口失败（{exc}），改用系统浏览器")
-            _open_in_browser(url)
+            _open_in_browser(info["url"])
+            return None
+        rec = {"win": win, "account_id": account_id, "cookie": info["cookie"],
+               "real": info["real"], "url": info["url"], "title": info["title"],
+               "domain": info["domain"], "state": "closed", "note": "", "injected": False}
+        self.web_windows.append(win)
+        if account_id is not None:
+            self._sessions[account_id] = rec
+            self.web_account = account_id
+        try:  # 用户自己关掉窗口后从会话表里摘掉，免得 accumulate
+            win.events.closed += lambda: self._forget(rec)
+        except Exception:  # noqa: BLE001
+            pass
+        if try_cookie:
+            # 先摆一个「正在准备」页，别让用户对着空白窗口猜（挂起时也留着，反正看不见）
+            try:
+                # 不传 base_uri：各后端默认值不同（Windows 忽略、macOS 拿它建
+                # NSURL），让它用 pywebview 自己的默认更稳
+                win.load_html(_WAIT_HTML.replace(
+                    "<!--VER-->", "启动器 v%s · 桌面版" % (_app_version() or "?")))
+            except Exception as exc:  # noqa: BLE001
+                print(f"[desktop] 显示等待页失败（不影响后续）：{exc}")
+            self._publish(rec, "preparing",
+                          note="正在后台准备（登录态 + 真站页面）" if hidden else "正在写入登录态…")
+            # 把 Cookie 写进内核，再打开真正的 dola.com（放后台线程，
+            # 免得等内核就绪把接口调用卡住）
+            threading.Thread(
+                target=self._finish_cookie_window,
+                args=(win, info["url"], info["real"], info["cookie"], info["domain"],
+                      info["title"], rec, hidden),
+                daemon=True,
+            ).start()
+        else:
+            print(f"[desktop] 已打开账号网页窗口（本机代理页）：{info['title']}")
+            self._publish(rec, "parked" if hidden else "running",
+                          note="后台挂起（本机代理页，不占内核登录态）" if hidden else "前台显示中（本机代理页）")
+        return rec
+
+    def _activate(self, rec: dict, info: dict = None) -> None:
+        """把已有窗口显示到前台；内核登录态不是它的话先重连（注入 Cookie + 刷新）。"""
+        win = rec.get("win")
+        self._hide_others(rec)
+        self._show(win)
+        account_id = rec.get("account_id")
+        if account_id is not None:
+            self.web_account = account_id
+        need = bool(
+            account_id is not None
+            and rec.get("injected")
+            and self._kernel_account != account_id
+            and rec.get("cookie") and rec.get("real")
+            and _can_inject_cookies() and not self.demo
+            and rec.get("state") != "preparing"
+        )
+        if not need:
+            self._publish(rec, "running", note="前台显示中（页面没动过，切换是秒开的）")
+            return
+        self._publish(rec, "preparing", note="登录态被别的账号顶掉了，正在重新写入…")
+        self._set_win_title(win, rec["title"] + " · 正在重连…")
+        threading.Thread(target=self._reconnect, args=(rec,), daemon=True).start()
+
+    def _reconnect(self, rec: dict) -> None:
+        """把某个账号的登录态重新写进内核并刷新页面（切回挂起窗口时用）。"""
+        win = rec.get("win")
+        version = _app_version() or "?"
+        try:
+            ok, note = _inject_webview2_cookies(win, rec.get("cookie") or "",
+                                                rec.get("domain") or ".dola.com",
+                                                timeout=_INJECT_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001
+            ok, note = False, "注入过程出错（%s）" % exc
+        if ok:
+            rec["injected"] = True
+            self._mark_kernel_owner(rec.get("account_id"))
+            print(f"[desktop] 切换账号：{note}；刷新真站：{rec.get('real')}")
+            self._navigate(win, rec.get("real") or rec.get("url") or "", rec.get("url") or "")
+            self._set_win_title(win, rec["title"] + " · dola.com")
+            self._publish(rec, "running", note="前台显示中（已重新写入登录态）")
+        else:
+            print(f"[desktop] 切换账号：注入不可用（{note}），改用本机代理页")
+            self._navigate(win, rec.get("url") or "", "")
+            self._set_win_title(win, rec["title"] + " · 本机代理页")
+            self._publish(rec, "running", note="前台显示中（本机代理页：%s）" % note)
+        if not ok or self.demo:
+            return
+        info = _inspect_real_site(win, host=_real_host(rec.get("real") or ""))
+        if not info.get("ok"):
+            print("[desktop] v%s 自检：重连后真站没渲染出来 ——\n%s"
+                  % (version, _format_report(info, rec.get("url") or "", version)))
+            self._publish(rec, "stale", note="重连后真站没渲染出来（窗口里有诊断页）")
 
     def _finish_cookie_window(self, win, proxy_url: str, real_url: str,
-                              cookie: str, domain: str, title: str) -> None:
+                              cookie: str, domain: str, title: str,
+                              rec: dict = None, hidden: bool = False) -> None:
         """注入 Cookie 成功就打开真实 dola.com，失败就退回本机代理页。"""
         version = _app_version() or "?"
         try:
@@ -952,19 +1452,43 @@ class Control:
         if ok:
             print(f"[desktop] {note}；打开真实站点：{real_url}")
             target, suffix = real_url, " · dola.com"
+            if rec is not None:
+                rec["injected"] = True
+                self._mark_kernel_owner(rec.get("account_id"))
         else:
             print(f"[desktop] Cookie 注入不可用（{note}），改用本机代理页：{proxy_url}")
             target, suffix = proxy_url, " · 本机代理页"
         # 先导航、再写标题：标题没写上也不能挡住导航
         self._navigate(win, target, proxy_url)
         self._set_win_title(win, title + suffix)
+        if rec is not None:
+            if hidden:
+                self._publish(rec, "parked", note="已挂起在后台（真站页面已就绪，切换秒开）"
+                              if ok else "已挂起在后台（本机代理页）")
+            else:
+                self._publish(rec, "running", note="前台显示中（真站）" if ok else "前台显示中（本机代理页）")
         if not ok or self.demo:
+            return
+        if hidden:
+            # 后台窗口看不见，别给用户弹诊断页；只用会话备注说明情况
+            info = _inspect_real_site(win, host=_real_host(real_url))
+            if info.get("ok"):
+                print(f"[desktop] v{version} 挂起自检：真站已渲染 —— {info['why']}")
+                if rec is not None:
+                    self._publish(rec, "parked", note="已挂起在后台（真站已就绪，切换秒开）")
+            else:
+                print("[desktop] v%s 挂起自检：真站没渲染出来（窗口在后台，不弹诊断页）——\n%s"
+                      % (version, _format_report(info, proxy_url, version)))
+                if rec is not None:
+                    self._publish(rec, "stale", note="后台挂起，但真站没渲染出来（切换过去看诊断页）")
             return
         # 打开了真站，但要确认它真的渲染出来了 —— 白屏不能再靠人肉发现
         info = _inspect_real_site(win, host=_real_host(real_url))
         if info["ok"]:
             print(f"[desktop] v{version} 自检：真站已渲染 —— {info['why']}")
             self._set_win_title(win, title + " · dola.com")
+            if rec is not None:
+                self._publish(rec, "running", note="前台显示中（真站已渲染）")
             return
         print("[desktop] v%s 自检：真站没渲染出来 ——\n%s"
               % (version, _format_report(info, proxy_url, version)))
@@ -972,10 +1496,14 @@ class Control:
             win.load_html(_diagnose_html(info, real_url, proxy_url, title, version,
                                          net_note=self.net_note, base_url=self.base_url))
             self._set_win_title(win, title + " · 真站打不开（窗口里有说明）")
+            if rec is not None:
+                self._publish(rec, "running", note="前台显示中，但真站打不开（窗口里有诊断页）")
         except Exception as exc:  # noqa: BLE001
             print(f"[desktop] 诊断页也显示不出来（{exc}），退回本机代理页")
             self._navigate(win, proxy_url, "")
             self._set_win_title(win, title + " · 本机代理页")
+            if rec is not None:
+                self._publish(rec, "running", note="前台显示中（本机代理页）")
 
     @staticmethod
     def _navigate(win, target: str, fallback: str) -> None:
@@ -1010,14 +1538,16 @@ class Control:
 
         否则 webview.start() 会因为还有窗口活着而不返回，程序就卡住不退出/不重启了。
         """
+        for account_id in list(self._sessions.keys()):
+            self.close_session(account_id)
         for win in list(self.web_windows):
             try:
                 win.destroy()
             except Exception:  # noqa: BLE001
                 pass
         self.web_windows.clear()
-
-
+        self.web_account = None
+        self._kernel_account = None
 
 # --------------------------------------------------------------------------
 # 窗口

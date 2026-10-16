@@ -28,6 +28,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -193,11 +194,19 @@ class FakePyWindow:
         self.html_base = base_uri      # 期望 None：base_uri 各后端语义不同，别乱传
 
     def evaluate_js(self, script, *args, **kwargs):
-        """默认假装内核还没回话（自检会当作「拿不到页面信息」）。"""
-        raise RuntimeError("evaluate_js 未就绪（假窗口）")
+        """自检已经不用 pywebview 的 evaluate_js 了（它会永久卡死）。留着只为兼容。"""
+        raise RuntimeError("evaluate_js 不该被调用：它会卡死，自检走 .NET 导航事件")
+
+    def show(self):
+        self.hidden = False
+        self.shown = getattr(self, "shown", 0) + 1
+
+    def hide(self):
+        self.hidden = True
+        self.hidden_count = getattr(self, "hidden_count", 0) + 1
 
     def destroy(self):
-        pass
+        self.destroyed = True
 
 
 _FAKE_INJECT_OK = [True]
@@ -208,6 +217,7 @@ def fake_webview_module():
     mod = types.ModuleType("webview")
     mod.guilib = object()          # 假装 GUI 循环已就绪
     mod.windows = []
+    mod.created = []               # (title, hidden)
     mod.injected = []              # pywebview 的注入函数被调用的记录
 
     def inject_pywebview(platform, win):
@@ -220,7 +230,9 @@ def fake_webview_module():
     def create_window(title, url, **kwargs):
         win = FakePyWindow(title, url)
         win.kwargs = kwargs          # 测试要检查有没有传 js_api（传了会把进程搞崩）
+        win.hidden = bool(kwargs.get("hidden"))
         mod.windows.append(win)
+        mod.created.append((title, win.hidden))
         return win
 
     mod.create_window = create_window
@@ -324,14 +336,60 @@ def cookie_injection_checks():
               win2.loaded[:1] == ["http://127.0.0.1:8099/dola-web/3/"], win2.loaded)
         check("标题栏标明走的是本机代理页", win2.title.endswith("· 本机代理页"), win2.title)
 
-        # g) 换账号时先关旧窗口（内核 Cookie 是共享的，两个账号会同归于尽）
+        # g) 换账号时把上一个账号窗口收进后台（内核 Cookie 是共享的，不能两个都亮着）
         _FAKE_INJECT_OK[0] = True
         before = list(ctl.web_windows)
         ctl.open_web({"url": "/dola-web/4/", "title": "Dola · #4",
                       "real": "https://www.dola.com/chat/",
                       "cookie": "sessionid=zzz", "domain": ".dola.com", "account_id": 4})
-        check("换账号时上一个账号窗口被关掉",
-              bool(before) and len(ctl.web_windows) == 1, [w.title for w in ctl.web_windows])
+        hidden_ok = bool(before) and all(getattr(w, "hidden", False) for w in before)
+        check("换账号时上一个账号窗口被挂起（不销毁，切回去更快）",
+              hidden_ok and not any(getattr(w, "destroyed", False) for w in before),
+              [(w.title, getattr(w, "hidden", None)) for w in before])
+
+        # g2) 切回已挂起的账号：直接显示（内核登录态已被 #4 顶掉 → 自动重连）
+        win3b = before[0]                       # 就是步骤 e) 里为账号 #2 建的窗口
+        n_windows = len(sys.modules["webview"].windows)
+        loaded_before = list(win3b.loaded)
+        ctl.open_web({"url": "/dola-web/2/", "title": "Dola · #2 测试号",
+                      "real": "https://www.dola.com/chat/",
+                      "cookie": "sessionid=abc", "domain": ".dola.com", "account_id": 2})
+        for _ in range(60):
+            if not getattr(win3b, "hidden", False) and win3b.loaded != loaded_before:
+                break
+            time.sleep(0.1)
+        check("切回挂起的账号：复用原窗口（不新建），重新显示出来",
+              getattr(win3b, "hidden", True) is False
+              and len(sys.modules["webview"].windows) == n_windows,
+              (getattr(win3b, "hidden", None), len(sys.modules["webview"].windows), n_windows))
+        check("切回挂起的账号：内核登录态被顶掉 → 自动重连真站",
+              win3b.loaded[-1] == "https://www.dola.com/chat/", win3b.loaded)
+
+        # g3) 后台挂起：窗口建好但隐藏，且不弹诊断页
+        sys.modules["webview"].windows.clear()
+        sys.modules["webview"].created.clear()
+        ctl.open_web({"url": "/dola-web/5/", "title": "Dola · #5",
+                      "real": "https://www.dola.com/chat/",
+                      "cookie": "sessionid=p", "domain": ".dola.com", "account_id": 5})
+        ctl.session({"action": "suspend", "url": "/dola-web/6/", "title": "Dola · #6",
+                     "real": "https://www.dola.com/chat/",
+                     "cookie": "sessionid=q", "domain": ".dola.com", "account_id": 6})
+        for _ in range(60):
+            if len(sys.modules["webview"].windows) >= 2 and any(
+                    "https://www.dola.com/chat/" in (w.loaded or []) for w in sys.modules["webview"].windows[1:]):
+                break
+            time.sleep(0.1)
+        parked = sys.modules["webview"].windows[-1]
+        check("后台挂起：create_window 传 hidden=True（不弹窗）",
+              sys.modules["webview"].created[-1] == ("Dola · #6", True),
+              sys.modules["webview"].created[-1])
+        check("后台挂起也把真站准备好了（切换时不用等）",
+              "https://www.dola.com/chat/" in (parked.loaded or []), parked.loaded)
+        check("后台挂起不弹诊断页（看不见的窗口不该换成说明页）",
+              "真站没能在窗口里显示" not in (getattr(parked, "html_shown", "") or ""),
+              (getattr(parked, "html_shown", "") or "")[:30])
+        check("后台挂起时前台窗口被收起", getattr(sys.modules["webview"].windows[0], "hidden", False) is True,
+              getattr(sys.modules["webview"].windows[0], "hidden", None))
     finally:
         if real_mod is not None:
             sys.modules["webview"] = real_mod
@@ -627,72 +685,160 @@ def network_checks():
     check("控制台编码兜底：不可编码字符换成 ?（保住后台线程，不崩）",
           fake_out.kwargs == {"errors": "replace"}, fake_out.kwargs)
 
-    # e) 真站自检的判定
+    # e) 真站自检的判定（新：以 .NET 导航结果为主证据）
+    def page(**kw):
+        base = {"href": "", "source": "", "started": "", "nav_done": False, "nav_ok": None,
+                "http": None, "error_code": "", "error_hint": "", "js_ok": False,
+                "js_error": "", "report": {}}
+        base.update(kw)
+        return base
+
     check("自检：地址还是 about:blank → 判为没打开（并指出是网络/代理层面）",
-          desktop._judge_real_site({"href": "about:blank"})[0] is False
-          and "about:blank" in desktop._judge_real_site({"href": "about:blank"})[1], "ok")
+          desktop._judge_page_state(page(href="about:blank"))[0] is False
+          and "about:blank" in desktop._judge_page_state(page(href="about:blank"))[1], "ok")
     check("自检：内核跳到错误页 → 判为导航失败",
-          desktop._judge_real_site({"href": "chrome-error://chromewebdata/"})[0] is False, "ok")
-    check("自检：真站有内容 → 通过",
-          desktop._judge_real_site({"href": "https://www.dola.com/chat/", "text": "开始创作",
-                                    "html_len": 5000, "status": 200, "title": "Dola"})[0] is True, "ok")
+          desktop._judge_page_state(page(href="chrome-error://chromewebdata/"))[0] is False, "ok")
+    check("自检：地址对 + 导航成功 + 有正文 → 通过",
+          desktop._judge_page_state(page(
+              href="https://www.dola.com/chat/", nav_done=True, nav_ok=True, http=200, js_ok=True,
+              report={"html_len": 5000, "text": "开始创作", "title": "Dola", "status": 200}))[0] is True, "ok")
     check("自检：地址对但内容是空的 → 判为没渲染出来（白屏能被抓出来）",
-          desktop._judge_real_site({"href": "https://www.dola.com/chat/", "text": "",
-                                    "html_len": 20, "status": 200})[0] is False, "ok")
+          desktop._judge_page_state(page(
+              href="https://www.dola.com/chat/", nav_done=True, nav_ok=True, http=200, js_ok=True,
+              report={"html_len": 20, "text": "", "status": 200}))[0] is False, "ok")
     check("自检：拿不到页面信息 → 判为失败而不是通过",
-          desktop._judge_real_site(None)[0] is False, "ok")
+          desktop._judge_page_state(page())[0] is False, "ok")
+    ok, why = desktop._judge_page_state(page(
+        href="https://www.dola.com/chat/", nav_done=True, nav_ok=False,
+        error_code="WebErrorStatus.ConnectionAborted", error_hint="连接被中断（链路被重置：常见于该走代理却直连、或代理不稳）"))
+    check("自检：导航失败时把 WebErrorStatus 翻成人话（这是真机最有用的一行）",
+          ok is False and "ConnectionAborted" in why and "链路被重置" in why, why)
+    check("自检：脚本通道没回话但导航成功 → 仍算打开（并写清只验证到导航这一层）",
+          desktop._judge_page_state(page(href="https://www.dola.com/chat/", nav_done=True,
+                                         nav_ok=True, http=200, js_ok=False))[0] is True, "ok")
+    check("WebErrorStatus → 人话的映射（连不上代理 / 解析失败 / 超时）",
+          "代理" in desktop._hint_for_nav_error("WebErrorStatus.CannotConnectToProxy")
+          and "DNS" in desktop._hint_for_nav_error("HostNameNotResolved")
+          and "超时" in desktop._hint_for_nav_error("Timeout"), "ok")
 
-    # f) 轮询式自检：先 about:blank，后渲染出来
-    class ProbeWin:
-        def __init__(self, seq):
-            self.seq, self.calls = list(seq), 0
-
-        def evaluate_js(self, *_a, **_k):
-            self.calls += 1
-            return self.seq[min(self.calls - 1, len(self.seq) - 1)]
-
-    win = ProbeWin([{"href": "about:blank"}, {"href": "about:blank"},
-                    {"href": "https://www.dola.com/chat/", "text": "创作", "html_len": 4000, "status": 200}])
-    got = desktop._inspect_real_site(win, timeout=3, poll=0.05)
-    check("轮询自检：一直等到渲染成功才放行", got["ok"] and win.calls == 3, (got["why"], win.calls))
-
-    win2 = ProbeWin([{"href": "about:blank"}])
-    got2 = desktop._inspect_real_site(win2, timeout=0.3, poll=0.05)
-    check("轮询自检：一直打不开 → 超时后返回失败和原因",
-          got2["ok"] is False and "about:blank" in got2["why"] and win2.calls >= 2, got2["why"])
-
-    win_str = ProbeWin(['{"href": "https://www.dola.com/chat/", "text": "创作", "html_len": 3000, "status": 200}'])
-    got_str = desktop._inspect_real_site(win_str, timeout=1, poll=0.05)
-    check("自检兼容「结果是 JSON 字符串」的后端", got_str["ok"] is True, got_str["why"])
-
-    class BrokenWin:
-        def evaluate_js(self, *_a, **_k):
-            raise RuntimeError("内核没注入脚本")
-
-    got3 = desktop._inspect_real_site(BrokenWin(), timeout=0.25, poll=0.05)
-    check("轮询自检：脚本通道报错也不抛异常，而是当成失败并记下原因",
-          got3["ok"] is False and "内核没注入脚本" in got3["error"], got3["error"])
-
-    class HangingWin:
-        """内核卡住不回话：evaluate_js 永不返回。"""
+    # f) 轮询式自检：内核一开始没导航，后来成功渲染
+    class _Evt:
+        """.NET 事件的样子：pythonnet 里写 `core.X += handler`。"""
 
         def __init__(self):
-            self.gate = threading.Event()
+            self.handlers = []
 
-        def evaluate_js(self, *_a, **_k):
-            self.gate.wait(30)
-            return {}
+        def __iadd__(self, fn):
+            self.handlers.append(fn)
+            return self
 
-    old_limit = desktop._PROBE_HARD_LIMIT
-    desktop._PROBE_HARD_LIMIT = 0.4
+    class NavCore:
+        """假 CoreWebView2：支持 NavigationStarting/Completed 事件与 ExecuteScriptAsync。"""
+
+        Source = "about:blank"
+
+        def __init__(self, script_result='{"href":"https://www.dola.com/chat/","text":"创作","html_len":4000,"status":200}'):
+            self._started = []
+            self._done = []
+            self.NavigationStarting = _Evt()
+            self.NavigationCompleted = _Evt()
+            self.script_result = script_result
+            self.script_calls = 0
+
+        def complete(self, url="https://www.dola.com/chat/", ok=True, http=200, err="WebErrorStatus.UnexpectedError"):
+            class Sender:
+                Source = url
+
+            class Args:
+                IsSuccess = ok
+                HttpStatusCode = http
+                WebErrorStatus = err
+
+            for fn in self.NavigationCompleted.handlers:
+                fn(Sender(), Args())
+
+        def start(self, url):
+            class Args:
+                Uri = url
+
+            for fn in self.NavigationStarting.handlers:
+                fn(None, Args())
+
+        def ExecuteScriptAsync(self, js):
+            self.script_calls += 1
+            class Task:                      # 结果直接可用（不做真异步）
+                Result = self.script_result
+            return Task()
+
+    class NavWin:
+        """假窗口：和 pywebview 一样 —— Invoke 在 native（BrowserView）上，
+        native.webview 才是 .NET 的 WebView2 控件。"""
+
+        def __init__(self, core):
+            ns = types.SimpleNamespace(webview=types.SimpleNamespace(CoreWebView2=core))
+            ns.Invoke = lambda fn: fn()          # 切 UI 线程
+            self.native = ns
+
+    old_clr, old_invoke = desktop._clr_ready, desktop._ui_invoke
+    desktop._clr_ready = lambda: (True, "")
+    desktop._ui_invoke = lambda holder, fn: holder.Invoke(fn)
     try:
+        core = NavCore()
+        win = NavWin(core)
+        state = desktop._install_page_probe(win, log=lambda *a: None)
+        check("自检装上了 .NET 导航监听（Starting/Completed 都挂上了）",
+              len(core.NavigationStarting.handlers) == 1
+              and len(core.NavigationCompleted.handlers) == 1,
+              (core.NavigationStarting.handlers, core.NavigationCompleted.handlers))
+        core.start("https://www.dola.com/chat/")
+        p1 = desktop._page_state(state)
+        check("自检：导航已开始但没结束 → 如实说「还没结束」",
+              p1["started"].endswith("dola.com/chat/") and p1["nav_done"] is False, p1["started"])
+        core.complete(ok=True, http=200)
+        core.script_result = '{"href":"https://www.dola.com/chat/","text":"创作","html_len":4200,"status":200}'
+        state["_start_js"]()                 # 模拟一次 JS 探针
+        p2 = desktop._page_state(state)
+        check("自检：导航成功后靠自己的脚本探针确认有正文（标题/正文/HTTP 都拿得到）",
+              p2["nav_ok"] is True and p2["js_ok"] is True
+              and desktop._judge_page_state(p2)[0] is True, desktop._judge_page_state(p2)[1])
+        check("JS 探针走的是内核的 ExecuteScriptAsync（不是 pywebview 的 evaluate_js）",
+              core.script_calls == 1, core.script_calls)
+
+        # 脚本通道坏掉（返回 null）→ 只记一笔，绝不能挂住
+        core2 = NavCore(script_result=None)
+        win2 = NavWin(core2)
+        state2 = desktop._install_page_probe(win2, log=lambda *a: None)
+        state2["_start_js"]()
+        core2.complete(ok=True, http=200)
+        p3 = desktop._page_state(state2)
+        check("脚本通道返回空 → 记为「没回话」，但导航成功仍算打开（不卡死）",
+              p3["js_ok"] is False and "空" in p3["js_error"]
+              and desktop._judge_page_state(p3)[0] is True, (p3["js_error"], desktop._judge_page_state(p3)[1]))
+
+        # 导航失败 → WebErrorStatus 翻成人话
+        core3 = NavCore()
+        state3 = desktop._install_page_probe(NavWin(core3), log=lambda *a: None)
+        core3.complete(ok=False, http=0, err="WebErrorStatus.CannotConnectToProxy")
+        p4 = desktop._page_state(state3)
+        ok4, why4 = desktop._judge_page_state(p4)
+        check("导航失败 → 原因里带 WebErrorStatus 的中文解释（真机诊断靠这行）",
+              ok4 is False and "CannotConnectToProxy" in why4 and "代理" in why4, why4)
+
+        # UI 线程卡住 → 有界 Invoke 要能放弃，而不是把自检线程一起拖死
+        class StuckHolder:
+            def Invoke(self, fn):
+                time.sleep(5)
+
         t0 = time.time()
-        got4 = desktop._inspect_real_site(HangingWin(), timeout=0.2, poll=0.05)
-        spent = time.time() - t0
-        check("内核卡住不回话 → 看门狗放弃并出结论（不会永远挂着）",
-              got4["ok"] is False and "没回话" in got4["why"] and spent < 5, (got4["why"], round(spent, 2)))
+        ok5 = desktop._ui_invoke_bounded(StuckHolder(), lambda: None, timeout=0.3)
+        check("UI 线程卡住时有界 Invoke 会放弃（不会永久卡死调用方）",
+              ok5 is False and (time.time() - t0) < 2, round(time.time() - t0, 2))
+
+        # 拿不到内核 → 明确失败
+        got6 = desktop._inspect_real_site(NavWin(None), timeout=0.2, poll=0.05)
+        check("拿不到内核时自检明确失败并说明原因", got6["ok"] is False and "内核" in got6["why"], got6["why"])
     finally:
-        desktop._PROBE_HARD_LIMIT = old_limit
+        desktop._clr_ready, desktop._ui_invoke = old_clr, old_invoke
 
     # g) 整条路：注入成功但真站白屏 → 窗口显示诊断页（而不是干白着）
     real_mod = sys.modules.get("webview")
@@ -702,8 +848,11 @@ def network_checks():
         ctl = desktop.Control()
         ctl.base_url = "http://127.0.0.1:8099/"
         ctl.net_note = "经本机中转 http://127.0.0.1:1234 → proxy.example:6666"
-        desktop._inspect_real_site = lambda *a, **k: {"ok": False, "why": "地址还是 about:blank",
-                                                     "report": {"href": "about:blank"}, "error": ""}
+        desktop._inspect_real_site = lambda *a, **k: {
+            "ok": False, "why": "地址还是 about:blank",
+            "report": {"href": "about:blank"}, "error": "",
+            "page": {"href": "about:blank", "nav_done": False, "started": "", "js_ok": False,
+                     "js_error": "evaluate_js 一直没返回"}}
         ctl.open_web({"url": "/dola-web/7/", "title": "Dola · #7", "real": "https://www.dola.com/chat/",
                       "cookie": "sessionid=a", "domain": ".dola.com", "account_id": 7})
         w = sys.modules["webview"].windows[-1]
@@ -716,13 +865,16 @@ def network_checks():
               "真站没能在窗口里显示" in page and "about:blank" in page, "诊断页已显示")
         check("诊断页里带上了内核网络说明（代理还是直连）",
               "127.0.0.1:1234" in page, "ok")
+        check("诊断页里有「导航结果」和「脚本通道」两行（真机诊断的关键证据）",
+              "导航结果" in page and "脚本通道" in page and "evaluate_js 一直没返回" in page, "ok")
         check("标题栏明说真站打不开", w.title.endswith("真站打不开（窗口里有说明）"), w.title)
 
         # h) 注入成功且真站渲染出来 → 不显示诊断页，标题保持 dola.com
         sys.modules["webview"].windows.clear()
-        desktop._inspect_real_site = lambda *a, **k: {"ok": True, "why": "标题「Dola」",
-                                                      "report": {"href": "https://www.dola.com/chat/"},
-                                                      "error": ""}
+        desktop._inspect_real_site = lambda *a, **k: {
+            "ok": True, "why": "标题「Dola」", "report": {"href": "https://www.dola.com/chat/"},
+            "error": "", "page": {"href": "https://www.dola.com/chat/", "nav_done": True,
+                                  "nav_ok": True, "http": 200, "js_ok": True}}
         ctl.open_web({"url": "/dola-web/8/", "title": "Dola · #8", "real": "https://www.dola.com/chat/",
                       "cookie": "sessionid=b", "domain": ".dola.com", "account_id": 8})
         w2 = sys.modules["webview"].windows[-1]
@@ -878,6 +1030,22 @@ def main():
         check("空 Cookie 建号被拒（不会再存进坏数据）", status == 400 and "Cookie" in str(res), str(res)[:110])
         check("代理入口可访问（沙箱无外网时给出「连不上 Dola」说明页，而不是 500）",
               live_proxy_check(acc_id), "GET /dola-web/%s/" % acc_id)
+
+        print("\n== 4b. 窗口会话（前台打开 / 后台挂起 / 切换）==")
+        status, sess = call("GET", "/api/desktop/sessions")
+        check("会话总览：桌面版 can_manage=True",
+              status == 200 and sess.get("mode") == "desktop" and sess.get("can_manage") is True, sess)
+        status, res = call("POST", "/api/accounts/%s/session" % acc_id, {"action": "suspend"})
+        check("后台挂起：桌面版接收（不弹窗，窗口隐藏着准备好）",
+              status == 200 and res.get("mode") == "desktop" and res.get("action") == "suspend", res)
+        status, res = call("POST", "/api/accounts/%s/session" % acc_id, {"action": "activate"})
+        check("切换过去：桌面版接收 activate", status == 200 and res.get("action") == "activate", res)
+        status, res = call("POST", "/api/accounts/%s/session" % acc_id, {"action": "close"})
+        check("关闭窗口：桌面版接收 close", status == 200 and res.get("action") == "close", res)
+        status, res = call("POST", "/api/accounts/%s/session" % acc_id, {"action": "乱写"})
+        check("非法会话动作 → 400", status == 400, str(res)[:80])
+        status, res = call("POST", "/api/accounts/999999/session", {"action": "open"})
+        check("给不存在的账号开会话 → 404", status == 404, str(res)[:80])
 
         print("\n== 5. reveal 路径处理 ==")
         status, res = call("POST", "/api/desktop/reveal", {"path": "/etc/passwd"})

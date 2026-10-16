@@ -61,10 +61,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .node-body .status.error{background:rgba(255,107,107,0.15);color:#ff6b6b}
 
 /* 端口 */
-.port{position:absolute;width:14px;height:14px;background:#2a3538;border:2px solid #5a6a6d;border-radius:50%;cursor:crosshair;z-index:20;transition:all .2s}
+.port{position:absolute;width:14px;height:14px;background:#2a3538;border:2px solid #5a6a6d;border-radius:50%;cursor:crosshair;z-index:30;transition:all .2s}
+/* 真正好点：外面套一圈 30px 的透明命中区（伪元素也是可命中的） */
+.port::after{content:'';position:absolute;left:-9px;top:-9px;right:-9px;bottom:-9px;border-radius:50%}
 .port:hover{background:#078d78;border-color:#078d78;transform:scale(1.3)}
-.port.input{left:-7px}
-.port.output{right:-7px}
+.port.armed{background:#f5a623;border-color:#f5a623;box-shadow:0 0 0 4px rgba(245,166,35,0.25)}
+.port.input{left:-8px}
+.port.output{right:-8px}
 .port.connected{background:#078d78;border-color:#078d78}
 
 /* 连线SVG */
@@ -72,7 +75,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .connections-svg path{fill:none;stroke:#3a484b;stroke-width:2;pointer-events:stroke;cursor:pointer}
 .connections-svg path:hover{stroke:#ff6b6b}
 .connections-svg path.active{stroke:#078d78;stroke-width:3}
-.connections-svg path.temp{stroke:#f5a623;stroke-dasharray:5,5}
+.connections-svg path.temp{stroke:#f5a623;stroke-dasharray:5,5;pointer-events:none}
 
 /* 右侧属性面板 */
 .props-panel{position:fixed;top:48px;right:0;bottom:0;width:260px;background:rgba(15,20,22,0.95);backdrop-filter:blur(10px);border-left:1px solid rgba(48,59,62,0.5);padding:16px;overflow-y:auto;z-index:999;display:none}
@@ -233,7 +236,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 <div class="toast" id="toast"></div>
 
 <!-- 帮助提示 -->
-<div class="help-hint">空格+拖拽=平移画布 | 滚轮=缩放 | Delete=删除选中 | 从端口拖拽=连线</div>
+<div class="help-hint" id="helpHint">空格+拖拽=平移画布 | 滚轮=缩放 | Delete=删除选中 | 点两下端口或从端口拖到目标=连线</div>
 
 <script>
 // ==================== 鉴权（DOLA_ADMIN_TOKEN）====================
@@ -276,8 +279,12 @@ let panStartX = 0, panStartY = 0;
 let isDraggingNode = false;
 let dragNode = null;
 let dragOffsetX = 0, dragOffsetY = 0;
-let isConnecting = false;
-let connectFrom = null;
+let isConnecting = false;      // 兼容旧代码：当前是否正在连线
+let connectFrom = null;        // 兼容旧代码：起点信息
+let pendingFrom = null;        // 待连线的一端 {nodeId, port, type}
+let portDragged = false;       // 按住端口后是否移动过（区分“拖拽”和“点一下”）
+let portDownX = 0, portDownY = 0;
+let lastMouseX = 0, lastMouseY = 0;
 let tempLine = null;
 let nodeIdCounter = 1;
 
@@ -344,6 +351,7 @@ canvasContainer.addEventListener('wheel', (e) => {
 // 空格+拖拽平移
 let spacePressed = false;
 document.addEventListener('keydown', (e) => {
+    if (e.code === 'Escape') { cancelPending('已取消连线'); return; }
     if (e.code === 'Space') { spacePressed = true; canvasContainer.style.cursor = 'grab'; }
     if (e.code === 'Delete' || e.code === 'Backspace') {
         if (selectedNode) { deleteNode(selectedNode.id); }
@@ -361,10 +369,12 @@ canvasContainer.addEventListener('mousedown', (e) => {
         panStartY = e.clientY - panY;
         canvasContainer.classList.add('panning');
         deselectAll();
+        cancelPending('已取消连线');
     }
 });
 
 document.addEventListener('mousemove', (e) => {
+    lastMouseX = e.clientX; lastMouseY = e.clientY;
     if (isPanning) {
         panX = e.clientX - panStartX;
         panY = e.clientY - panStartY;
@@ -377,25 +387,171 @@ document.addEventListener('mousemove', (e) => {
         updateNodePosition(dragNode);
         updateConnections();
     }
-    if (isConnecting && tempLine) {
+    if (pendingFrom) {
+        if (Math.abs(e.clientX - portDownX) + Math.abs(e.clientY - portDownY) > 4) portDragged = true;
         const rect = canvasContainer.getBoundingClientRect();
-        const x = (e.clientX - rect.left - panX) / zoom;
-        const y = (e.clientY - rect.top - panY) / zoom;
-        updateTempLine(x, y);
+        updateTempLine((e.clientX - rect.left - panX) / zoom, (e.clientY - rect.top - panY) / zoom);
     }
 });
 
-document.addEventListener('mouseup', () => {
+document.addEventListener('mouseup', (e) => {
     isPanning = false;
     canvasContainer.classList.remove('panning');
     isDraggingNode = false;
     dragNode = null;
-    if (isConnecting) {
-        isConnecting = false;
-        if (tempLine) { tempLine.remove(); tempLine = null; }
-        connectFrom = null;
-    }
+    if (!pendingFrom) return;
+    if (!portDragged) return;              // 只是点了一下：保持选中，等用户点另一端
+    const want = pendingFrom.type === 'output' ? 'input' : 'output';
+    const hit = resolveDropTarget(e, want);
+    const from = pendingFrom;
+    pendingFrom = null;
+    if (tempLine) { tempLine.remove(); tempLine = null; }
+    paintArmed();
+    updateHint();
+    if (hit) connectPorts(from, hit);
+    else toast('没连上：请拖到目标节点的小圆点上（或点一下输出圆点、再点输入圆点）', true);
 });
+
+// ==================== 连线：拖拽 / 点两下都行，落点容错 ====================
+function portInfo(el) {
+    if (!el || !el.dataset || !el.dataset.node) return null;
+    return { nodeId: el.dataset.node, port: el.dataset.port, type: el.dataset.type };
+}
+
+function paintArmed() {
+    document.querySelectorAll('.port.armed').forEach(p => p.classList.remove('armed'));
+    if (!pendingFrom) return;
+    const el = document.querySelector('.port[data-node="' + pendingFrom.nodeId + '"][data-port="' + pendingFrom.port + '"]');
+    if (el) el.classList.add('armed');
+}
+
+function makeTempLine() {
+    if (tempLine) tempLine.remove();
+    tempLine = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    tempLine.classList.add('temp');
+    connectionsSvg.appendChild(tempLine);
+}
+
+function updateHint() {
+    const el = document.getElementById('helpHint');
+    if (!el) return;
+    el.textContent = pendingFrom
+        ? '连线中：点目标端口即可连上（' + (pendingFrom.type === 'output' ? '来自输出端口' : '来自输入端口') + '）· Esc/点空白=取消'
+        : '空格+拖拽=平移画布 | 滚轮=缩放 | Delete=删除选中 | 点两下端口或从端口拖到目标=连线';
+}
+
+function cancelPending(msg) {
+    if (!pendingFrom) return false;
+    pendingFrom = null;
+    if (tempLine) { tempLine.remove(); tempLine = null; }
+    paintArmed();
+    updateHint();
+    if (msg) toast(msg);
+    return true;
+}
+
+// 按住端口：可能是「拖过去松开」，也可能是「点一下」
+function onPortDown(port) {
+    const info = portInfo(port);
+    if (!info) return;
+    portDownX = lastMouseX; portDownY = lastMouseY;
+    portDragged = false;
+    if (pendingFrom && pendingFrom.type !== info.type) {   // 两端凑齐，直接连
+        const from = pendingFrom;
+        pendingFrom = null;
+        if (tempLine) { tempLine.remove(); tempLine = null; }
+        paintArmed();
+        updateHint();
+        connectPorts(from, info);
+        return;
+    }
+    pendingFrom = info;
+    makeTempLine();
+    paintArmed();
+    updateHint();
+    const p = getPortPosition(info.nodeId, info.port, info.type);
+    updateTempLine(p.x, p.y);
+}
+
+// 点一下端口（没有拖动）
+function onPortClick(port) {
+    const info = portInfo(port);
+    if (!info) return;
+    if (pendingFrom) {
+        if (pendingFrom.type !== info.type) {
+            const from = pendingFrom;
+            pendingFrom = null;
+            if (tempLine) { tempLine.remove(); tempLine = null; }
+            paintArmed();
+            updateHint();
+            connectPorts(from, info);
+        } else {
+            pendingFrom = info; paintArmed(); updateHint();
+            toast('已改选这一端，再去点另一端的端口');
+        }
+        return;
+    }
+    pendingFrom = info;
+    makeTempLine();
+    paintArmed();
+    updateHint();
+    const p = getPortPosition(info.nodeId, info.port, info.type);
+    updateTempLine(p.x, p.y);
+    toast(info.type === 'output' ? '已选中输出端口：再点目标的输入圆点就能连上' : '已选中输入端口：再点来源的输出圆点就能连上');
+}
+
+// 松开的位置到底落在哪个端口上：先看鼠标下面的元素，再看 60px 内最近的同类端口
+function resolveDropTarget(e, wantType) {
+    const tgt = e && e.target && e.target.closest ? e.target : null;
+    const direct = tgt ? tgt.closest('.port') : null;
+    if (direct && direct.dataset.type === wantType) return portInfo(direct);
+    const directNode = tgt ? tgt.closest('.node') : null;      // 松手在节点身上也算（手不用抖那么准）
+    if (directNode) {
+        const cand = directNode.querySelector('.port.' + wantType);
+        if (cand) return portInfo(cand);
+    }
+    let el = null;
+    try { el = document.elementFromPoint(e.clientX, e.clientY); } catch (err) { el = null; }
+    if (el && el.closest) {
+        const p = el.closest('.port');
+        if (p && p.dataset.type === wantType) return portInfo(p);
+        const n = el.closest('.node');
+        if (n && wantType === 'input') {
+            const cand = n.querySelector('.port.input');
+            if (cand) return portInfo(cand);
+        }
+    }
+    let best = null, bestD = 1e9;
+    document.querySelectorAll('.port.' + wantType).forEach(pe => {
+        const r = pe.getBoundingClientRect();
+        const d = Math.hypot(e.clientX - (r.left + r.width / 2), e.clientY - (r.top + r.height / 2));
+        if (d < bestD) { bestD = d; best = pe; }
+    });
+    if (best && bestD < 60) return portInfo(best);
+    return null;
+}
+
+// 连两个端口：自动识别方向，并给出人话提示
+function connectPorts(a, b) {
+    let from = a, to = b;
+    if (a.type === 'input') { from = b; to = a; }
+    if (from.type !== 'output' || to.type !== 'input') {
+        toast('方向不对：要连「输出圆点 → 输入圆点」', true);
+        return false;
+    }
+    if (from.nodeId === to.nodeId) {
+        toast('同一个节点不能连自己', true);
+        return false;
+    }
+    const dup = connections.find(c => c.from_node === from.nodeId && c.from_port === from.port &&
+                                      c.to_node === to.nodeId && c.to_port === to.port);
+    if (dup) {
+        toast('这两个端口已经连过了', true);
+        return false;
+    }
+    createConnection(from.nodeId, from.port, to.nodeId, to.port);
+    return true;
+}
 
 // ==================== 节点拖拽创建 ====================
 document.querySelectorAll('.node-item').forEach(item => {
@@ -508,28 +664,17 @@ function renderNode(node) {
         e.stopPropagation();
     });
     
-    // 端口连线
+    // 端口连线：既支持「按住输出圆点拖到目标」，也支持「先点一下输出圆点、再点一下输入圆点」
     el.querySelectorAll('.port').forEach(port => {
         port.addEventListener('mousedown', (e) => {
             e.stopPropagation();
-            if (port.dataset.type === 'output') {
-                isConnecting = true;
-                connectFrom = { nodeId: node.id, port: port.dataset.port, type: 'output' };
-                const pos = getPortPosition(node.id, port.dataset.port, 'output');
-                tempLine = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-                tempLine.classList.add('temp');
-                connectionsSvg.appendChild(tempLine);
-                updateTempLine(pos.x, pos.y);
-            }
+            e.preventDefault();
+            onPortDown(port);
         });
-        port.addEventListener('mouseup', (e) => {
+        // 注意：端口上的 mouseup 一定要能冒泡到 document，否则拖拽松手收不到
+        port.addEventListener('click', (e) => {
             e.stopPropagation();
-            if (isConnecting && connectFrom && port.dataset.type === 'input') {
-                createConnection(connectFrom.nodeId, connectFrom.port, node.id, port.dataset.port);
-            }
-            if (isConnecting && tempLine) { tempLine.remove(); tempLine = null; }
-            isConnecting = false;
-            connectFrom = null;
+            if (!portDragged) onPortClick(port);
         });
     });
     
@@ -636,10 +781,13 @@ function updateConnections() {
 }
 
 function updateTempLine(x, y) {
-    if (!tempLine || !connectFrom) return;
-    const from = getPortPosition(connectFrom.nodeId, connectFrom.port, 'output');
-    const dx = Math.abs(x - from.x) * 0.5;
-    tempLine.setAttribute('d', `M ${from.x} ${from.y} C ${from.x + dx} ${from.y}, ${x - dx} ${y}, ${x} ${y}`);
+    const start = pendingFrom || connectFrom;
+    if (!tempLine || !start) return;
+    const p = getPortPosition(start.nodeId, start.port, start.type);
+    let a = p, b = { x: x, y: y };
+    if (start.type === 'input') { a = { x: x, y: y }; b = p; }   // 从输入端口往回拖
+    const dx = Math.max(30, Math.abs(b.x - a.x) * 0.5);
+    tempLine.setAttribute('d', `M ${a.x} ${a.y} C ${a.x + dx} ${a.y}, ${b.x - dx} ${b.y}, ${b.x} ${b.y}`);
 }
 
 // ==================== 属性面板 ====================
