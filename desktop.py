@@ -192,6 +192,8 @@ class _WebWindowApi:
 # --------------------------------------------------------------------------
 # 等内核就绪的最长时间（测试会把它调小）
 _INJECT_TIMEOUT = 15.0
+# 读内核时抛异常最多容忍几次（内核初始化中途偶尔会抛），超过就当真的不可用
+_INJECT_RETRY_LIMIT = 12
 
 
 def _can_inject_cookies() -> bool:
@@ -268,7 +270,7 @@ def _inject_webview2_cookies(window, cookie: str, domain: str = ".dola.com",
     if not ready:  # 尽早失败：pythonnet 不在就说明不是 Windows/WebView2 后端
         return False, "非 Windows 内核（%s）" % why
 
-    state = {"done": False, "count": 0, "err": "", "fatal": False, "holder": None}
+    state = {"done": False, "count": 0, "err": "", "fatal": False, "fails": 0, "holder": None}
 
     def _probe_and_write():
         """只在 UI 线程上跑：内核还没就绪就直接返回，等下一轮。"""
@@ -281,6 +283,7 @@ def _inject_webview2_cookies(window, cookie: str, domain: str = ".dola.com",
             core = getattr(ctrl, "CoreWebView2", None) if ctrl is not None else None
             if core is None:
                 return                      # 还没初始化好，下一轮再试
+            state["fails"] = 0                 # 能拿到内核说明前面那次异常是暂时的
             manager = core.CookieManager
             failed = []
             for name, value in pairs:
@@ -300,7 +303,9 @@ def _inject_webview2_cookies(window, cookie: str, domain: str = ".dola.com",
             state["done"] = state["count"] > 0
         except Exception as exc:  # noqa: BLE001
             state["err"] = str(exc)
-            state["fatal"] = True            # 这类错误重试也没用，直接放弃
+            state["fails"] += 1
+            if state["fails"] >= _INJECT_RETRY_LIMIT:
+                state["fatal"] = True        # 反复失败就别耗到超时了
 
     deadline = time.time() + max(0.0, timeout)
     while True:

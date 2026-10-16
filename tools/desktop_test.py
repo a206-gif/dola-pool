@@ -113,6 +113,26 @@ class FakeControl:
         return self._core
 
 
+class FlakyControl(FakeControl):
+    """内核初始化途中偶尔会抛（真机上见过）→ 前 N 次读失败，之后正常。
+
+    用来验证：读内核抛异常时会重试，而不是一抛就放弃、把用户踢回代理页。
+    """
+
+    def __init__(self, core=None, fails=2):
+        super().__init__(core)
+        self._fails = fails
+        self.reads = 0
+
+    @property
+    def CoreWebView2(self):
+        self.reads += 1
+        if self._fails > 0:
+            self._fails -= 1
+            raise RuntimeError("CoreWebView2 was not initialized yet（瞬时错误）")
+        return super().CoreWebView2
+
+
 class FakeBrowserView:
     """模拟 pywebview 的 WinForms 窗体：Invoke 就是「切到 UI 线程」。"""
 
@@ -223,6 +243,24 @@ def cookie_injection_checks():
     # d2) 内核还没就绪（窗口刚建好）→ 轮询到超时后失败，不是卡死
     ok, why = desktop._inject_webview2_cookies(FakeWin(None), "a=1", timeout=0.4)
     check("内核未就绪时轮询到超时、返回可读原因", ok is False and "就绪" in why, why)
+
+    # d3) 读内核偶尔抛异常 → 要重试；连续失败太多次 → 快速放弃并说明原因
+    win3 = FakeWin(FakeCore())
+    flaky = FlakyControl(win3.native.webview._core, fails=2)
+    win3.native.webview = flaky
+    ok, why = desktop._inject_webview2_cookies(win3, "sessionid=abc", ".dola.com", timeout=1.5)
+    check("读内核抛异常时会重试（不是一抛就放弃、直接踢回代理页）",
+          ok is True and "1 个" in why, why)
+    check("重试次数符合预期（前两次抛、第三次成功就写入）", flaky.reads == 3, flaky.reads)
+
+    win4 = FakeWin(FakeCore())
+    flaky4 = FlakyControl(win4.native.webview._core, fails=999)
+    win4.native.webview = flaky4
+    t0 = time.time()
+    ok, why = desktop._inject_webview2_cookies(win4, "sessionid=abc", ".dola.com", timeout=10)
+    check("连续抛异常到上限就放弃（不干等到超时），且给出可读原因",
+          ok is False and "瞬时错误" in why and (time.time() - t0) < 8,
+          "%s ｜ 耗时 %.1fs" % (why, time.time() - t0))
 
     # e) 整条路：Control.open_web → 注入成功 → 打开的是真实 dola.com
     import types
