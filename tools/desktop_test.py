@@ -591,6 +591,27 @@ def network_checks():
           info6["applied"] is False and "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS" not in env6,
           info6["note"])
 
+    # d2) 控制台编码兜底：打中文不能把线程抛死
+    class _NoReconf:
+        pass
+
+    class _Reconf:
+        def __init__(self):
+            self.kwargs = None
+
+        def reconfigure(self, **kw):
+            self.kwargs = kw
+
+    saved_out, saved_err = sys.stdout, sys.stderr
+    fake_out, fake_err = _Reconf(), _NoReconf()
+    try:
+        sys.stdout, sys.stderr = fake_out, fake_err
+        desktop._make_output_robust()          # 不许抛异常
+    finally:
+        sys.stdout, sys.stderr = saved_out, saved_err
+    check("控制台编码兜底：不可编码字符换成 ?（保住后台线程，不崩）",
+          fake_out.kwargs == {"errors": "replace"}, fake_out.kwargs)
+
     # e) 真站自检的判定
     check("自检：地址还是 about:blank → 判为没打开（并指出是网络/代理层面）",
           desktop._judge_real_site({"href": "about:blank"})[0] is False
@@ -624,6 +645,10 @@ def network_checks():
     got2 = desktop._inspect_real_site(win2, timeout=0.3, poll=0.05)
     check("轮询自检：一直打不开 → 超时后返回失败和原因",
           got2["ok"] is False and "about:blank" in got2["why"] and win2.calls >= 2, got2["why"])
+
+    win_str = ProbeWin(['{"href": "https://www.dola.com/chat/", "text": "创作", "html_len": 3000, "status": 200}'])
+    got_str = desktop._inspect_real_site(win_str, timeout=1, poll=0.05)
+    check("自检兼容「结果是 JSON 字符串」的后端", got_str["ok"] is True, got_str["why"])
 
     class BrokenWin:
         def evaluate_js(self, *_a, **_k):

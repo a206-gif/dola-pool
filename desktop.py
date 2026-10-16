@@ -47,6 +47,21 @@ CONFIG_NAME = "config.json"
 # --------------------------------------------------------------------------
 # 用户数据目录（桌面版默认不写在程序目录里，避免只读安装目录 / 权限问题）
 # --------------------------------------------------------------------------
+def _make_output_robust() -> None:
+    """控制台编码兜底。
+
+    Windows 控制台默认编码可能是 cp1252（英文版系统），这时 print 中文会抛
+    UnicodeEncodeError —— 而我们的日志大多打在后台线程里，抛出去就等于悄悄中断
+    （真机上踩过一次同类问题）。这里把编不出来的字符换成 ?，保住线程；
+    控制台本来就支持中文时（cp936 / UTF-8）显示不受影响。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except Exception:  # noqa: BLE001 （没有 reconfigure 的对象、已关闭的管道都无所谓）
+            pass
+
+
 def user_data_dir() -> str:
     override = os.getenv("DOLA_DATA_DIR")
     if override:
@@ -566,6 +581,11 @@ def _inspect_loop(win, timeout: float, poll: float, host: str) -> dict:
             err = ""
         except Exception as exc:  # noqa: BLE001 （页面还没加载好 / 内核还没注入脚本）
             report, err = {}, str(exc)[:160]
+        if isinstance(report, str):        # 有的后端把结果当字符串给回来
+            try:
+                report = json.loads(report)
+            except Exception:  # noqa: BLE001
+                report = {}
         ok, why = _judge_real_site(report, host)
         if ok or time.time() >= deadline:
             return {"ok": ok, "why": why, "report": report if isinstance(report, dict) else {},
@@ -1098,6 +1118,7 @@ def open_browser(url: str) -> None:
 # 入口
 # --------------------------------------------------------------------------
 def main(argv=None) -> int:
+    _make_output_robust()
     cfg = load_config()
     parser = argparse.ArgumentParser(description=f"{APP_NAME} 桌面版")
     mode = parser.add_mutually_exclusive_group()
