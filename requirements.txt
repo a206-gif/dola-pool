@@ -1,10 +1,21 @@
-# Dola Pool 依赖
-fastapi==0.115.6
-uvicorn[standard]==0.34.0
-python-multipart==0.0.20
-requests==2.32.3
-pycryptodome==3.21.0
+# Dola Pool 依赖（服务端 / Docker / 本地运行都适用）
+#
+# 为什么用纯 uvicorn 而不是 uvicorn[standard]：
+#   [standard] 会额外拉入 pyyaml / httptools / watchfiles / uvloop，
+#   其中 pyyaml 在新版 Python（3.14、或 free-threaded 构建）上没有预编译包，
+#   pip 会退回源码编译，编译又要再联网抓 Cython —— 国内网络下极易失败
+#   （典型报错：Failed to build 'pyyaml' ... Could not find a version that
+#    satisfies the requirement Cython>=3.0）。
+#   本项目用不到 YAML 日志配置与 uvloop，装纯 uvicorn 完全够用。
+#
+# 版本用范围而不是死锁：让 pip 自动挑选「有现成 wheel」的版本，
+# 避免在新版 Python 上被迫编译。
+fastapi>=0.115,<1.0
+uvicorn>=0.30,<1.0
+python-multipart>=0.0.9
+requests>=2.31,<3
+pycryptodome>=3.20
 
-# 可选：仅制作静态资源（背景图 / 演示视频）时需要
+# 可选：仅制作静态资源（背景图 / 演示视频 / 图标）时需要
 # pillow
 # imageio-ffmpeg

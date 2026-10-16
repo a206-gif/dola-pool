@@ -10,35 +10,66 @@ echo
 
 if ! command -v python3 >/dev/null 2>&1; then
   echo "[错误] 没有检测到 python3。"
-  echo "       请先安装 Python 3.10+（https://www.python.org/downloads/ 或 brew install python）"
+  echo "       请先安装 Python 3.10+（推荐 3.12）：https://www.python.org/downloads/"
   echo "       然后重新双击本文件。"
   read -r -p "按回车退出…"
   exit 1
 fi
 
-if [ ! -x ".venv/bin/python" ]; then
-  echo "[1/3] 首次运行，正在创建运行环境…"
-  python3 -m venv .venv
-else
-  echo "[1/3] 运行环境已存在，跳过创建"
-fi
-
-echo "[2/3] 检查依赖…"
-if ! .venv/bin/python -c "import fastapi, uvicorn, webview, requests, Crypto" >/dev/null 2>&1; then
-  echo "      正在安装依赖，首次大约 1-3 分钟…"
-  .venv/bin/python -m pip install --upgrade pip -q
-  .venv/bin/python -m pip install -r requirements-desktop.txt -q
-  echo "      依赖安装完成"
-else
-  echo "      依赖已就绪"
-fi
-
-echo "[3/3] 正在启动界面…"
+echo "[1/4] 检测到 Python：$(python3 --version 2>&1)"
 echo
-.venv/bin/python desktop.py "$@" || {
+
+# 坏的虚拟环境自动重建
+if [ -d ".venv" ] && ! .venv/bin/python -c "import sys" >/dev/null 2>&1; then
+  echo "[i] 检测到损坏的 .venv，正在重建…"
+  rm -rf .venv
+fi
+
+echo "[2/4] 准备运行环境…"
+if [ ! -x ".venv/bin/python" ]; then
+  python3 -m venv .venv
+fi
+PY=".venv/bin/python"
+
+echo "[3/4] 检查依赖…"
+if $PY -c "import fastapi, uvicorn, requests, Crypto, multipart" >/dev/null 2>&1; then
+  echo "      依赖已就绪"
+else
+  $PY -m pip install --upgrade pip --timeout 60 --retries 2 --disable-pip-version-check >/dev/null 2>&1 || true
+  install_deps() {
+    echo "      $1"
+    $PY -m pip install -r requirements-desktop.txt --timeout 60 --retries 2 --disable-pip-version-check $2
+  }
+  if install_deps "首次安装约 1-3 分钟，请耐心等待…" ""; then
+    :
+  elif install_deps "官方源失败，改用清华镜像重试…" "-i https://pypi.tuna.tsinghua.edu.cn/simple"; then
+    :
+  elif install_deps "清华源失败，改用阿里云镜像重试…" "-i https://mirrors.aliyun.com/pypi/simple/"; then
+    :
+  else
+    echo
+    echo "[错误] 三个源都装不上，几乎都是网络问题。可以试试："
+    echo "  1) 永久换镜像后再跑一次本文件："
+    echo "       $PY -m pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple"
+    echo "  2) 手动安装："
+    echo "       $PY -m pip install -r requirements-desktop.txt -i https://pypi.tuna.tsinghua.edu.cn/simple"
+    echo "  3) 如果报错里出现 compiling/building 'pyyaml'，说明你用的是旧版压缩包，"
+    echo "     新版依赖已不需要 pyyaml，请重新下载最新包。"
+    read -r -p "按回车退出…"
+    exit 1
+  fi
+fi
+
+if ! $PY -c "import webview" >/dev/null 2>&1; then
+  echo "      [i] pywebview 未安装：界面会用系统浏览器打开（功能一样）"
+fi
+
+echo "[4/4] 正在启动界面…"
+echo
+$PY desktop.py "$@" || {
   echo
   echo "[提示] 启动失败。若是提示缺少 GUI 库，可先这样跑："
-  echo "       .venv/bin/python desktop.py --browser"
+  echo "       $PY desktop.py --browser"
   read -r -p "按回车退出…"
   exit 1
 }

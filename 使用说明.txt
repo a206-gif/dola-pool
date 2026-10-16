@@ -124,6 +124,30 @@ Linux   ：终端执行  ./start-linux.sh
       会用系统默认浏览器打开界面，同样能用。
 
 
+【最常见 2】装依赖时报错：Failed to build 'pyyaml' / Could not find Cython
+   （报错里会有一堆 pypi.org 连接超时、SSL EOF）
+
+   原因有两层：
+     · 你的网络连 Python 官方源 pypi.org 不稳定；
+     · 旧版依赖里的 pyyaml 需要"现场编译"，编译又要再从 pypi 抓 Cython，
+       网络一断就彻底失败。
+
+   新版已经解决：
+     · 依赖里去掉了会拉 pyyaml 的 uvicorn[standard]（附带的包用不上）；
+     · 三个平台的启动器都会【自动依次尝试】：官方源 → 清华镜像 → 阿里云镜像。
+
+   如果你用的是旧压缩包，或想立刻手动解决，直接执行（复制整行）：
+
+     .venv\Scripts\python.exe -m pip install -r requirements-desktop.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+   想永久换镜像（一劳永逸，以后 pip 都快）：
+
+     .venv\Scripts\python.exe -m pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
+
+   如果报错里出现 "free-threaded" 字样，说明你装的是自由线程版 Python，
+   很多包还没有对应的预编译文件 —— 请改装普通版 Python 3.12。
+
+
 【其它】
 · start-windows.bat 里的提示是英文的 → 因为中文写在批处理里会导致乱码
   甚至窗口闪退（编码问题），所以批处理里只用英文；中文说明就是本文件。

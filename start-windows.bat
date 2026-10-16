@@ -11,14 +11,10 @@ echo.
 rem ---------- 0) self-heal: drop a broken .venv left by a failed run ----------
 if not exist ".venv\Scripts\python.exe" goto findpy
 ".venv\Scripts\python.exe" -c "import sys" >nul 2>nul
-if not errorlevel 1 goto usevenv
+if not errorlevel 1 goto havepy
 echo [i] Existing .venv is broken - rebuilding it...
 rmdir /s /q ".venv"
 goto findpy
-
-:usevenv
-set "PY=%CD%\.venv\Scripts\python.exe"
-goto havepy
 
 rem ---------- 1) find a usable Python ----------
 :findpy
@@ -37,31 +33,65 @@ if defined PY goto havepy
 goto nopython
 
 :havepy
-echo [1/3] Python found: %PY%
+echo [1/4] Python found: %PY%
 %PY% --version
+%PY% -c "import sysconfig;print('  [WARN] this is a free-threaded build - packages may have no wheel') if sysconfig.get_config_var('Py_GIL_DISABLED') else ''"
+%PY% -c "import sys;sys.exit(0 if sys.version_info[:2] < (3,14) else 1)"
+if not errorlevel 1 goto newvenv
+echo   [i] Python 3.14+ is very new. If installation keeps failing,
+echo       installing Python 3.12 is the most reliable choice.
 echo.
 
-if exist ".venv\Scripts\python.exe" goto deps
-echo [2/3] Creating virtual environment (first run only)...
+:newvenv
+if exist ".venv\Scripts\python.exe" goto depscheck
+echo [2/4] Creating virtual environment (first run only)...
 %PY% -m venv .venv
 if errorlevel 1 goto venvfail
 echo.
 
-:deps
+rem ---------- 2) dependencies ----------
+:depscheck
 set "PY=%CD%\.venv\Scripts\python.exe"
-%PY% -c "import fastapi, uvicorn, webview, requests, Crypto" >nul 2>nul
+%PY% -c "import fastapi, uvicorn, requests, Crypto, multipart" >nul 2>nul
+if not errorlevel 1 goto softcheck
+
+echo [3/4] Installing dependencies (first run: 1-3 minutes)...
+echo       Please wait - it may look frozen while downloading.
+echo.
+%PY% -m pip install --upgrade pip --timeout 60 --retries 2 --disable-pip-version-check >nul 2>nul
+
+%PY% -m pip install -r requirements-desktop.txt --timeout 60 --retries 2 --disable-pip-version-check
+if not errorlevel 1 goto depsok
+
+echo.
+echo [i] Official PyPI failed. Retrying with Tsinghua mirror...
+echo.
+%PY% -m pip install -r requirements-desktop.txt --timeout 60 --retries 2 --disable-pip-version-check -i https://pypi.tuna.tsinghua.edu.cn/simple
+if not errorlevel 1 goto depsok
+
+echo.
+echo [i] Retrying with Aliyun mirror...
+echo.
+%PY% -m pip install -r requirements-desktop.txt --timeout 60 --retries 2 --disable-pip-version-check -i https://mirrors.aliyun.com/pypi/simple/
+if not errorlevel 1 goto depsok
+
+goto depfail
+
+:depsok
+echo.
+echo       Dependencies installed.
+echo.
+
+:softcheck
+%PY% -c "import webview" >nul 2>nul
 if not errorlevel 1 goto run
-
-echo [2/3] Installing dependencies - first run takes 1-3 minutes...
-echo       (it may look frozen while downloading - please wait)
-echo.
-%PY% -m pip install --upgrade pip
-%PY% -m pip install -r requirements-desktop.txt
-if errorlevel 1 goto depfail
+echo [i] pywebview is not installed - the app will open in your web browser
+echo     instead of a native window. That works fine.
 echo.
 
+rem ---------- 3) run ----------
 :run
-echo [3/3] Starting Dola Pool desktop app...
+echo [4/4] Starting Dola Pool...
 echo       A window should appear in a few seconds.
 echo.
 %PY% desktop.py %*
@@ -81,9 +111,8 @@ echo.
 echo   IMPORTANT: during installation, tick the checkbox
 echo              "Add Python to PATH"
 echo.
+echo   Recommended version: 3.12 (most reliable for this app)
 echo   Then double-click start-windows.bat again.
-echo.
-echo   Chinese step-by-step guide: open the .txt file in this folder
 goto end
 
 :venvfail
@@ -99,12 +128,23 @@ goto end
 
 :depfail
 echo.
-echo [ERROR] Dependency installation failed - probably a network problem.
+echo [ERROR] Dependency installation failed on all three sources.
 echo.
-echo   Check your internet connection and try again, or run manually:
-echo       .venv\Scripts\python.exe -m pip install -r requirements-desktop.txt
+echo   This is almost always a network problem. Options:
 echo.
-goto end
+echo   1) Use a mirror permanently, then run this file again:
+echo        .venv\Scripts\python.exe -m pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
+echo.
+echo   2) Install manually with a mirror:
+echo        .venv\Scripts\python.exe -m pip install -r requirements-desktop.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+echo.
+echo   3) If you see errors about building "pyyaml" from source,
+echo      you are using an OLD copy of this package. Download the
+echo      latest one: the new requirements no longer need pyyaml.
+echo.
+echo   4) If you use Python 3.13/3.14 and it still fails, install
+echo      Python 3.12 instead - it has prebuilt packages for everything.
+echo.
 
 :runfail
 echo [WARNING] The app exited with an error (code %RC%).

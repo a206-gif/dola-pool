@@ -49,6 +49,20 @@ python desktop.py --no-demo  # 生产模式：调用真实 Dola 生成
 系统依赖：Windows / macOS 开箱即用；Linux 需要 `sudo apt install python3-gi gir1.2-webkit2-4.1`，
 或改用 Qt 后端 `pip install "pywebview[qt]"`。缺 GUI 库时会打印安装提示并自动降级到浏览器模式。
 
+### 装不上依赖怎么办（国内网络常见）
+
+`uvicorn[standard]` 会拉入 pyyaml 等需要编译的包，在国内网络下容易失败。本项目已改用
+**纯 uvicorn**（用不到 YAML 日志与 uvloop），并且三个平台的启动器都会自动依次尝试
+官方源 → 清华镜像 → 阿里云镜像。手动安装时也可以直接指定镜像：
+
+```bash
+pip install -r requirements-desktop.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+# 永久换源：
+pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+若提示 `free-threaded`（自由线程版 Python）导致缺预编译包，请改用普通版 Python 3.12。
+
 ### 打包成免安装程序
 
 ```bash
