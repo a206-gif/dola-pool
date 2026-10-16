@@ -21,14 +21,17 @@ Dola Pool 桌面版启动器
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import platform
+import select
 import socket
 import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import webbrowser
 
@@ -167,12 +170,42 @@ class Backend:
 
 
 class _WebWindowApi:
-    """账号网页窗口能调用的少量能力。
+    """账号网页窗口能调用的少量能力（诊断页上的按钮就走这里）。
 
-    只做一件事：把当前页面丢到系统浏览器里打开 —— WebView2 万一渲染不出来，
-    用户点提示条上的「🌐 用系统浏览器打开」就能换个浏览器对照。
-    只接受本机地址，免得页面脚本借这个口子去开任意网址。
+    只做本机地址相关的事，免得页面脚本借这个口子去开任意网址。
     """
+
+    def __init__(self):
+        self.win = None
+        self.local_url = ""
+        self.real_url = ""
+
+    def attach(self, win, local_url: str, real_url: str) -> None:
+        self.win, self.local_url, self.real_url = win, local_url or "", real_url or ""
+
+    def show_proxy_page(self) -> dict:
+        """真站渲染不出来时，改看本机代理页（服务端带着这个账号的 Cookie 去取）。"""
+        if self.win is None or not self.local_url:
+            return {"ok": False, "detail": "没有可用的本机代理页"}
+        try:
+            self.win.load_url(self.local_url)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "detail": str(exc)}
+        return {"ok": True, "url": self.local_url}
+
+    def retry_real(self) -> dict:
+        """再打开一次真站（比如刚把代理配上）。"""
+        if self.win is None or not self.real_url:
+            return {"ok": False, "detail": "没有可用的真站地址"}
+        try:
+            self.win.load_url(self.real_url)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "detail": str(exc)}
+        return {"ok": True, "url": self.real_url}
+
+    def open_local(self) -> dict:
+        """把本机代理页丢到系统浏览器里开（那个浏览器走系统代理，常能看到页面）。"""
+        return self.open_external(self.local_url)
 
     def open_external(self, url: str = "") -> dict:
         target = str(url or "").strip()
@@ -230,6 +263,437 @@ def _clr_ready() -> tuple:
         return False, str(exc)
 
 
+# --------------------------------------------------------------------------
+# 让浏览器内核走和「验活」用的同一个代理
+#
+# 真机现象：账号池里验活显示「dola.com 可达」（Python 侧的 urllib 会读
+# DOLA_PROXY / HTTPS_PROXY 环境变量），可账号窗口就是一片空白、右键菜单还在
+# （说明内核活着、只是没把网页取回来）。原因是 WebView2 内核**不读这两个环境
+# 变量**，它只认系统代理设置：机器上只配了环境变量代理时，窗口其实是直连
+# dola.com，被挡住 → 停在 about:blank。
+#
+# 为什么不把账号密码直接写进 --proxy-server：Chromium 不支持（会报
+# ERR_NO_SUPPORTED_PROXIES），WebView2 也没有代理认证弹窗。所以本机再起一个
+# 免认证的小代理，由它带着账号密码去连上游。
+# --------------------------------------------------------------------------
+_PROXY_ENV_KEYS = ("DOLA_PROXY", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy")
+# 本机服务必须绕过代理，否则界面自己都打不开
+_PROXY_BYPASS = "--proxy-bypass-list=127.0.0.1;localhost;<local>"
+_SITE_TIMEOUT = 25.0        # 真站自检最多等多久
+_PROBE_HARD_LIMIT = 5.0     # 内核完全没回话时，最多再等这么久就放弃并出诊断页
+
+
+def _app_version() -> str:
+    """后端 app 模块里的版本号（写进标题/诊断页，方便判断有没有装成新版）。"""
+    return str(getattr(sys.modules.get("app"), "VERSION", "") or "")
+
+
+def _split_proxy_url(raw: str):
+    """'http://用户:密码@主机:6666' -> (scheme, host, port, user, password)；看不懂给 None。"""
+    raw = str(raw or "").strip()
+    if not raw:
+        return None
+    if "://" not in raw:
+        raw = "http://" + raw
+    try:
+        u = urllib.parse.urlsplit(raw)
+        host = u.hostname
+        if not host:
+            return None
+        scheme = (u.scheme or "http").lower()
+        port = u.port or (80 if scheme == "http" else 1080)
+        user = urllib.parse.unquote(u.username or "")
+        password = urllib.parse.unquote(u.password or "")
+    except Exception:  # noqa: BLE001
+        return None
+    return scheme, host, port, user, password
+
+
+def _real_host(url: str) -> str:
+    """'https://www.dola.com/chat/' -> 'dola.com'（去掉 www 之类，跳转后也能认出来）。"""
+    host = (urllib.parse.urlsplit(str(url or "")).hostname or "").lower()
+    parts = [p for p in host.split(".") if p]
+    return ".".join(parts[-2:]) if len(parts) >= 2 else host
+
+
+class _LocalProxyTunnel:
+    """免认证的本机小代理：转发给上游代理并补上 Proxy-Authorization。
+
+    只做两件事：CONNECT（https 的隧道）和明文 HTTP 转发。够浏览器加载网页用了。
+    """
+
+    def __init__(self, parts):
+        self.scheme, self.host, self.port, self.user, self.password = parts
+        self._sock = None
+        self._thread = None
+        self._stop = threading.Event()
+        self.stats = {"connect": 0, "forward": 0, "ok": 0, "fail": 0, "last_error": ""}
+
+    # ---- 生命周期 ----
+    def start(self) -> str:
+        self._sock = socket.socket()
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(("127.0.0.1", 0))          # 只监听本机，不对外
+        self._sock.listen(64)
+        self._thread = threading.Thread(target=self._accept_loop, name="dola-proxy-tunnel",
+                                        daemon=True)
+        self._thread.start()
+        return self.url
+
+    @property
+    def url(self) -> str:
+        if self._sock is None:
+            return ""
+        try:
+            return "http://127.0.0.1:%d" % self._sock.getsockname()[1]
+        except OSError:
+            return ""
+
+    def stop(self) -> None:
+        self._stop.set()
+        try:
+            if self._sock is not None:
+                self._sock.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def note(self) -> str:
+        return "%s:%d" % (self.host, self.port)
+
+    # ---- 内部 ----
+    def _auth_header(self) -> bytes:
+        if not self.user:
+            return b""
+        token = base64.b64encode(("%s:%s" % (self.user, self.password)).encode("utf-8"))
+        return b"Proxy-Authorization: Basic " + token + b"\r\n"
+
+    def _accept_loop(self):
+        while not self._stop.is_set():
+            try:
+                client, _ = self._sock.accept()
+            except OSError:
+                break
+            threading.Thread(target=self._serve, args=(client,), daemon=True).start()
+
+    @staticmethod
+    def _read_head(sock, limit: int = 65536) -> bytes:
+        buf = b""
+        while b"\r\n\r\n" not in buf and len(buf) < limit:
+            try:
+                chunk = sock.recv(4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+        return buf
+
+    def _serve(self, client):
+        try:
+            head = self._read_head(client)
+            if not head:
+                return
+            first = head.split(b"\r\n", 1)[0].decode("latin-1", "replace")
+            words = first.split(" ")
+            method = (words[0] if words else "").upper()
+            target = words[1] if len(words) > 1 else ""
+            upstream = socket.create_connection((self.host, self.port), timeout=20)
+            if method == "CONNECT":
+                self.stats["connect"] += 1
+                req = ("CONNECT %s HTTP/1.1\r\nHost: %s\r\n" % (target, target)).encode() \
+                    + self._auth_header() + b"\r\n"
+                upstream.sendall(req)
+                resp = self._read_head(upstream)
+                status = resp.split(b"\r\n", 1)[0].decode("latin-1", "replace")
+                if " 200" not in status:
+                    self.stats["fail"] += 1
+                    self.stats["last_error"] = "上游代理拒绝：%s" % status[:90]
+                    client.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                    return
+                client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                self.stats["ok"] += 1
+            else:
+                self.stats["forward"] += 1
+                rest = head.split(b"\r\n", 1)[1] if b"\r\n" in head else b""
+                keep = [ln for ln in rest.split(b"\r\n")
+                        if ln and not ln.lower().startswith((b"proxy-authorization:", b"proxy-connection:"))]
+                forwarded = head.split(b"\r\n", 1)[0] + b"\r\n" + b"\r\n".join(keep) \
+                    + b"\r\n" + self._auth_header() + b"Connection: close\r\n\r\n"
+                upstream.sendall(forwarded)
+                self.stats["ok"] += 1
+            self._pump(client, upstream)
+        except Exception as exc:  # noqa: BLE001
+            self.stats["fail"] += 1
+            self.stats["last_error"] = "%s: %s" % (type(exc).__name__, exc)
+            try:
+                client.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    @staticmethod
+    def _pump(a, b) -> None:
+        """两个方向来回搬字节，任意一侧断开就收工。"""
+        try:
+            while True:
+                try:
+                    ready, _, broken = select.select([a, b], [], [a, b], 120)
+                except OSError:
+                    return
+                if broken:
+                    return
+                if not ready:
+                    return
+                for src in ready:
+                    data = src.recv(65536)
+                    if not data:
+                        return
+                    (b if src is a else a).sendall(data)
+        except OSError:
+            pass
+        finally:
+            for sock in (a, b):
+                try:
+                    sock.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+
+def _prepare_browser_network(config=None, env=None, log=print,
+                             allow_env: bool = True) -> dict:
+    """把内核的网络也挂到同一个代理上。返回一份说明（给日志和诊断页用）。"""
+    env = os.environ if env is None else env
+    info = {"applied": False, "source": "", "proxy": "", "note": "", "args": "", "tunnel": None}
+    existing = str(env.get("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS") or "").strip()
+    if existing:
+        info["note"] = "环境里已经设过 WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS，保持不动"
+        log("[desktop] 浏览器内核参数：%s（%s）" % (info["note"], existing[:80]))
+        return info
+    raw, source = "", ""
+    if isinstance(config, dict):
+        raw = str(config.get("proxy") or "").strip()
+        source = "config.json 里的 proxy" if raw else ""
+    if not raw and allow_env:
+        for key in _PROXY_ENV_KEYS:
+            value = str(env.get(key) or "").strip()
+            if value:
+                raw, source = value, key
+                break
+    if not raw:
+        info["note"] = "没发现代理配置（%s），窗口直连" % "/".join(_PROXY_ENV_KEYS[:2])
+        log("[desktop] 浏览器内核网络：%s" % info["note"])
+        return info
+    parts = _split_proxy_url(raw)
+    if not parts:
+        info["note"] = "代理地址看不懂，按直连处理：%s" % raw[:60]
+        log("[desktop] 浏览器内核网络：%s" % info["note"])
+        return info
+    scheme, host, port, user, password = parts
+    if scheme not in ("http", "https"):
+        info["note"] = "只支持 http/https 代理（拿到的是 %s），按直连处理" % scheme
+        log("[desktop] 浏览器内核网络：%s" % info["note"])
+        return info
+    shown = "%s://%s:%d" % (scheme, host, port)
+    if user:
+        tunnel = _LocalProxyTunnel(parts)
+        try:
+            tunnel.start()
+        except Exception as exc:  # noqa: BLE001
+            proxy_arg, note = shown, "本机中转起不来（%s），仍把请求交给 %s（可能因无认证被拒）" % (exc, shown)
+        else:
+            info["tunnel"] = tunnel
+            proxy_arg = tunnel.url
+            note = "经本机中转 %s → %s（账号密码由中转带上，内核不直接接触）" % (tunnel.url, shown)
+    else:
+        proxy_arg, note = shown, "直接交给内核：%s" % shown
+    env["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = "--proxy-server=%s %s" % (proxy_arg, _PROXY_BYPASS)
+    info.update(applied=True, source=source, proxy=shown, note=note,
+                args=env["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"])
+    log("[desktop] 浏览器内核网络：%s（来自 %s；本机地址直连）" % (note, source))
+    return info
+
+
+# --------------------------------------------------------------------------
+# 真站加载自检：窗口里到底渲染出来没有？让内核里的 JS 自己回答。
+# 有这一层，白屏就不会再靠人肉发现 —— 窗口会直接写出「卡在哪一步」。
+# --------------------------------------------------------------------------
+_PROBE_JS = r"""(function () {
+  var nav = null;
+  try { var e = performance.getEntriesByType('navigation'); if (e && e.length) nav = e[0]; } catch (err) {}
+  var body = document.body;
+  return {
+    href: String(location.href || ''),
+    ready: String(document.readyState || ''),
+    title: String(document.title || '').slice(0, 80),
+    html_len: body ? String(body.innerHTML || '').length : -1,
+    text: body ? String(body.innerText || '').replace(/\s+/g, ' ').slice(0, 100) : '',
+    status: nav ? (nav.responseStatus || 0) : 0,
+    ms: nav ? Math.round(nav.duration || 0) : 0
+  };
+})()"""
+
+
+def _judge_real_site(report, host: str = "dola.com") -> tuple:
+    """(渲染成功?, 一句话原因)。判断依据只有内核自己报上来的东西。"""
+    if not isinstance(report, dict) or not report:
+        return False, "拿不到页面信息（浏览器内核没回话）"
+    href = str(report.get("href") or "")
+    if "chromewebdata" in href or "edge-error" in href:
+        return False, "导航失败：内核跳到了错误页（%s）" % href[:70]
+    if not href or href in ("about:blank", "about:blank#blocked"):
+        return False, "地址还是 about:blank —— 内核没能把 dola.com 打开（网络/代理层面被挡住）"
+    if host and host not in href:
+        return False, "地址被跳到了 %s（不是 %s）" % (href[:70], host)
+    html_len = report.get("html_len")
+    text = str(report.get("text") or "")
+    if not isinstance(html_len, int):
+        html_len = -1
+    if len(text) >= 2:
+        return True, "标题「%s」，可见文字 %d 字，HTML %d 字符，HTTP %s" % (
+            report.get("title") or "", len(text), html_len, report.get("status"))
+    if html_len >= 4000:      # 纯 canvas 页面：没有可见文字但有实打实的 DOM
+        return True, "标题「%s」，HTML %d 字符（页面无文字节点，按渲染成功算）" % (
+            report.get("title") or "", html_len)
+    return False, "页面打开了但内容几乎是空的（HTML %s 字符、可见文字 %d 字，HTTP %s）" % (
+        html_len, len(text), report.get("status"))
+
+
+def _inspect_loop(win, timeout: float, poll: float, host: str) -> dict:
+    deadline = time.time() + max(0.0, timeout)
+    report, err = {}, ""
+    while True:
+        try:                      # pywebview 的 evaluate_js 内部会切到 UI 线程，可放心调用
+            report = win.evaluate_js(_PROBE_JS) or {}
+            err = ""
+        except Exception as exc:  # noqa: BLE001 （页面还没加载好 / 内核还没注入脚本）
+            report, err = {}, str(exc)[:160]
+        ok, why = _judge_real_site(report, host)
+        if ok or time.time() >= deadline:
+            return {"ok": ok, "why": why, "report": report if isinstance(report, dict) else {},
+                    "error": err}
+        time.sleep(poll)
+
+
+def _inspect_real_site(win, timeout: float = _SITE_TIMEOUT, poll: float = 0.5,
+                       host: str = "dola.com") -> dict:
+    """轮询窗口里的 JS，直到真站渲染出来或超时。
+
+    整段放进带看门狗的线程里：pywebview 的 evaluate_js 是同步等内核回话的，
+    万一内核卡住，这里也不会把开窗口的那个线程一起拖死。
+    """
+    result = {}
+
+    def worker():
+        result["info"] = _inspect_loop(win, timeout, poll, host)
+
+    thread = threading.Thread(target=worker, name="dola-site-probe", daemon=True)
+    thread.start()
+    thread.join(max(0.0, timeout) + _PROBE_HARD_LIMIT)
+    if thread.is_alive():
+        return {"ok": False, "why": "浏览器内核没回话（自检超时）",
+                "report": {}, "error": "evaluate_js 一直没返回"}
+    return result.get("info") or {"ok": False, "why": "自检没拿到结果", "report": {}, "error": ""}
+
+
+def _format_report(info: dict, proxy_url: str, version: str) -> str:
+    """把自检结果排成一段可以直接复制发出来的文字。"""
+    rep = info.get("report") or {}
+    lines = [
+        "  · 结论：%s" % info.get("why", ""),
+        "  · 地址：%s ｜ readyState=%s ｜ HTTP=%s ｜ 用时=%sms" % (
+            rep.get("href") or "(空)", rep.get("ready") or "?", rep.get("status", "?"),
+            rep.get("ms", "?")),
+        "  · 标题：%s" % (rep.get("title") or "(空)"),
+        "  · 正文：HTML %s 字符，可见文字 %s 字" % (rep.get("html_len", "?"),
+                                           len(str(rep.get("text") or ""))),
+        "  · 本机代理页：%s" % proxy_url,
+    ]
+    if info.get("error"):
+        lines.append("  · 脚本通道报错：%s" % info["error"])
+    lines.append("  · 启动器版本：v%s" % (version or "?",))
+    return "\n".join(lines)
+
+
+def _esc(text) -> str:
+    return (str(text).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def _diagnose_html(info: dict, real_url: str, proxy_url: str, title: str,
+                   version: str, net_note: str = "") -> str:
+    """真站没渲染出来时显示这一页：把看到的事实和下一步都写清楚。"""
+    rep = info.get("report") or {}
+    rows = [
+        ("结论", info.get("why", "")),
+        ("地址", rep.get("href") or "(空)"),
+        ("HTTP 状态", str(rep.get("status", "?"))),
+        ("就绪状态", str(rep.get("ready") or "?")),
+        ("页面标题", rep.get("title") or "(空)"),
+        ("HTML 长度", "%s 字符" % rep.get("html_len", "?")),
+        ("可见文字", "%s 字" % len(str(rep.get("text") or ""))),
+        ("脚本通道", info.get("error") or "正常"),
+        ("内核网络", net_note or "（见黑窗口日志）"),
+        ("启动器版本", "v%s" % (version or "?")),
+    ]
+    table = "".join(
+        '<tr><th>%s</th><td>%s</td></tr>' % (_esc(k), _esc(v)) for k, v in rows)
+    return """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<title>真站打不开 · 诊断</title><style>
+html,body{margin:0;background:#0a0f11;color:#dfeae8;
+font:14px/1.75 -apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif}
+.wrap{max-width:760px;margin:0 auto;padding:28px 22px 40px}
+h1{font-size:19px;margin:0 0 6px;color:#ffd479}
+.sub{color:#9db3b1;font-size:13px;margin-bottom:18px}
+table{border-collapse:collapse;width:100%%;margin:0 0 18px;font-size:13px}
+th,td{border:1px solid #2b3a38;padding:7px 10px;text-align:left;vertical-align:top;word-break:break-all}
+th{width:112px;color:#9db3b1;font-weight:600;background:#101b1a}
+td{font-family:ui-monospace,Consolas,monospace}
+h2{font-size:15px;margin:20px 0 8px;color:#cfe3e0}
+li{margin-bottom:7px;color:#c9d8d6}
+code{background:#101b1a;border:1px solid #2b3a38;border-radius:5px;padding:1px 6px;
+font-family:ui-monospace,Consolas,monospace}
+a.btn{display:inline-block;margin:14px 10px 0 0;padding:10px 16px;border-radius:9px;
+background:#0d6f62;color:#fff;text-decoration:none;font-weight:600;cursor:pointer;border:0;font-size:13.5px}
+a.btn.alt{background:#2a3a38}
+.note{margin-top:22px;padding-top:14px;border-top:1px solid #2b3a38;color:#93a8a6;font-size:12.5px}
+</style></head><body><div class="wrap">
+<h1>真站没能在窗口里显示</h1>
+<div class="sub">这是个诊断页 —— 下面是我从浏览器内核里问到的实情，不是猜的。</div>
+<table>""" + table + """</table>
+<h2>接下来可以这样</h2>
+<ul>
+  <li><b>改看本机代理页</b>：由服务端带着这个账号的 Cookie 去取 Dola，地址是本机，一定能打开
+      （上面按钮 / 或点窗口右键 → 刷新）。</li>
+  <li><b>用系统浏览器打开</b>：那个浏览器走系统代理，往往能看到页面，也能对照是不是网络问题。</li>
+  <li><b>配一下代理</b>：如果 <code>DOLA_PROXY</code> 只写在环境变量里，浏览器内核读不到 ——
+      在程序目录的 <code>config.json</code> 里加一行
+      <code>"proxy": "http://用户:密码@主机:6666"</code>，或启动时加 <code>--proxy</code>，重启程序即可。</li>
+  <li><b>做个对照实验</b>：关掉程序，改用 <code>--no-proxy</code> 启动一次（或把
+      <code>config.json</code> 里的 <code>proxy</code> 删掉）—— 能分辨是「代理配错了」
+      还是「内核本身取不回页面」。两种结果都告诉我。</li>
+  <li><b>把这一页告诉我</b>：连同黑窗口里 <code>[desktop] v%s 自检</code> 那几行，我按里面的数字继续修。</li>
+</ul>
+<a class="btn" href="javascript:dlp('proxy')">◀ 改看本机代理页</a>
+<a class="btn alt" href="javascript:dlp('retry')">↻ 重新打开真站</a>
+<a class="btn alt" href="javascript:dlp('browser')">🌐 用系统浏览器打开</a>
+<div class="note">要打开的真站：%s<br>本机代理页：%s<br>窗口：%s</div>
+<script>
+function dlp(what){
+  try{
+    if(!window.pywebview || !window.pywebview.api){
+      alert('这个窗口暂时连不上主程序：请关掉它，重新点账号池里的「🌐 网页」');
+      return;
+    }
+    var api = pywebview.api, r;
+    if(what==='proxy'){ r = api.show_proxy_page(); }
+    else if(what==='retry'){ r = api.retry_real(); }
+    else { r = api.open_local(); }
+    if(r && r.then){ r.then(function(res){ if(res && res.ok===false){ alert('失败：'+res.detail); } }); }
+  }catch(e){ alert('操作失败：'+e); }
+}
+</script>
+</div></body></html>""" % (version or "?", _esc(real_url), _esc(proxy_url), _esc(title))
+
+
 _WAIT_HTML = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <title>正在打开…</title><style>
 html,body{margin:0;height:100%;background:#0a0f11;color:#c9d8d6;
@@ -240,6 +704,7 @@ b{color:#0ca58c}
 <div style="font-size:15px">正在用该账号的登录态打开 <b>Dola</b>…</div>
 <div style="opacity:.72;margin-top:6px">把该账号的 Cookie 写进浏览器内核后再跳转（最多等 15 秒）<br>
 写不进去会自动改用本机代理页</div>
+<div style="opacity:.45;margin-top:12px;font-size:12.5px"><!--VER--></div>
 </div></body></html>"""
 
 
@@ -341,6 +806,8 @@ class Control:
         self.base_url = ""          # 后端地址，main() 里设置，用于把 /dola-web/… 补成绝对地址
         self.web_windows = []       # 「打开账号网页」开出的窗口
         self.web_account = None     # 当前账号网页窗口对应的账号 id（内核 Cookie 是共享的）
+        self.net_note = ""          # 内核网络说明（代理还是直连），写进诊断页
+        self.demo = False           # 演示模式：账号窗口不碰真站，走本机代理页
 
     def __call__(self, action: str, payload=None) -> None:
         """由后端接口触发。"""
@@ -394,15 +861,20 @@ class Control:
         if account_id is not None:
             self.web_account = account_id
         # 能注入 Cookie 就直接开真站；否则退回本机代理页
-        try_cookie = bool(real and cookie and _can_inject_cookies())
+        # （演示模式不碰外网：不写内核 Cookie、不开真站）
+        try_cookie = bool(real and cookie and _can_inject_cookies() and not self.demo)
+        if self.demo and real and cookie:
+            print("[desktop] 演示模式：账号窗口用本机代理页（演示模式不访问真站）")
         try:
+            api = _WebWindowApi()
             win = webview.create_window(
                 title, "about:blank" if try_cookie else url,
                 width=1180, height=860,
                 min_size=(720, 520),
                 text_select=True,
-                js_api=_WebWindowApi(),
+                js_api=api,
             )
+            api.attach(win, url, real)      # 诊断页上的按钮要用到这两个地址
             self.web_windows.append(win)
             try:  # 用户自己关掉窗口后从列表里摘掉，免得 accumulate
                 win.events.closed += lambda: self.web_windows.remove(win) if win in self.web_windows else None
@@ -413,7 +885,8 @@ class Control:
                 try:
                     # 不传 base_uri：各后端默认值不同（Windows 忽略、macOS 拿它建
                     # NSURL），让它用 pywebview 自己的默认更稳
-                    win.load_html(_WAIT_HTML)
+                    win.load_html(_WAIT_HTML.replace(
+                        "<!--VER-->", "启动器 v%s · 桌面版" % (_app_version() or "?")))
                 except Exception as exc:  # noqa: BLE001
                     print(f"[desktop] 显示等待页失败（不影响后续）：{exc}")
                 # 把 Cookie 写进内核，再打开真正的 dola.com（放后台线程，
@@ -432,32 +905,64 @@ class Control:
     def _finish_cookie_window(self, win, proxy_url: str, real_url: str,
                               cookie: str, domain: str, title: str) -> None:
         """注入 Cookie 成功就打开真实 dola.com，失败就退回本机代理页。"""
+        version = _app_version() or "?"
         try:
             ok, note = _inject_webview2_cookies(win, cookie, domain, timeout=_INJECT_TIMEOUT)
         except Exception as exc:  # noqa: BLE001  任何意外都不能让窗口停在空白页
             ok, note = False, "注入过程出错（%s）" % exc
         if ok:
             print(f"[desktop] {note}；打开真实站点：{real_url}")
-            self._set_win_title(win, title + " · dola.com")
-            target = real_url
+            target, suffix = real_url, " · dola.com"
         else:
             print(f"[desktop] Cookie 注入不可用（{note}），改用本机代理页：{proxy_url}")
+            target, suffix = proxy_url, " · 本机代理页"
+        # 先导航、再写标题：标题没写上也不能挡住导航
+        self._navigate(win, target, proxy_url)
+        self._set_win_title(win, title + suffix)
+        if not ok or self.demo:
+            return
+        # 打开了真站，但要确认它真的渲染出来了 —— 白屏不能再靠人肉发现
+        info = _inspect_real_site(win, host=_real_host(real_url))
+        if info["ok"]:
+            print(f"[desktop] v{version} 自检：真站已渲染 —— {info['why']}")
+            self._set_win_title(win, title + " · dola.com")
+            return
+        print("[desktop] v%s 自检：真站没渲染出来 ——\n%s"
+              % (version, _format_report(info, proxy_url, version)))
+        try:
+            win.load_html(_diagnose_html(info, real_url, proxy_url, title, version,
+                                         net_note=self.net_note))
+            self._set_win_title(win, title + " · 真站打不开（窗口里有说明）")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[desktop] 诊断页也显示不出来（{exc}），退回本机代理页")
+            self._navigate(win, proxy_url, "")
             self._set_win_title(win, title + " · 本机代理页")
-            target = proxy_url
+
+    @staticmethod
+    def _navigate(win, target: str, fallback: str) -> None:
+        """load_url；打不开就退到兜底地址（宁可显示兜底页，也别停在空白）。"""
         try:
             win.load_url(target)
         except Exception as exc:  # noqa: BLE001
-            print(f"[desktop] 打开 {target} 失败（{exc}），退回本机代理页")
-            try:
-                win.load_url(proxy_url)
-            except Exception as exc2:  # noqa: BLE001
-                print(f"[desktop] 本机代理页也打不开：{exc2}")
+            print(f"[desktop] 打开 {target} 失败（{exc}）")
+            if fallback and fallback != target:
+                try:
+                    win.load_url(fallback)
+                except Exception as exc2:  # noqa: BLE001
+                    print(f"[desktop] 兜底地址也打不开：{exc2}")
 
     @staticmethod
     def _set_win_title(win, text: str) -> None:
-        """标题栏写明用的是真站还是本机代理页，方便一眼看出走的哪条路。"""
+        """标题栏写明走的是哪条路（真站 / 本机代理页 / 真站打不开）。"""
         try:
             win.title = text
+            return
+        except Exception:  # noqa: BLE001
+            pass
+        try:  # pywebview 的 title 要等页面加载完才认；直接改窗体文字更稳
+            holder = _webview_holder(win)
+            if holder is not None:
+                _ui_invoke(holder, lambda: setattr(holder, "Text", text))
         except Exception:  # noqa: BLE001
             pass
 
@@ -604,6 +1109,10 @@ def main(argv=None) -> int:
     parser.add_argument("--browser", action="store_true", help="用系统浏览器打开，不开原生窗口")
     parser.add_argument("--headless", action="store_true", help="只启动服务，不打开任何界面")
     parser.add_argument("--debug", action="store_true", help="打开窗口调试模式（可看控制台报错）")
+    parser.add_argument("--proxy", default="",
+                        help="给账号窗口用的代理，如 http://用户:密码@主机:6666"
+                             "（默认读配置里的 proxy / DOLA_PROXY / HTTPS_PROXY）")
+    parser.add_argument("--no-proxy", action="store_true", help="账号窗口直连，不用任何代理")
     args = parser.parse_args(argv)
 
     if args.demo:
@@ -614,10 +1123,15 @@ def main(argv=None) -> int:
         demo = bool(cfg.get("demo", True))
 
     cfg.update({"demo": demo, "width": args.width, "height": args.height})
+    if args.proxy:
+        cfg["proxy"] = args.proxy
+    elif args.no_proxy:
+        cfg.pop("proxy", None)
     save_config(cfg)
 
     port = pick_port(args.port or int(cfg.get("port") or 0))
     control = Control()
+    control.demo = demo
     backend = Backend(port, demo)
     backend.start(control)
 
@@ -648,6 +1162,11 @@ def main(argv=None) -> int:
         finally:
             backend.stop()
         return 0
+
+    # 内核（WebView2）的网络必须先准备好：WebView2 只在**创建浏览器环境时**读
+    # WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS，等窗口建出来再设就没用了。
+    control.net_note = _prepare_browser_network(
+        {} if args.no_proxy else cfg, log=print, allow_env=not args.no_proxy).get("note", "")
 
     storage_path = os.path.join(DATA_DIR, "webview")
     os.makedirs(storage_path, exist_ok=True)

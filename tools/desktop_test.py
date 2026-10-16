@@ -12,13 +12,16 @@
   4. 切换模式 → 服务自动重启 → 新进程以新模式运行（核心行为）
   5. /api/desktop/reveal 路径映射与越权拦截
   6. 账号窗口：把 Cookie 写进浏览器内核（用假的 WebView2 对象验证，不需要真 GUI）
+  7. 内核网络：代理（含账号密码 → 本机中转）、参数生成、真站自检与诊断页
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -183,6 +186,10 @@ class FakePyWindow:
         self.html_shown = html
         self.html_base = base_uri      # 期望 None：base_uri 各后端语义不同，别乱传
 
+    def evaluate_js(self, script, *args, **kwargs):
+        """默认假装内核还没回话（自检会当作「拿不到页面信息」）。"""
+        raise RuntimeError("evaluate_js 未就绪（假窗口）")
+
     def destroy(self):
         pass
 
@@ -317,6 +324,406 @@ def cookie_injection_checks():
             sys.modules.pop("webview", None)
 
 
+# --------------------------------------------------------------------------
+# 7. 内核网络（代理）与真站自检
+# --------------------------------------------------------------------------
+class FakeUpstreamProxy:
+    """假上游代理：只认 CONNECT，校验 Proxy-Authorization，然后把连接接到目标上。"""
+
+    def __init__(self, expect_auth=None, reply=b"HTTP/1.1 200 Connection Established\r\n\r\n"):
+        import socket as _s
+        self._s = _s
+        self.expect_auth = expect_auth
+        self.reply = reply
+        self.seen_auth = []
+        self.targets = []
+        self.sock = _s.socket()
+        self.sock.setsockopt(_s.SOL_SOCKET, _s.SO_REUSEADDR, 1)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(8)
+        self.port = self.sock.getsockname()[1]
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        while True:
+            try:
+                client, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._serve, args=(client,), daemon=True).start()
+
+    def _serve(self, client):
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = client.recv(4096)
+            if not chunk:
+                client.close()
+                return
+            buf += chunk
+        head = buf.decode("latin-1", "replace")
+        lines = head.split("\r\n")
+        self.targets.append(lines[0])
+        for line in lines[1:]:
+            if line.lower().startswith("proxy-authorization:"):
+                self.seen_auth.append(line.split(":", 1)[1].strip())
+        if self.expect_auth and (not self.seen_auth or self.seen_auth[-1] != self.expect_auth):
+            client.sendall(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n")
+            client.close()
+            return
+        if " 200" not in self.reply.decode("latin-1", "replace").split("\r\n")[0]:
+            client.sendall(self.reply)
+            client.close()
+            return
+        if not lines[0].startswith("CONNECT"):
+            # 明文 HTTP：按绝对地址把请求转给目标，再把响应原样带回
+            import urllib.parse as _up
+            u = _up.urlsplit(lines[0].split(" ")[1])
+            origin = "GET %s HTTP/1.1" % (u.path or "/")
+            head2 = origin + head[len(lines[0]):]
+            up = socket.create_connection((u.hostname, u.port or 80), timeout=5)
+            up.sendall(head2.encode("latin-1"))
+            _relay(up, client)
+            up.close()
+            client.close()
+            return
+        # 真的接到目标上，做中继
+        target = lines[0].split(" ")[1]
+        host, _, port = target.rpartition(":")
+        up = socket.create_connection((host, int(port)), timeout=5)
+        client.sendall(self.reply)
+        for src, dst in ((client, up), (up, client)):
+            threading.Thread(target=lambda a=src, b=dst: _relay(a, b), daemon=True).start()
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def _relay(a, b):
+    try:
+        while True:
+            data = a.recv(4096)
+            if not data:
+                return
+            b.sendall(data)
+    except OSError:
+        pass
+
+
+class FakeEcho:
+    """假目标服务器：收到什么回什么（模拟 https 隧道里的字节流）。"""
+
+    def __init__(self):
+        self.sock = socket.socket()
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(8)
+        self.port = self.sock.getsockname()[1]
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        while True:
+            try:
+                client, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._serve, args=(client,), daemon=True).start()
+
+    def _serve(self, client):
+        try:
+            while True:
+                data = client.recv(4096)
+                if not data:
+                    return
+                client.sendall(b"echo:" + data)
+        except OSError:
+            pass
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def network_checks():
+    """代理转发 + 内核网络参数 + 真站自检 + 诊断页。"""
+    sys.path.insert(0, ROOT)
+    import desktop  # noqa: E402
+
+    _REAL_INSPECT = desktop._inspect_real_site      # 后面会临时换成固定答案
+
+    # a) 代理地址解析
+    check("代理地址解析（带账号密码）",
+          desktop._split_proxy_url("http://u%40x:p%3A1@proxy.example:6666")
+          == ("http", "proxy.example", 6666, "u@x", "p:1"),
+          desktop._split_proxy_url("http://u%40x:p%3A1@proxy.example:6666"))
+    check("代理地址解析（无协议头、默认端口）",
+          desktop._split_proxy_url("proxy.example:6666")[:4] == ("http", "proxy.example", 6666, ""),
+          desktop._split_proxy_url("proxy.example:6666"))
+    check("看不懂的代理地址返回 None", desktop._split_proxy_url("") is None
+          and desktop._split_proxy_url("http://") is None, "ok")
+    check("从真站地址里取站点名（跳转后也认得出来）",
+          desktop._real_host("https://www.dola.com/chat/") == "dola.com",
+          desktop._real_host("https://www.dola.com/chat/"))
+
+    # b) 本机中转：CONNECT + Proxy-Authorization + 真的把字节搬过去
+    echo = FakeEcho()
+    auth = "Basic " + base64.b64encode(b"userId-1-custom-2:secret").decode()
+    up = FakeUpstreamProxy(expect_auth=auth)
+    tunnel = desktop._LocalProxyTunnel(("http", "127.0.0.1", up.port, "userId-1-custom-2", "secret"))
+    try:
+        url = tunnel.start()
+        check("本机中转只监听 127.0.0.1", url.startswith("http://127.0.0.1:"), url)
+        port = int(url.rsplit(":", 1)[1])
+        client = socket.create_connection(("127.0.0.1", port), timeout=5)
+        client.sendall(("CONNECT 127.0.0.1:%d HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n" % echo.port).encode())
+        head = client.recv(4096)
+        check("中转回了 200（隧道建立）", b"200 Connection Established" in head, head[:60])
+        client.sendall(b"hello")
+        got = client.recv(4096)
+        check("隧道里的字节被真的转发到目标并回传", got == b"echo:hello", got)
+        check("上游代理收到了账号密码（Basic 认证）",
+              up.seen_auth and up.seen_auth[-1] == auth, up.seen_auth)
+        client.close()
+    finally:
+        tunnel.stop()
+        up.close()
+        echo.close()
+
+    # b2) 明文 HTTP 转发（http:// 网站走这条）
+    import http.server as _hs
+    import functools as _ft
+
+    class _Handler(_hs.BaseHTTPRequestHandler):
+        def do_GET(self):                                  # noqa: N802
+            body = b"page-ok"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):                         # 别刷屏
+            pass
+
+    httpd = _hs.ThreadingHTTPServer(("127.0.0.1", 0), _ft.partial(_Handler))
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    up_plain = FakeUpstreamProxy()
+    tunnel3 = desktop._LocalProxyTunnel(("http", "127.0.0.1", up_plain.port, "u", "p"))
+    try:
+        port3 = int(tunnel3.start().rsplit(":", 1)[1])
+        client = socket.create_connection(("127.0.0.1", port3), timeout=5)
+        url = "http://127.0.0.1:%d/hello" % httpd.server_address[1]
+        client.sendall(("GET %s HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n" % url).encode())
+        resp = b""
+        while True:
+            chunk = client.recv(4096)
+            if not chunk:
+                break
+            resp += chunk
+        check("明文 HTTP 也转得动（响应回到了浏览器侧）", b"page-ok" in resp, resp[:60])
+        check("转发时保留了绝对地址并带上了认证",
+              up_plain.targets and up_plain.targets[-1].startswith("GET " + url)
+              and up_plain.seen_auth, (up_plain.targets[:1], up_plain.seen_auth))
+        client.close()
+    finally:
+        tunnel3.stop()
+        up_plain.close()
+        httpd.shutdown()
+
+    # c) 上游拒绝（407）→ 给浏览器 502，并记下原因
+    up2 = FakeUpstreamProxy(expect_auth="Basic 错的")
+    tunnel2 = desktop._LocalProxyTunnel(("http", "127.0.0.1", up2.port, "u", "p"))
+    try:
+        port2 = int(tunnel2.start().rsplit(":", 1)[1])
+        client = socket.create_connection(("127.0.0.1", port2), timeout=5)
+        client.sendall(b"CONNECT www.dola.com:443 HTTP/1.1\r\n\r\n")
+        head = client.recv(4096)
+        check("上游认证失败 → 客户端拿到 502（不是一直挂着）",
+              b"502" in head, head[:60])
+        check("失败原因被记下（能看到上游的 407）",
+              "407" in tunnel2.stats["last_error"] and tunnel2.stats["fail"] >= 1,
+              tunnel2.stats)
+        client.close()
+    finally:
+        tunnel2.stop()
+        up2.close()
+
+    # d) 内核网络参数：代理来自环境变量 / 配置 / 不设
+    env = {"HTTPS_PROXY": "http://u:p@proxy.example:6666"}
+    info = desktop._prepare_browser_network({}, env=env, log=lambda *a: None)
+    args = env.get("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", "")
+    check("有账号密码的代理 → 内核指向本机中转（不是把密码塞进 --proxy-server）",
+          info["applied"] and "--proxy-server=http://127.0.0.1:" in args and "u:p@" not in args, args)
+    check("本机地址在绕过名单里（否则界面自己都打不开）",
+          "127.0.0.1" in args and "--proxy-bypass-list" in args, args)
+    check("中转起来后确实在监听", info["tunnel"] is not None
+          and info["tunnel"].stats["connect"] == 0 and info["tunnel"].url.startswith("http://127.0.0.1:"),
+          info["tunnel"].url if info["tunnel"] else "")
+    if info["tunnel"]:
+        info["tunnel"].stop()
+
+    env2 = {"DOLA_PROXY": "http://proxy.example:3128"}
+    info2 = desktop._prepare_browser_network({}, env=env2, log=lambda *a: None)
+    check("无账号密码的代理 → 直接写进 --proxy-server",
+          info2["applied"] and env2.get("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", "").startswith(
+              "--proxy-server=http://proxy.example:3128"), env2.get("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"))
+
+    env3 = {}
+    info3 = desktop._prepare_browser_network({}, env=env3, log=lambda *a: None)
+    check("没有代理配置 → 什么都不设（保持直连）",
+          info3["applied"] is False and "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS" not in env3, info3["note"])
+
+    env4 = {"WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS": "--我自己设的", "HTTPS_PROXY": "http://p:1"}
+    info4 = desktop._prepare_browser_network({}, env=env4, log=lambda *a: None)
+    check("用户自己设过内核参数 → 绝不覆盖", info4["applied"] is False
+          and env4["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] == "--我自己设的", env4.get("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"))
+
+    env5 = {"HTTPS_PROXY": "http://env.example:1"}
+    info5 = desktop._prepare_browser_network({"proxy": "http://cfg.example:2"}, env=env5, log=lambda *a: None)
+    check("配置里的 proxy 优先于环境变量",
+          "cfg.example:2" in env5.get("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", ""), info5.get("args"))
+    env6 = {"HTTPS_PROXY": "http://env.example:1"}
+    info6 = desktop._prepare_browser_network({}, env=env6, log=lambda *a: None, allow_env=False)
+    check("--no-proxy 时连环境变量都不看（窗口真直连）",
+          info6["applied"] is False and "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS" not in env6,
+          info6["note"])
+
+    # e) 真站自检的判定
+    check("自检：地址还是 about:blank → 判为没打开（并指出是网络/代理层面）",
+          desktop._judge_real_site({"href": "about:blank"})[0] is False
+          and "about:blank" in desktop._judge_real_site({"href": "about:blank"})[1], "ok")
+    check("自检：内核跳到错误页 → 判为导航失败",
+          desktop._judge_real_site({"href": "chrome-error://chromewebdata/"})[0] is False, "ok")
+    check("自检：真站有内容 → 通过",
+          desktop._judge_real_site({"href": "https://www.dola.com/chat/", "text": "开始创作",
+                                    "html_len": 5000, "status": 200, "title": "Dola"})[0] is True, "ok")
+    check("自检：地址对但内容是空的 → 判为没渲染出来（白屏能被抓出来）",
+          desktop._judge_real_site({"href": "https://www.dola.com/chat/", "text": "",
+                                    "html_len": 20, "status": 200})[0] is False, "ok")
+    check("自检：拿不到页面信息 → 判为失败而不是通过",
+          desktop._judge_real_site(None)[0] is False, "ok")
+
+    # f) 轮询式自检：先 about:blank，后渲染出来
+    class ProbeWin:
+        def __init__(self, seq):
+            self.seq, self.calls = list(seq), 0
+
+        def evaluate_js(self, *_a, **_k):
+            self.calls += 1
+            return self.seq[min(self.calls - 1, len(self.seq) - 1)]
+
+    win = ProbeWin([{"href": "about:blank"}, {"href": "about:blank"},
+                    {"href": "https://www.dola.com/chat/", "text": "创作", "html_len": 4000, "status": 200}])
+    got = desktop._inspect_real_site(win, timeout=3, poll=0.05)
+    check("轮询自检：一直等到渲染成功才放行", got["ok"] and win.calls == 3, (got["why"], win.calls))
+
+    win2 = ProbeWin([{"href": "about:blank"}])
+    got2 = desktop._inspect_real_site(win2, timeout=0.3, poll=0.05)
+    check("轮询自检：一直打不开 → 超时后返回失败和原因",
+          got2["ok"] is False and "about:blank" in got2["why"] and win2.calls >= 2, got2["why"])
+
+    class BrokenWin:
+        def evaluate_js(self, *_a, **_k):
+            raise RuntimeError("内核没注入脚本")
+
+    got3 = desktop._inspect_real_site(BrokenWin(), timeout=0.25, poll=0.05)
+    check("轮询自检：脚本通道报错也不抛异常，而是当成失败并记下原因",
+          got3["ok"] is False and "内核没注入脚本" in got3["error"], got3["error"])
+
+    class HangingWin:
+        """内核卡住不回话：evaluate_js 永不返回。"""
+
+        def __init__(self):
+            self.gate = threading.Event()
+
+        def evaluate_js(self, *_a, **_k):
+            self.gate.wait(30)
+            return {}
+
+    old_limit = desktop._PROBE_HARD_LIMIT
+    desktop._PROBE_HARD_LIMIT = 0.4
+    try:
+        t0 = time.time()
+        got4 = desktop._inspect_real_site(HangingWin(), timeout=0.2, poll=0.05)
+        spent = time.time() - t0
+        check("内核卡住不回话 → 看门狗放弃并出结论（不会永远挂着）",
+              got4["ok"] is False and "没回话" in got4["why"] and spent < 5, (got4["why"], round(spent, 2)))
+    finally:
+        desktop._PROBE_HARD_LIMIT = old_limit
+
+    # g) 整条路：注入成功但真站白屏 → 窗口显示诊断页（而不是干白着）
+    real_mod = sys.modules.get("webview")
+    try:
+        _FAKE_INJECT_OK[0] = True
+        sys.modules["webview"] = fake_webview_module()
+        ctl = desktop.Control()
+        ctl.base_url = "http://127.0.0.1:8099/"
+        ctl.net_note = "经本机中转 http://127.0.0.1:1234 → proxy.example:6666"
+        desktop._inspect_real_site = lambda *a, **k: {"ok": False, "why": "地址还是 about:blank",
+                                                     "report": {"href": "about:blank"}, "error": ""}
+        ctl.open_web({"url": "/dola-web/7/", "title": "Dola · #7", "real": "https://www.dola.com/chat/",
+                      "cookie": "sessionid=a", "domain": ".dola.com", "account_id": 7})
+        w = sys.modules["webview"].windows[-1]
+        for _ in range(80):      # 注意：注入期间先显示「正在准备」等待页，别把它当诊断页
+            if "真站没能在窗口里显示" in str(getattr(w, "html_shown", "") or ""):
+                break
+            time.sleep(0.1)
+        page = getattr(w, "html_shown", "") or ""
+        check("真站白屏时窗口显示诊断页（不是让你对着空白）",
+              "真站没能在窗口里显示" in page and "about:blank" in page, "诊断页已显示")
+        check("诊断页里带上了内核网络说明（代理还是直连）",
+              "127.0.0.1:1234" in page, "ok")
+        check("诊断页里有三个按钮（改看本机代理页 / 重开真站 / 系统浏览器）",
+              page.count("dlp('") >= 3, page.count("dlp('"))
+        check("标题栏明说真站打不开", w.title.endswith("真站打不开（窗口里有说明）"), w.title)
+
+        # h) 注入成功且真站渲染出来 → 不显示诊断页，标题保持 dola.com
+        sys.modules["webview"].windows.clear()
+        desktop._inspect_real_site = lambda *a, **k: {"ok": True, "why": "标题「Dola」",
+                                                      "report": {"href": "https://www.dola.com/chat/"},
+                                                      "error": ""}
+        ctl.open_web({"url": "/dola-web/8/", "title": "Dola · #8", "real": "https://www.dola.com/chat/",
+                      "cookie": "sessionid=b", "domain": ".dola.com", "account_id": 8})
+        w2 = sys.modules["webview"].windows[-1]
+        for _ in range(60):
+            if w2.loaded:
+                break
+            time.sleep(0.1)
+        # 注：w2.html_shown 里是注入期间的「正在准备」等待页，不能拿它判断有没有诊断页
+        check("真站渲染出来 → 不弹诊断页，标题保持「· dola.com」",
+              "真站没能在窗口里显示" not in (getattr(w2, "html_shown", "") or "")
+              and w2.title.endswith("· dola.com")
+              and w2.loaded[:1] == ["https://www.dola.com/chat/"], (w2.title, w2.loaded))
+
+        # i) 诊断页上的三个按钮（js_api）真的能用
+        api = desktop._WebWindowApi()
+        api.attach(w2, "http://127.0.0.1:8099/dola-web/8/", "https://www.dola.com/chat/")
+        r1 = api.show_proxy_page()
+        r2 = api.retry_real()
+        opened = {}
+        real_browser = desktop._open_in_browser
+        desktop._open_in_browser = lambda u: opened.setdefault("url", u)
+        try:
+            r3 = api.open_local()
+        finally:
+            desktop._open_in_browser = real_browser
+        check("诊断页按钮：改看本机代理页 / 重开真站 / 用系统浏览器打开都可用",
+              r1.get("ok") and r2.get("ok") and r3.get("ok")
+              and opened.get("url") == "http://127.0.0.1:8099/dola-web/8/",
+              (r1, r2, r3, opened))
+        check("外部打开仍然只放行本机地址",
+              api.open_external("https://evil.example/").get("ok") is False, "ok")
+    finally:
+        desktop._inspect_real_site = _REAL_INSPECT
+        if real_mod is not None:
+            sys.modules["webview"] = real_mod
+        else:
+            sys.modules.pop("webview", None)
+
+
 def wait_up(should_be_up=True, timeout=45):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -426,7 +833,10 @@ def main():
         print("\n== 6. 账号窗口的 Cookie 注入（假 WebView2）==")
         cookie_injection_checks()
 
-        print("\n== 7. 退出接口 ==")
+        print("\n== 7. 内核网络（代理）与真站自检 ==")
+        network_checks()
+
+        print("\n== 8. 退出接口 ==")
         status, res = call("POST", "/api/desktop/quit")
         check("退出请求被接受", status == 200 and isinstance(res, dict) and res.get("ok"), res)
         gone, _ = wait_up(should_be_up=False, timeout=20)
