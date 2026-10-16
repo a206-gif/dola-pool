@@ -89,6 +89,8 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 
 DEMO_MODE = _env_flag("DOLA_DEMO", False)          # 演示模式：不访问外网
+DESKTOP_MODE = _env_flag("DOLA_DESKTOP", False)    # 桌面版（desktop.py 启动时置 1）
+DESKTOP_CONFIG = os.getenv("DOLA_DESKTOP_CONFIG", "").strip()
 DEMO_SECONDS = float(os.getenv("DOLA_DEMO_SECONDS", "6"))  # 演示渲染耗时
 
 logging.basicConfig(
@@ -274,6 +276,13 @@ _STOP = threading.Event()
 
 _ai_module = None
 _memory_ai_key = AI_API_KEY or ""
+_control_hook = None          # 桌面版注入：切换运行模式 / 退出应用
+
+
+def set_control_hook(hook) -> None:
+    """由 desktop.py 注入控制回调；Web 版不注入，相关接口会自动降级为「不支持」。"""
+    global _control_hook
+    _control_hook = hook
 
 
 def load_generator():
@@ -835,6 +844,7 @@ def index() -> HTMLResponse:
         .replace("{{DEMO}}", "1" if DEMO_MODE else "0")
         .replace("{{AI}}", "1" if ai_available() else "0")
         .replace("{{PORT}}", str(PORT))
+        .replace("{{DESKTOP}}", "1" if DESKTOP_MODE else "0")
     )
     return HTMLResponse(html)
 
@@ -1536,6 +1546,100 @@ def api_delete_workflow(workflow_id: int):
     return {"ok": True}
 
 
+# ---------------------------------- 桌面版 ----------------------------------
+def _desktop_mode_file() -> str:
+    return DESKTOP_CONFIG or os.path.join(DATA_DIR, "desktop.json")
+
+
+def _read_desktop_config() -> dict:
+    try:
+        with open(_desktop_mode_file(), "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _write_desktop_config(data: dict) -> None:
+    path = _desktop_mode_file()
+    merged = _read_desktop_config()
+    merged.update(data)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(merged, f, ensure_ascii=False, indent=2)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("写入桌面配置失败：%s", exc)
+
+
+@app.get("/api/desktop/config")
+def api_desktop_config() -> dict:
+    return {
+        "desktop": DESKTOP_MODE,
+        "demo": DEMO_MODE,
+        "demo_seconds": DEMO_SECONDS,
+        "version": VERSION,
+        "data_dir": DATA_DIR,
+        "output_dir": OUTPUT_DIR,
+        "config_path": _desktop_mode_file(),
+        "can_control": bool(_control_hook),
+    }
+
+
+@app.post("/api/desktop/mode")
+async def api_desktop_mode(request: Request):
+    """切换演示/生产模式：写配置 + 请求桌面外壳重启（Web 版下返回 need_restart）。"""
+    if not DESKTOP_MODE:
+        return JSONResponse({"error": "该接口仅在桌面版可用"}, 400)
+    body = await request.json()
+    demo = bool(body.get("demo"))
+    _write_desktop_config({"demo": demo})
+    audit("desktop.mode", "demo=%s" % demo)
+    if _control_hook:
+        threading.Thread(target=_control_hook, args=("restart",), daemon=True).start()
+        return {"ok": True, "demo": demo, "restarting": True}
+    return {"ok": True, "demo": demo, "restarting": False,
+            "detail": "已写入配置，下次启动生效"}
+
+
+@app.post("/api/desktop/quit")
+def api_desktop_quit():
+    if not _control_hook:
+        return JSONResponse({"error": "该接口仅在桌面版可用"}, 400)
+    audit("desktop.quit")
+    threading.Thread(target=_control_hook, args=("quit",), daemon=True).start()
+    return {"ok": True}
+
+
+@app.post("/api/desktop/reveal")
+async def api_desktop_reveal(request: Request):
+    """在文件管理器里定位成片 / 上传目录（桌面版右键「打开所在文件夹」用）。"""
+    body = await request.json()
+    target = str(body.get("path") or "").strip()
+    # 允许前端直接传静态 URL（/output/xxx.mp4、/uploads/xxx.jpg）
+    if target.startswith("/output/"):
+        target = os.path.join(OUTPUT_DIR, os.path.basename(target))
+    elif target.startswith("/uploads/"):
+        target = os.path.join(UPLOAD_DIR, os.path.basename(target))
+    allowed = (os.path.abspath(OUTPUT_DIR), os.path.abspath(UPLOAD_DIR), os.path.abspath(DATA_DIR))
+    if not target:
+        target = DATA_DIR
+    target = os.path.abspath(target)
+    if not target.startswith(allowed):
+        return JSONResponse({"error": "路径不在允许范围内"}, 400)
+    if not os.path.exists(target):
+        target = os.path.dirname(target)
+    try:
+        system = platform.system()
+        if system == "Windows":
+            subprocess.Popen(["explorer", "/select,", target] if os.path.isfile(target) else ["explorer", target])
+        elif system == "Darwin":
+            subprocess.Popen(["open", "-R", target] if os.path.isfile(target) else ["open", target])
+        else:
+            subprocess.Popen(["xdg-open", target if os.path.isdir(target) else os.path.dirname(target)])
+        return {"ok": True, "path": target}
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"error": f"打开失败：{exc}"}, 500)
+
+
 # --------------------------------------------------------------------------
 # 启动
 # --------------------------------------------------------------------------
@@ -1548,6 +1652,8 @@ def bootstrap() -> None:
              "已配置" if ai_available() else "未配置（将使用本地规则）")
     if DEMO_MODE:
         log.info("演示模式：任务会 6 秒内生成内置示例视频，不需要真实账号与代理")
+    if DESKTOP_MODE:
+        log.info("桌面模式：控制接口已启用（%s）", DESKTOP_CONFIG or "默认配置路径")
 
 
 bootstrap()

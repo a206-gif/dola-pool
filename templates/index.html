@@ -201,6 +201,7 @@ tbody tr:hover{background:rgba(12,165,140,.06)}
 const $ = (id) => document.getElementById(id);
 const view = $('view'), modal = $('modal'), modalBox = $('modalBox');
 const IS_DEMO = '{{DEMO}}' === '1';
+const IS_DESKTOP = '{{DESKTOP}}' === '1';
 const AI_READY = '{{AI}}' === '1';
 const state = { page: 'dashboard', tasks: [], accounts: [], assets: [], timers: [], scenes: [] };
 
@@ -305,6 +306,7 @@ async function refreshPills(){
     el.className = 'pill ' + (p.connected ? 'ok' : 'bad');
   } catch(e){ $('pillProxy').textContent = '代理 –'; }
 }
+$('verLine').textContent = 'v{{VERSION}}' + (IS_DESKTOP ? ' · 桌面版' : '');
 $('modeLine').textContent = IS_DEMO ? '演示模式：任务使用内置示例成片' : '生产模式：真实调用 Dola';
 $('aiLine').textContent = AI_READY ? 'AI 推理：已配置' : 'AI 推理：本地规则降级';
 $('pillMode').textContent = IS_DEMO ? '演示模式' : '生产模式';
@@ -421,8 +423,30 @@ function taskTable(tasks, compact){
 function playVideo(url, id){
   openModal('▶ 成片预览 · 任务 ' + esc(id),
     '<video src="' + url + '" controls autoplay style="width:100%;border-radius:10px;background:#000"></video>' +
-    '<div class="foot"><a class="btn" href="' + url + '" download>⬇ 下载</a>' +
-    '<button class="btn" onclick="closeModal()">关闭</button></div>');
+    '<div class="foot">' +
+      (IS_DESKTOP ? '<button class="btn" onclick="revealPath(\'' + url + '\')">📂 打开所在文件夹</button>' : '') +
+      '<a class="btn" href="' + url + '" download>⬇ 下载</a>' +
+      '<button class="btn" onclick="closeModal()">关闭</button></div>');
+}
+async function revealPath(path){
+  try { const r = await api('api/desktop/reveal', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({path: path})}); toast('已打开：' + (r.path || path)); }
+  catch(e){ toast(e.message, true); }
+}
+async function desktopSwitchMode(demo){
+  try {
+    await api('api/desktop/mode', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({demo: demo})});
+    openModal('正在重启应用', '<p class="muted">已切换到<b>' + (demo ? '演示模式' : '生产模式') +
+      '</b>，应用正在自动重启，窗口稍后会重新出现。</p>' +
+      '<p class="dim" style="font-size:12px">' + (demo
+        ? '演示模式：任务用内置示例成片，不访问外网、不需要账号。'
+        : '生产模式：任务会调用真实 Dola 生成，需要先在「账号池」导入账号 Cookie。') + '</p>');
+  } catch(e){ toast(e.message, true); }
+}
+async function desktopQuit(){
+  try { await api('api/desktop/quit', {method:'POST'}); }
+  catch(e){ toast(e.message, true); }
 }
 async function retryTask(id){
   await api('api/tasks/' + id + '/retry', {method:'POST'});
@@ -677,7 +701,8 @@ async function pageCanvas(){
     '<div class="panel" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">' +
       '<div><b>节点式工作流</b><div class="dim" style="font-size:12px">拖拽节点编排提示词 → 提交生成任务，画布可保存到服务端</div></div>' +
       '<span class="spacer" style="flex:1"></span>' +
-      '<button class="btn sm" onclick="window.open(\'/canvas\',\'_blank\')">↗ 新窗口打开</button>' +
+      '<button class="btn sm" onclick="' + (IS_DESKTOP ? "location.href='/canvas'" : "window.open('/canvas','_blank')") +
+        '">' + (IS_DESKTOP ? '↗ 全屏打开画布' : '↗ 新窗口打开') + '</button>' +
       '<button class="btn sm" onclick="loadWorkflowIntoFrame()">⇧ 加载服务端工作流</button>' +
       '<span class="chip">服务端已存 ' + wfs.length + ' 个</span>' +
     '</div>' +
@@ -942,6 +967,26 @@ async function pageSettings(){
         '<p class="dim" style="font-size:12px">未配置时，AI 推理会自动降级为本地规则模板（仍可拆镜并生成提示词）。</p>' +
         '<button class="btn primary" id="saveAi">保存 AI 配置</button></div>' +
     '</div>' +
+    (IS_DESKTOP ? '<div class="panel"><h2>🖥 桌面应用</h2>' +
+      '<div class="grid g3">' +
+        '<div class="card"><div class="k muted">当前运行模式</div>' +
+          '<div style="font-size:18px;font-weight:700;color:' + (s.demo_mode === '1' ? 'var(--warn)' : 'var(--ok)') + '">' +
+          (s.demo_mode === '1' ? '演示模式' : '生产模式') + '</div>' +
+          '<div class="dim" style="font-size:12px;margin-top:6px">' + (s.demo_mode === '1'
+            ? '任务使用内置示例成片，不访问外网，适合先熟悉流程。'
+            : '任务会真实调用 Dola 生成视频，需要先在「账号池」导入账号 Cookie。') + '</div></div>' +
+        '<div class="card"><div class="k muted">切换模式</div>' +
+          '<div class="row" style="margin-top:8px">' + (s.demo_mode === '1'
+            ? '<button class="btn primary" onclick="desktopSwitchMode(false)">切换到生产模式</button>'
+            : '<button class="btn" onclick="desktopSwitchMode(true)">切换到演示模式</button>') +
+          '</div><div class="dim" style="font-size:12px;margin-top:8px">切换后应用会自动重启，窗口稍后重新出现。</div></div>' +
+        '<div class="card"><div class="k muted">本机文件</div>' +
+          '<div class="row" style="margin-top:8px">' +
+            '<button class="btn sm" onclick="revealPath(\'' + s.output_dir + '\')">📂 成片目录</button>' +
+            '<button class="btn sm" onclick="revealPath(\'' + s.data_dir + '\')">📂 数据目录</button>' +
+            '<button class="btn sm danger" onclick="desktopQuit()">⏻ 退出应用</button>' +
+          '</div><div class="dim mono" style="font-size:11px;margin-top:8px;word-break:break-all">' + esc(s.data_dir) + '</div></div>' +
+      '</div></div>' : '') +
     '<div class="panel"><h2>ℹ 运行信息</h2><div class="grid g3">' +
       [['版本', s.version], ['运行模式', s.demo_mode === '1' ? '演示模式' : '生产模式'],
        ['数据目录', s.data_dir], ['数据库', s.db_path], ['成片目录', s.output_dir],
@@ -951,7 +996,7 @@ async function pageSettings(){
     '<div class="panel"><h2>⚠ 维护</h2><div class="row">' +
       '<button class="btn" onclick="clearLog(\'errors\')">清空错误日志</button>' +
       '<button class="btn" onclick="clearLog(\'audits\')">清空审计日志</button>' +
-      '<button class="btn" onclick="window.open(\'/docs\',\'_blank\')">打开 API 文档（/docs）</button>' +
+      (IS_DESKTOP ? '' : '<button class="btn" onclick="window.open(\'/docs\',\'_blank\')">打开 API 文档（/docs）</button>') +
       '<button class="btn" onclick="window.open(\'/api/health\',\'_blank\')">健康检查</button>' +
     '</div></div>';
   const save = async (payload, hintEl) => {

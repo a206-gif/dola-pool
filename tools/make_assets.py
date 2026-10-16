@@ -143,7 +143,29 @@ def make_demo_video(size, name, seconds=6, title="DOLA POOL", subtitle="演示�
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def make_app_icon():
+    """生成桌面版图标：static/app_icon.png（窗口图标）与 static/app_icon.ico（Windows 打包）。"""
+    from PIL import Image, ImageDraw, ImageFont
+
+    sizes = [16, 32, 48, 64, 128, 256]
+    base = Image.new("RGBA", (512, 512), (0, 0, 0, 0))
+    d = ImageDraw.Draw(base)
+    # 圆角底板
+    d.rounded_rectangle([16, 16, 496, 496], radius=104, fill=(12, 110, 94, 255))
+    d.rounded_rectangle([16, 16, 496, 496], radius=104, outline=(24, 190, 160, 255), width=8)
+    # 中央方块（沿用界面里的 ▣ 标记）
+    d.rounded_rectangle([140, 140, 372, 372], radius=34, outline=(233, 250, 246, 255), width=26)
+    d.rounded_rectangle([208, 208, 304, 304], radius=14, fill=(233, 250, 246, 255))
+    os.makedirs(os.path.join(ROOT, "static"), exist_ok=True)
+    png = os.path.join(ROOT, "static", "app_icon.png")
+    base.resize((256, 256), Image.LANCZOS).save(png, "PNG")
+    base.save(os.path.join(ROOT, "static", "app_icon.ico"),
+              sizes=[(s, s) for s in sizes])
+    print("[+] 已生成应用图标 -> static/app_icon.png / app_icon.ico")
+
+
 def main():
+    make_app_icon()
     make_backgrounds()
     make_demo_video((720, 1280), "sample_9x16.mp4")
     make_demo_video((1280, 720), "sample_16x9.mp4")

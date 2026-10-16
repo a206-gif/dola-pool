@@ -1,0 +1,15 @@
+# Dola Pool 桌面版依赖（在 Web 版依赖之上追加 pywebview）
+#
+#   pip install -r requirements-desktop.txt
+#   python desktop.py
+#
+# 各平台说明：
+#   Windows 10/11  开箱即用（pywebview 走系统自带 WebView2；老系统需装 WebView2 Runtime）
+#   macOS          开箱即用（系统 WKWebView）
+#   Linux          需要 WebKitGTK：
+#                     sudo apt install python3-gi gir1.2-webkit2-4.1
+#                  或改用 Qt 后端： pip install "pywebview[qt]"
+#
+-r requirements.txt
+
+pywebview==6.2.1

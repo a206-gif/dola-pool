@@ -9,6 +9,61 @@
                                             └── 演示渲染（DOLA_DEMO=1，无外网也可跑通）
 ```
 
+## 两种用法
+
+| 用法 | 启动方式 | 适合 |
+| --- | --- | --- |
+| **桌面应用**（推荐个人使用） | `python desktop.py` 或双击打包好的程序 | 只想在自己电脑上用，不折腾浏览器和端口 |
+| **Web 服务** | `python app.py` | 部署到服务器，多人/多设备访问 |
+
+两者共用同一套后端与控制台，功能完全一致。
+
+---
+
+## 桌面应用
+
+```bash
+pip install -r requirements-desktop.txt
+python desktop.py            # 默认演示模式，双击即可用
+python desktop.py --no-demo  # 生产模式：调用真实 Dola 生成
+```
+
+窗口用系统自带浏览器内核渲染（Windows WebView2 / macOS WKWebView / Linux WebKitGTK），
+后端只监听 `127.0.0.1` 的随机空闲端口，**不对外暴露**。
+
+- 首次运行的用户数据在：Windows `%APPDATA%\DolaPool`、macOS `~/Library/Application Support/DolaPool`、Linux `~/.local/share/dola-pool`
+- 界面「设置 → 桌面应用」里可以在**演示 / 生产模式之间一键切换**（写入 `config.json` 后应用自动重启）
+- 成片播放弹窗里可以直接「📂 打开所在文件夹」
+- 关掉窗口即退出，后台不会残留服务
+
+命令行参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `--demo` / `--no-demo` | 强制演示 / 生产模式（不写则用上次保存的选择） |
+| `--port 8123` | 指定端口（默认自动选空闲端口） |
+| `--browser` | 不开原生窗口，用系统默认浏览器打开 |
+| `--headless` | 只起服务不弹窗（调试用） |
+| `--width/--height` | 初始窗口尺寸 |
+
+系统依赖：Windows / macOS 开箱即用；Linux 需要 `sudo apt install python3-gi gir1.2-webkit2-4.1`，
+或改用 Qt 后端 `pip install "pywebview[qt]"`。缺 GUI 库时会打印安装提示并自动降级到浏览器模式。
+
+### 打包成免安装程序
+
+```bash
+pip install -r requirements-desktop.txt pyinstaller
+python tools/build_desktop.py            # 单目录版，启动快（推荐）
+python tools/build_desktop.py --onefile  # 单文件版，便于分发
+```
+
+产物在 `dist/DolaPool/`（Windows 为 `DolaPool.exe`，macOS 为 `DolaPool.app`）。
+PyInstaller 不能跨平台打包，请在目标系统上执行。
+
+自检：`python tools/desktop_test.py`（无头环境也能跑，覆盖启动 / 模式切换重启 / 退出 / 路径校验）
+
+---
+
 ## 30 秒跑起来
 
 ```bash
@@ -67,6 +122,7 @@ docker compose up -d --build
 | --- | --- | --- |
 | `DOLA_DEMO` | `0` | `1` = 演示模式，不访问外网，任务用内置示例成片 |
 | `DOLA_HOST_BIND` / `DOLA_PORT` | `0.0.0.0` / `8000` | 监听地址 |
+| `DOLA_DESKTOP` | 桌面版自动设为 `1` | 启用 `/api/desktop/*`（模式切换 / 打开目录 / 退出） |
 | `DOLA_ADMIN_TOKEN` | 空 | 设置后控制台与 API 需携带令牌（登录页 / 请求头 `X-Admin-Token` / `?token=`） |
 | `DOLA_DATA_DIR` | `./data` | 数据根目录，内含 `dola.db`、`output/`、`uploads/` |
 | `DOLA_OUTPUT_DIR` / `DOLA_UPLOAD_DIR` / `DOLA_DB` | 派生自上面 | 可分别覆盖 |
@@ -112,6 +168,7 @@ curl -X POST http://127.0.0.1:8000/api/tasks -H "Content-Type: application/json"
 | GET/POST/DELETE | `/api/workflows` | 节点画布工作流（服务端保存） |
 | GET/POST | `/api/settings` | 读写设置 |
 | GET/DELETE | `/api/errors` · `/api/audits` · `/api/keys` | 日志与密钥 |
+| GET/POST | `/api/desktop/config` · `/api/desktop/mode` · `/api/desktop/quit` · `/api/desktop/reveal` | 桌面版专用（Web 版返回「仅桌面版可用」） |
 
 交互式文档：`/docs`（FastAPI 自带）。
 
@@ -122,6 +179,7 @@ curl -X POST http://127.0.0.1:8000/api/tasks -H "Content-Type: application/json"
 ```
 dola-pool/
 ├── app.py                     # 主程序：API + 任务队列 + 账号池 + 控制台路由
+├── desktop.py                 # 桌面版启动器（pywebview 原生窗口 + 内置后端）
 ├── gen/
 │   └── dola_gen_clean.py      # 视频生成核心（提交 / 轮询 / 去水印下载 / IP 轮换）
 ├── templates/
@@ -133,6 +191,9 @@ dola-pool/
 ├── assets_src/                # 背景图源图（可用自己的图片替换后重建）
 ├── tools/make_assets.py       # 重建背景图 / 演示视频
 ├── tools/smoke_test.py        # 端到端自检（只依赖标准库）
+├── tools/desktop_test.py      # 桌面版无头自检
+├── tools/build_desktop.py     # 打包成免安装桌面程序（PyInstaller）
+├── requirements-desktop.txt   # 桌面版依赖
 ├── scripts/refresh-proxy.sh   # 代理刷新（cron 友好）
 ├── cleanup.sh                 # 成片与日志清理（建议每 5 小时一次）
 ├── data/                      # 运行时生成：dola.db、output/、uploads/（已 gitignore）
