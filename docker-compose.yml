@@ -1,6 +1,21 @@
 services:
-  dola:
+  dola-pool:
     build: .
-    ports: ["8000:8000"]
-    volumes: ["./data:/app"]
+    image: dola-pool:latest
+    container_name: dola-pool
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # 演示模式：容器内不联网也能跑通完整流程。正式使用改为 0
+      DOLA_DEMO: "${DOLA_DEMO:-1}"
+      VIDEO_MAX_CONCURRENCY: "${VIDEO_MAX_CONCURRENCY:-6}"
+    volumes:
+      - ./data:/app/data          # 数据库 / 成片 / 上传，持久化到宿主机
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/api/health',timeout=4)"]
+      interval: 30s
+      timeout: 6s
+      retries: 3

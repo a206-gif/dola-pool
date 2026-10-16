@@ -1,0 +1,1010 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Dola Pool · AI 视频生成池化平台</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>▣</text></svg>">
+<style>
+:root{
+  --bg:#0a0f11; --panel:rgba(20,26,28,.86); --panel-2:rgba(14,19,21,.9);
+  --line:rgba(52,70,70,.55); --line-2:rgba(70,96,94,.45);
+  --txt:#e6efed; --muted:#8ba1a1; --dim:#6a7d7e;
+  --brand:#0ca58c; --brand-2:#078d78; --warn:#ffc56d; --bad:#ff8b87; --ok:#7be2ad;
+  --radius:12px;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;
+  color:var(--txt); background:var(--bg); min-height:100vh; overflow-x:hidden;
+  -webkit-tap-highlight-color:transparent;
+}
+#bg{position:fixed;inset:0;z-index:-2;background-size:cover;background-position:center;transition:opacity .8s}
+#bg::after{content:'';position:absolute;inset:0;background:linear-gradient(180deg,rgba(8,12,14,.86),rgba(8,12,14,.93))}
+a{color:var(--brand);text-decoration:none}
+::-webkit-scrollbar{width:9px;height:9px}
+::-webkit-scrollbar-thumb{background:#2c3a3a;border-radius:6px}
+
+/* ---------- 布局 ---------- */
+aside{
+  position:fixed;inset:0 auto 0 0;width:210px;z-index:40;
+  background:linear-gradient(180deg,rgba(16,30,33,.96),rgba(11,17,19,.97));
+  border-right:1px solid var(--line);padding:18px 12px;overflow-y:auto;
+}
+aside .brand{display:flex;align-items:center;gap:9px;padding:2px 8px 18px}
+aside .brand b{font-size:16px;letter-spacing:.5px}
+aside .brand small{display:block;font-size:10px;color:#6fbfae;letter-spacing:1.6px}
+nav button{
+  display:flex;align-items:center;gap:9px;width:100%;text-align:left;background:none;border:0;
+  color:#b9c9c9;padding:10px 12px;border-radius:9px;font-size:13.5px;cursor:pointer;margin-bottom:2px;
+  transition:.15s;
+}
+nav button:hover{background:rgba(12,165,140,.14);color:#fff}
+nav button.active{background:linear-gradient(90deg,var(--brand-2),rgba(7,141,120,.25));color:#fff;font-weight:600}
+nav .grp{font-size:10px;color:#5f7476;letter-spacing:1.4px;padding:14px 12px 6px}
+aside .sidefoot{margin-top:14px;padding:10px 12px;border-top:1px solid var(--line);font-size:11px;color:var(--dim)}
+
+main{margin-left:210px;padding:20px 24px 60px;min-height:100vh}
+.topbar{
+  display:flex;align-items:center;gap:12px;margin-bottom:18px;padding-bottom:14px;
+  border-bottom:1px solid var(--line)
+}
+.topbar h1{font-size:20px;margin:0;flex:1}
+.pill{
+  font-size:11px;padding:4px 10px;border-radius:999px;border:1px solid var(--line-2);
+  color:var(--muted);white-space:nowrap;background:rgba(12,20,22,.6)
+}
+.pill.ok{color:var(--ok);border-color:rgba(123,226,173,.35)}
+.pill.bad{color:var(--bad);border-color:rgba(255,139,135,.35)}
+.pill.warn{color:var(--warn);border-color:rgba(255,197,109,.35)}
+#hamburger{display:none}
+
+/* ---------- 通用组件 ---------- */
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:16px;margin-bottom:16px}
+.panel h2{font-size:15px;margin:0 0 14px;display:flex;align-items:center;gap:8px}
+.panel h2 small{font-weight:400;color:var(--dim);font-size:12px}
+.grid{display:grid;gap:14px}
+.g2{grid-template-columns:repeat(2,minmax(0,1fr))}
+.g3{grid-template-columns:repeat(3,minmax(0,1fr))}
+.g4{grid-template-columns:repeat(4,minmax(0,1fr))}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.row.between{justify-content:space-between}
+.spacer{flex:1}
+.stat{background:var(--panel-2);border:1px solid var(--line);border-radius:var(--radius);padding:14px 16px}
+.stat .k{font-size:12px;color:var(--muted)}
+.stat .v{font-size:26px;font-weight:700;margin-top:4px}
+.stat .s{font-size:11px;color:var(--dim);margin-top:2px}
+label.f{display:block;font-size:12px;color:var(--muted);margin:0 0 6px}
+input,select,textarea{
+  width:100%;background:rgba(10,15,16,.85);color:var(--txt);border:1px solid var(--line-2);
+  border-radius:9px;padding:10px 11px;font:inherit;outline:none
+}
+input:focus,select:focus,textarea:focus{border-color:var(--brand);box-shadow:0 0 0 3px rgba(12,165,140,.14)}
+textarea{resize:vertical;min-height:110px;line-height:1.6}
+button{font:inherit;cursor:pointer}
+.btn{background:rgba(38,48,50,.9);color:var(--txt);border:1px solid var(--line-2);border-radius:9px;padding:9px 14px;transition:.15s}
+.btn:hover{border-color:var(--brand);color:#fff}
+.btn.primary{background:linear-gradient(135deg,var(--brand-2),var(--brand));border-color:transparent;color:#fff;font-weight:600}
+.btn.primary:hover{filter:brightness(1.08)}
+.btn.ghost{background:transparent}
+.btn.danger{color:var(--bad);border-color:rgba(255,139,135,.35)}
+.btn.sm{padding:5px 10px;font-size:12px;border-radius:7px}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{padding:9px 10px;text-align:left;border-bottom:1px solid var(--line);vertical-align:middle}
+th{color:var(--muted);font-weight:600;font-size:12px;white-space:nowrap}
+tbody tr:hover{background:rgba(12,165,140,.06)}
+.badge{display:inline-block;font-size:11px;padding:3px 8px;border-radius:999px;background:rgba(255,197,109,.14);color:var(--warn)}
+.badge.ok{background:rgba(123,226,173,.14);color:var(--ok)}
+.badge.bad{background:rgba(255,139,135,.14);color:var(--bad)}
+.badge.run{background:rgba(123,200,226,.16);color:#7bc8e2}
+.badge.dim{background:rgba(139,161,161,.14);color:var(--muted)}
+.bar{height:6px;border-radius:99px;background:rgba(120,150,150,.18);overflow:hidden;min-width:70px}
+.bar>i{display:block;height:100%;background:linear-gradient(90deg,var(--brand-2),var(--brand));transition:width .4s}
+.muted{color:var(--muted)}
+.dim{color:var(--dim)}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+.empty{padding:34px 10px;text-align:center;color:var(--dim)}
+.scroll-x{overflow-x:auto}
+.card{background:var(--panel-2);border:1px solid var(--line);border-radius:var(--radius);padding:14px}
+.chip{font-size:11px;color:var(--muted);border:1px solid var(--line-2);border-radius:999px;padding:3px 9px}
+.thumb{width:64px;height:64px;object-fit:cover;border-radius:8px;border:1px solid var(--line-2);background:#0b1113}
+.video-box{background:#05090a;border:1px solid var(--line);border-radius:10px;display:flex;align-items:center;
+  justify-content:center;min-height:230px;color:var(--dim);overflow:hidden}
+.video-box video{width:100%;max-height:460px;display:block;background:#000}
+
+/* 分镜 */
+.scene{border:1px solid var(--line);border-radius:var(--radius);background:var(--panel-2);padding:14px;margin-bottom:14px}
+.scene header{display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap}
+.scene .no{font-size:22px;color:#41514f;font-weight:700;min-width:32px}
+.scene .cols{display:grid;grid-template-columns:1fr 1.15fr 300px;gap:12px}
+.scene textarea{min-height:210px;font-size:13px}
+@media(max-width:1100px){.scene .cols{grid-template-columns:1fr}}
+
+/* 模态 / 提示 */
+.modal{position:fixed;inset:0;background:rgba(3,6,7,.78);backdrop-filter:blur(3px);z-index:80;
+  display:none;align-items:center;justify-content:center;padding:18px}
+.modal.open{display:flex}
+.modal .box{background:#131a1c;border:1px solid var(--line);border-radius:14px;padding:20px;width:100%;max-width:640px;
+  max-height:88vh;overflow:auto;box-shadow:0 30px 70px rgba(0,0,0,.55)}
+.modal .box h3{margin:0 0 16px;font-size:16px}
+.modal .box .foot{display:flex;justify-content:flex-end;gap:10px;margin-top:18px}
+#toast{position:fixed;right:20px;bottom:22px;z-index:99;display:flex;flex-direction:column;gap:8px;align-items:flex-end}
+#toast div{background:linear-gradient(135deg,var(--brand-2),var(--brand));color:#fff;padding:11px 16px;border-radius:10px;
+  box-shadow:0 12px 30px rgba(0,0,0,.4);animation:up .25s ease}
+#toast div.err{background:linear-gradient(135deg,#8f3b3b,#c2554f)}
+@keyframes up{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+
+/* 移动端 */
+@media(max-width:860px){
+  aside{transform:translateX(-100%);transition:transform .25s ease;width:250px;box-shadow:0 0 40px rgba(0,0,0,.6)}
+  aside.open{transform:none}
+  main{margin-left:0;padding:66px 12px 80px}
+  #hamburger{display:inline-flex}
+  .topbar{position:fixed;top:0;left:0;right:0;background:rgba(12,18,20,.97);z-index:50;
+    padding:12px;margin:0;border-bottom:1px solid var(--line)}
+  .grid.g2,.grid.g3,.grid.g4{grid-template-columns:1fr}
+  .topbar h1{font-size:16px}
+  .topbar .pill{display:none}
+  table{font-size:12px}
+  th,td{padding:8px 6px}
+}
+</style>
+</head>
+<body>
+<div id="bg"></div>
+
+<aside id="sidebar">
+  <div class="brand"><span style="font-size:20px">▣</span>
+    <div><b>Dola Pool</b><small>VIDEO PIPELINE</small></div>
+  </div>
+  <nav id="nav">
+    <div class="grp">创作</div>
+    <button data-page="dashboard">◎　概览</button>
+    <button data-page="generate">✧　生成</button>
+    <button data-page="storyboard">✦　分镜工作台</button>
+    <button data-page="canvas">⚡　节点画布</button>
+    <div class="grp">资源</div>
+    <button data-page="tasks">☷　任务队列</button>
+    <button data-page="accounts">♧　账号池</button>
+    <button data-page="proxies">◈　代理与 IP</button>
+    <button data-page="assets">▤　资产库</button>
+    <div class="grp">系统</div>
+    <button data-page="keys">⚿　API 密钥</button>
+    <button data-page="settings">⚙　设置</button>
+    <button data-page="logs">◉　日志</button>
+  </nav>
+  <div class="sidefoot">
+    <div id="verLine">v{{VERSION}}</div>
+    <div id="modeLine" class="dim"></div>
+    <div id="aiLine" class="dim"></div>
+  </div>
+</aside>
+
+<main>
+  <div class="topbar">
+    <button class="btn sm" id="hamburger" onclick="document.getElementById('sidebar').classList.toggle('open')">☰</button>
+    <h1 id="pageTitle">概览</h1>
+    <span class="pill" id="pillQueue">队列 –</span>
+    <span class="pill" id="pillProxy">代理 –</span>
+    <span class="pill" id="pillMode"></span>
+  </div>
+  <section id="view"></section>
+</main>
+
+<div class="modal" id="modal"><div class="box" id="modalBox"></div></div>
+<div id="toast"></div>
+
+<script>
+/* ==================== 基础工具 ==================== */
+const $ = (id) => document.getElementById(id);
+const view = $('view'), modal = $('modal'), modalBox = $('modalBox');
+const IS_DEMO = '{{DEMO}}' === '1';
+const AI_READY = '{{AI}}' === '1';
+const state = { page: 'dashboard', tasks: [], accounts: [], assets: [], timers: [], scenes: [] };
+
+function esc(v){ return String(v === null || v === undefined ? '' : v)
+  .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
+
+function toast(msg, isErr){
+  const d = document.createElement('div');
+  if (isErr) d.className = 'err';
+  d.textContent = msg;
+  $('toast').appendChild(d);
+  setTimeout(() => d.remove(), 3200);
+}
+
+async function api(path, opts){
+  opts = opts || {};
+  const headers = Object.assign({'X-Admin-Token': localStorage.getItem('dola_token') || ''}, opts.headers || {});
+  const res = await fetch('/' + path.replace(/^\//,''), Object.assign({}, opts, {headers}));
+  const text = await res.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch(e){ data = {error: text.slice(0,300)}; }
+  if (!res.ok){
+    if (res.status === 401) toast('未授权：请在登录页填写 DOLA_ADMIN_TOKEN', true);
+    throw new Error((data && (data.error || data.detail)) || ('HTTP ' + res.status));
+  }
+  return data;
+}
+
+function fmtTime(s){
+  if (!s) return '–';
+  try { return new Date(s.replace(' ','T').replace('Z','') + (s.endsWith('Z') ? '' : 'Z'))
+    .toLocaleString('zh-CN', {hour12:false, month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit', second:'2-digit'}); }
+  catch(e){ return s; }
+}
+function fmtBytes(n){
+  n = Number(n || 0);
+  if (n > 1073741824) return (n/1073741824).toFixed(2) + ' GB';
+  if (n > 1048576) return (n/1048576).toFixed(1) + ' MB';
+  if (n > 1024) return (n/1024).toFixed(0) + ' KB';
+  return n + ' B';
+}
+function statusBadge(s){
+  const map = {completed:'ok', running:'run', queued:'dim', failed:'bad', cancelled:'dim'};
+  const label = {completed:'已完成', running:'生成中', queued:'排队中', failed:'失败', cancelled:'已取消'};
+  return '<span class="badge ' + (map[s]||'') + '">' + (label[s] || esc(s||'–')) + '</span>';
+}
+function openModal(title, html, onOpen){
+  modalBox.innerHTML = '<h3>' + title + '</h3>' + html;
+  modal.classList.add('open');
+  if (onOpen) onOpen();
+}
+function closeModal(){ modal.classList.remove('open'); modalBox.innerHTML = ''; }
+modal.addEventListener('click', (e) => { if (e.target === modal) closeModal(); });
+
+/** 通用表单模态：fields=[{key,label,type,options,value,placeholder,hint}] */
+function formModal(title, fields, onSubmit, submitLabel){
+  const body = fields.map(f => {
+    const val = f.value === undefined || f.value === null ? '' : f.value;
+    let input;
+    if (f.type === 'textarea') input = '<textarea name="' + f.key + '" placeholder="' + esc(f.placeholder||'') + '">' + esc(val) + '</textarea>';
+    else if (f.type === 'select') input = '<select name="' + f.key + '">' + (f.options||[]).map(o =>
+      '<option value="' + esc(o) + '"' + (String(o) === String(val) ? ' selected' : '') + '>' + esc(o) + '</option>').join('') + '</select>';
+    else input = '<input name="' + f.key + '" type="' + (f.type||'text') + '" value="' + esc(val) + '" placeholder="' + esc(f.placeholder||'') + '">';
+    return '<div style="margin-bottom:12px"><label class="f">' + esc(f.label) + (f.hint ? ' <span class="dim">' + esc(f.hint) + '</span>' : '') + '</label>' + input + '</div>';
+  }).join('');
+  openModal(title, '<form id="mform">' + body +
+    '<div class="foot"><button type="button" class="btn" onclick="closeModal()">取消</button>' +
+    '<button type="submit" class="btn primary">' + esc(submitLabel || '确定') + '</button></div></form>');
+  $('mform').onsubmit = async (e) => {
+    e.preventDefault();
+    const data = Object.fromEntries(new FormData(e.target).entries());
+    try { await onSubmit(data); closeModal(); }
+    catch(err){ toast(err.message, true); }
+  };
+}
+function confirmAction(msg, fn){
+  openModal('请确认', '<p class="muted">' + esc(msg) + '</p><div class="foot">' +
+    '<button class="btn" onclick="closeModal()">取消</button>' +
+    '<button class="btn danger" id="okBtn">确定</button></div>');
+  $('okBtn').onclick = async () => { closeModal(); try { await fn(); } catch(e){ toast(e.message, true); } };
+}
+function setTimers(fns){ state.timers.forEach(clearInterval); state.timers = fns.map(f => setInterval(f, 4000)); }
+
+/* ==================== 背景轮换 ==================== */
+let bgIndex = (new Date().getHours() % 15) + 1;
+function applyBg(){
+  $('bg').style.backgroundImage = "url('/static/bg_images/bg_" + String(bgIndex).padStart(2,'0') + ".jpg')";
+}
+setInterval(() => { bgIndex = (bgIndex % 15) + 1; applyBg(); }, 300000);
+applyBg();
+
+/* ==================== 顶栏状态 ==================== */
+async function refreshPills(){
+  try {
+    const q = await api('api/queue');
+    $('pillQueue').textContent = '队列 ' + q.queue_depth + ' · 并发 ' + q.active + '/' + q.workers;
+  } catch(e){ $('pillQueue').textContent = '队列 –'; }
+  try {
+    const p = await api('api/proxy-status?probe=0');
+    const el = $('pillProxy');
+    el.textContent = p.connected ? ('IP ' + (p.ip || '已连接')) : '代理未连接';
+    el.className = 'pill ' + (p.connected ? 'ok' : 'bad');
+  } catch(e){ $('pillProxy').textContent = '代理 –'; }
+}
+$('modeLine').textContent = IS_DEMO ? '演示模式：任务使用内置示例成片' : '生产模式：真实调用 Dola';
+$('aiLine').textContent = AI_READY ? 'AI 推理：已配置' : 'AI 推理：本地规则降级';
+$('pillMode').textContent = IS_DEMO ? '演示模式' : '生产模式';
+$('pillMode').className = 'pill ' + (IS_DEMO ? 'warn' : 'ok');
+
+/* ==================== 路由 ==================== */
+const TITLES = {dashboard:'概览', generate:'生成', storyboard:'分镜工作台', canvas:'节点画布',
+  tasks:'任务队列', accounts:'账号池', proxies:'代理与 IP', assets:'资产库', keys:'API 密钥',
+  settings:'设置', logs:'日志'};
+const PAGES = {dashboard:pageDashboard, generate:pageGenerate, storyboard:pageStoryboard,
+  canvas:pageCanvas, tasks:pageTasks, accounts:pageAccounts, proxies:pageProxies,
+  assets:pageAssets, keys:pageKeys, settings:pageSettings, logs:pageLogs};
+
+function nav(){
+  document.querySelectorAll('#nav button').forEach(b => {
+    b.classList.toggle('active', b.dataset.page === state.page);
+    b.onclick = () => { state.page = b.dataset.page; $('sidebar').classList.remove('open'); render(); };
+  });
+}
+async function render(){
+  state.timers.forEach(clearInterval); state.timers = [];
+  nav();
+  $('pageTitle').textContent = TITLES[state.page] || state.page;
+  view.innerHTML = '<div class="empty">加载中…</div>';
+  try { await PAGES[state.page](); }
+  catch(e){ view.innerHTML = '<div class="panel"><h2>加载失败</h2><p class="muted">' + esc(e.message) +
+    '</p><button class="btn" onclick="render()">重试</button></div>'; }
+  refreshPills();
+}
+
+/* ==================== 概览 ==================== */
+async function pageDashboard(){
+  const [stats, queue, tasks, proxy] = await Promise.all([
+    api('api/stats'), api('api/queue'), api('api/tasks?limit=8'), api('api/proxy-status?probe=0')]);
+  const cards = [
+    ['可用账号', stats.active_accounts, '共 ' + stats.total_accounts + ' 个 · 失效 ' + stats.invalid_accounts, 'var(--ok)'],
+    ['正在生成', stats.running_tasks, '并发 ' + queue.active + '/' + queue.workers + ' · 排队 ' + stats.queued_tasks, '#7bc8e2'],
+    ['24h 成片', stats.today_completed, '累计完成 ' + stats.completed_tasks, 'var(--brand)'],
+    ['失败任务', stats.failed_tasks, '可一键重试', 'var(--bad)'],
+  ];
+  view.innerHTML =
+    '<div class="grid g4" style="margin-bottom:16px">' + cards.map(c =>
+      '<div class="stat"><div class="k">' + c[0] + '</div><div class="v" style="color:' + c[3] + '">' + c[1] +
+      '</div><div class="s">' + esc(c[2]) + '</div></div>').join('') + '</div>' +
+    '<div class="grid g2">' +
+      '<div class="panel"><h2>⚡ 快速开始</h2>' +
+        '<p class="muted" style="margin-top:0">' + (IS_DEMO
+          ? '当前是<b>演示模式</b>：提交任务后约 6 秒生成内置示例成片，无需真实账号与代理，可完整走通流程。'
+          : '当前是<b>生产模式</b>：任务会通过 <span class="mono">gen/dola_gen_clean.py</span> 调用 Dola 生成真实视频。') + '</p>' +
+        '<div class="row"><button class="btn primary" onclick="go(\'generate\')">✧ 去生成视频</button>' +
+        '<button class="btn" onclick="go(\'storyboard\')">✦ 分镜工作台</button>' +
+        '<button class="btn" onclick="go(\'accounts\')">♧ 导入账号</button>' +
+        '<button class="btn" onclick="go(\'canvas\')">⚡ 节点画布</button></div>' +
+        '<div class="grid g2" style="margin-top:16px">' +
+          '<div class="card"><div class="k muted">磁盘占用（成片）</div><div style="font-size:18px;font-weight:600">' + fmtBytes(stats.output_bytes) + '</div></div>' +
+          '<div class="card"><div class="k muted">资产 / 工作流</div><div style="font-size:18px;font-weight:600">' + stats.total_assets + ' / ' + stats.total_workflows + '</div></div>' +
+        '</div>' +
+      '</div>' +
+      '<div class="panel"><h2>◈ 出口 IP</h2>' +
+        '<div class="card"><div class="row between"><div><div class="muted" style="font-size:12px">状态</div>' +
+        '<div style="font-size:20px;font-weight:700;color:' + (proxy.connected ? 'var(--ok)' : 'var(--bad)') + '">' +
+        (proxy.connected ? '已连接' : '未连接') + '</div></div>' +
+        '<div style="text-align:right"><div class="muted" style="font-size:12px">出口 IP</div><div class="mono">' + esc(proxy.ip || '–') + '</div>' +
+        '<div class="dim" style="font-size:11px;margin-top:4px">' + esc(proxy.region || proxy.error || '') + '</div></div></div>' +
+        '<div class="row" style="margin-top:12px"><button class="btn sm" onclick="refreshProxyStatus()">↻ 检测出口 IP</button>' +
+        '<button class="btn sm" onclick="refreshProxyIp()">⟳ 刷新代理 IP</button></div></div>' +
+        '<p class="dim" style="font-size:12px">真实生成时出口 IP 由 <span class="mono">gen/dola_gen_clean.py</span> 按任务自动轮换；' +
+        '这里展示的是 <span class="mono">DOLA_PROXY / HTTPS_PROXY</span> 的连通性。</p>' +
+      '</div>' +
+    '</div>' +
+    '<div class="panel"><h2>☷ 最近任务 <small>自动刷新</small>' +
+      '<span class="spacer" style="flex:1"></span>' +
+      '<button class="btn sm" onclick="go(\'tasks\')">查看全部</button></h2>' +
+      taskTable(tasks, true) + '</div>';
+  setTimers([pageDashboard]);
+}
+function go(page){ state.page = page; render(); }
+
+async function refreshProxyStatus(){
+  const p = await api('api/proxy-status?probe=1');
+  toast('出口 IP：' + (p.ip || p.error || '未知'));
+  refreshPills();
+}
+async function refreshProxyIp(){
+  const r = await api('api/proxies/refresh', {method:'POST'});
+  toast(r.ok ? ('代理已刷新：' + ((r.status && r.status.ip) || 'ok')) : ('刷新失败：' + (r.error || '')), !r.ok);
+}
+
+/* ==================== 任务表 ==================== */
+function taskTable(tasks, compact){
+  if (!tasks.length) return '<div class="empty">暂无任务</div>';
+  return '<div class="scroll-x"><table><thead><tr>' +
+    '<th>ID</th><th>提示词</th>' + (compact ? '' : '<th>参数</th>') +
+    '<th>账号</th><th>状态</th>' + (compact ? '' : '<th>创建时间</th>') + '<th>操作</th>' +
+    '</tr></thead><tbody>' + tasks.map(t =>
+      '<tr><td class="mono">' + esc(t.id) + '</td>' +
+      '<td style="max-width:340px"><div style="display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden">' +
+        esc((t.prompt || '').slice(0, 160)) + '</div></td>' +
+      (compact ? '' : '<td class="dim mono">' + esc(t.model || '') + ' · ' + (t.duration || 0) + 's · ' + esc(t.ratio || '') + '</td>') +
+      '<td class="dim">' + (t.account_id ? '#' + t.account_id : '自动') + '</td>' +
+      '<td>' + statusBadge(t.status) +
+        (t.status === 'running' || t.status === 'queued'
+          ? '<div class="bar" style="margin-top:6px"><i style="width:' + (t.progress || 0) + '%"></i></div>' +
+            '<div class="dim" style="font-size:11px;margin-top:3px">' + esc((t.result || '').slice(0, 40)) + '</div>'
+          : (t.status === 'failed' ? '<div class="dim" style="font-size:11px;margin-top:4px;max-width:220px">' + esc((t.error || t.result || '').slice(0, 80)) + '</div>' : '')) +
+      '</td>' +
+      (compact ? '' : '<td class="dim" style="white-space:nowrap">' + fmtTime(t.created_at) + '</td>') +
+      '<td style="white-space:nowrap">' +
+        (t.video_url ? '<button class="btn sm" onclick="playVideo(\'' + t.video_url + '\',\'' + esc(t.id) + '\')">▶ 播放</button> ' : '') +
+        (t.status === 'failed' ? '<button class="btn sm" onclick="retryTask(\'' + t.id + '\')">↻ 重试</button> ' : '') +
+        (compact ? '' : '<button class="btn sm danger" onclick="deleteTask(\'' + t.id + '\')">✕</button>') +
+      '</td></tr>').join('') + '</tbody></table></div>';
+}
+function playVideo(url, id){
+  openModal('▶ 成片预览 · 任务 ' + esc(id),
+    '<video src="' + url + '" controls autoplay style="width:100%;border-radius:10px;background:#000"></video>' +
+    '<div class="foot"><a class="btn" href="' + url + '" download>⬇ 下载</a>' +
+    '<button class="btn" onclick="closeModal()">关闭</button></div>');
+}
+async function retryTask(id){
+  await api('api/tasks/' + id + '/retry', {method:'POST'});
+  toast('任务已重新排队'); render();
+}
+function deleteTask(id){
+  confirmAction('删除任务 ' + id + '（同时删除已生成的视频文件）？', async () => {
+    await api('api/tasks/' + id, {method:'DELETE'});
+    toast('任务已删除'); render();
+  });
+}
+function retryAllFailed(){
+  confirmAction('重试所有失败任务？', async () => {
+    const r = await api('api/tasks/retry-failed', {method:'POST'});
+    toast('已重新排队 ' + r.count + ' 个任务'); render();
+  });
+}
+
+/* ==================== 生成页 ==================== */
+async function pageGenerate(){
+  const [queue, tasks] = await Promise.all([api('api/queue'), api('api/tasks?limit=6')]);
+  const latest = tasks.find(t => t.video_url);
+  view.innerHTML =
+  '<div class="grid g2" style="grid-template-columns:minmax(0,1.15fr) minmax(0,.85fr)">' +
+    '<div class="panel"><h2>✧ 新建视频任务 <small>每行一条提示词即为批量</small></h2>' +
+      '<label class="f">提示词（每行一条）</label>' +
+      '<textarea id="genPrompt" style="min-height:180px" placeholder="例：9:16 竖屏，女孩在雨后街道回头，霓虹倒影，慢动作水花，电影级光影，8K 超清"></textarea>' +
+      '<div class="grid g4" style="margin-top:12px">' +
+        '<div><label class="f">模型</label><select id="genModel"><option>seedance_v2.0</option><option>seedance_v2.5</option></select></div>' +
+        '<div><label class="f">时长</label><select id="genDuration"><option>10</option><option>15</option><option>30</option><option>5</option></select></div>' +
+        '<div><label class="f">比例</label><select id="genRatio"><option>9:16</option><option>16:9</option><option>1:1</option></select></div>' +
+        '<div><label class="f">画质</label><select id="genQuality"><option>720p</option><option>1080p</option><option>480p</option></select></div>' +
+      '</div>' +
+      '<div class="row" style="margin-top:12px">' +
+        '<div style="width:150px"><label class="f">每条重复次数</label><input id="genCopies" type="number" min="1" max="20" value="1"></div>' +
+        '<div style="flex:1;min-width:200px"><label class="f">指定账号（留空自动选号）</label><input id="genAccount" type="number" placeholder="账号 ID，可留空"></div>' +
+      '</div>' +
+      '<div style="margin-top:12px"><label class="f">参考图（可选，最多 9 张）</label>' +
+        '<input type="file" id="genRefs" accept="image/*" multiple>' +
+        '<div id="refThumbs" class="row" style="margin-top:8px"></div></div>' +
+      '<div class="row" style="margin-top:16px"><button class="btn primary" id="genSubmit">✧ 提交任务</button>' +
+        '<button class="btn" onclick="openAiAssist()">✦ AI 帮我写提示词</button>' +
+        '<span class="dim" id="genHint"></span></div>' +
+    '</div>' +
+    '<div><div class="panel"><h2>☷ 队列状态</h2>' +
+      '<div class="grid g2">' +
+        '<div class="card"><div class="k muted">排队中</div><div style="font-size:22px;font-weight:700">' + queue.queue_depth + '</div></div>' +
+        '<div class="card"><div class="k muted">执行中</div><div style="font-size:22px;font-weight:700;color:#7bc8e2">' + queue.active + '/' + queue.workers + '</div></div>' +
+      '</div></div>' +
+      '<div class="panel"><h2>▶ 最近成片</h2><div class="video-box" id="latestBox">' +
+        (latest ? '<video src="' + latest.video_url + '" controls></video>' : '暂无成片') + '</div></div>' +
+    '</div>' +
+  '</div>' +
+  '<div class="panel"><h2>最近任务</h2>' + taskTable(tasks, true) + '</div>';
+
+  const refs = [];
+  $('genRefs').onchange = async (e) => {
+    for (const f of e.target.files){
+      const fd = new FormData(); fd.append('file', f);
+      try {
+        const r = await api('api/upload-image', {method:'POST', body: fd});
+        refs.push(r.path);
+        $('refThumbs').insertAdjacentHTML('beforeend', '<img class="thumb" src="' + r.url + '">');
+      } catch(err){ toast('上传失败：' + err.message, true); }
+    }
+    toast('已上传 ' + refs.length + ' 张参考图');
+  };
+  $('genSubmit').onclick = async () => {
+    const lines = $('genPrompt').value.split('\n').map(s => s.trim()).filter(Boolean);
+    if (!lines.length) return toast('请先填写提示词', true);
+    const copies = Math.max(1, Math.min(20, Number($('genCopies').value) || 1));
+    const accountId = Number($('genAccount').value) || null;
+    const items = [];
+    lines.forEach(p => { for (let i = 0; i < copies; i++) items.push({prompt: p}); });
+    if (items.length > 500) return toast('单次最多 500 条', true);
+    $('genSubmit').disabled = true;
+    try {
+      const r = await api('api/tasks', {method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({tasks: items, model: $('genModel').value, duration: Number($('genDuration').value),
+          ratio: $('genRatio').value, quality: $('genQuality').value, account_id: accountId,
+          ref_images: refs.join(',')})});
+      toast('已提交 ' + r.count + ' 个任务，队列 ' + r.queue_depth);
+      state.page = 'tasks'; render();
+    } catch(e){ toast(e.message, true); }
+    finally { const b = $('genSubmit'); if (b) b.disabled = false; }
+  };
+  setTimers([pageGenerate]);
+}
+function openAiAssist(){
+  formModal('AI 生成提示词', [
+    {key:'script', label:'内容梗概 / 脚本', type:'textarea', placeholder:'例：女孩在便利店门口等雨停，男生递伞…'},
+    {key:'style', label:'风格', type:'select', options:['movie quality','甜蜜喜剧手绘动画','商业广告','写实纪录','国漫 3D','赛博朋克']},
+    {key:'duration', label:'单镜头时长（秒）', type:'select', options:['5','10','15','30'], value:'15'},
+  ], async (d) => {
+    const r = await api('api/ai-reason', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({script: d.script, style: d.style, duration: Number(d.duration)})});
+    $('genPrompt').value = r.scenes.map(s => s.prompt).join('\n');
+    toast('已生成 ' + r.count + ' 条提示词（' + (r.engine === 'agnes' ? 'AI' : '本地规则') + '）');
+  });
+}
+
+/* ==================== 分镜工作台 ==================== */
+function loadScenes(){ try { return JSON.parse(localStorage.getItem('dola_scenes') || '[]'); } catch(e){ return []; } }
+function saveScenes(s){ localStorage.setItem('dola_scenes', JSON.stringify(s.slice(0, 60))); }
+
+async function pageStoryboard(){
+  state.scenes = loadScenes();
+  view.innerHTML =
+    '<div class="panel"><h2>✦ 分镜工作台 <small>AI 推理 → 逐镜生成 → 跟踪进度</small></h2>' +
+      '<div class="grid g2">' +
+        '<div><label class="f">脚本 / 内容梗概</label>' +
+          '<textarea id="sbScript" style="min-height:120px" placeholder="把整段文案贴进来，AI 会拆成多条镜头提示词"></textarea></div>' +
+        '<div><div class="grid g2">' +
+          '<div><label class="f">风格</label><select id="sbStyle"><option>movie quality</option><option>甜蜜喜剧手绘动画</option><option>商业广告</option><option>写实纪录</option><option>国漫 3D</option><option>赛博朋克</option></select></div>' +
+          '<div><label class="f">单镜头时长（秒）</label><select id="sbDuration"><option>15</option><option>10</option><option>5</option><option>30</option></select></div>' +
+        '</div>' +
+        '<div class="row" style="margin-top:12px"><button class="btn primary" id="sbReason">✦ AI 推理分镜</button>' +
+        '<button class="btn" id="sbAdd">+ 手动加镜</button>' +
+        '<button class="btn" id="sbAll">⚡ 全部生成</button>' +
+        '<button class="btn" id="sbExport">⬇ 导出 JSON</button>' +
+        '<button class="btn" onclick="document.getElementById(\'sbImport\').click()">⇧ 导入 JSON</button>' +
+        '<input type="file" id="sbImport" accept=".json" style="display:none">' +
+        '<button class="btn danger" id="sbClear">✕ 清空</button></div>' +
+        '<p class="dim" style="font-size:12px">提示：' + (AI_READY ? '已配置 AI Key，推理走 Agnes AI。' : '未配置 AI Key，将使用本地规则模板（在设置页可配置）。') + '</p>' +
+      '</div></div></div>' +
+    '<div id="sceneList"></div>';
+  renderScenes();
+  $('sbReason').onclick = async () => {
+    const script = $('sbScript').value.trim();
+    if (!script) return toast('请先填写脚本', true);
+    $('sbReason').disabled = true; $('sbReason').textContent = '推理中…';
+    try {
+      const r = await api('api/ai-reason', {method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({script, style: $('sbStyle').value, duration: Number($('sbDuration').value)})});
+      state.scenes = state.scenes.concat(r.scenes);
+      saveScenes(state.scenes); renderScenes();
+      toast('已生成 ' + r.count + ' 个镜头（' + (r.engine === 'agnes' ? 'Agnes AI' : '本地规则') + '）');
+    } catch(e){ toast(e.message, true); }
+    finally { const b = $('sbReason'); if (b) { b.disabled = false; b.textContent = '✦ AI 推理分镜'; } }
+  };
+  $('sbAdd').onclick = () => { state.scenes.push({title:'镜头_' + (state.scenes.length+1), script:'', prompt:'',
+    duration:Number($('sbDuration').value), ratio:'9:16', status:'draft'}); saveScenes(state.scenes); renderScenes(); };
+  $('sbAll').onclick = () => submitScenes(state.scenes.map((_, i) => i));
+  $('sbExport').onclick = () => {
+    const blob = new Blob([JSON.stringify(state.scenes, null, 2)], {type:'application/json'});
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'storyboard.json'; a.click();
+  };
+  $('sbImport').onchange = async (e) => {
+    const f = e.target.files[0]; if (!f) return;
+    try {
+      const data = JSON.parse(await f.text());
+      state.scenes = state.scenes.concat(Array.isArray(data) ? data : [data]);
+      saveScenes(state.scenes); renderScenes(); toast('已导入 ' + state.scenes.length + ' 个镜头');
+    } catch(err){ toast('解析失败：' + err.message, true); }
+  };
+  $('sbClear').onclick = () => confirmAction('清空当前所有分镜？', async () => {
+    state.scenes = []; saveScenes(state.scenes); renderScenes(); toast('已清空');
+  });
+  pollScenes();
+  setTimers([pollScenes]);
+}
+
+function renderScenes(){
+  if (!state.scenes.length){ $('sceneList').innerHTML = '<div class="panel"><div class="empty">还没有分镜，先点「AI 推理分镜」或「手动加镜」</div></div>'; return; }
+  $('sceneList').innerHTML = state.scenes.map((s, i) =>
+    '<div class="scene"><header><span class="no">' + (i+1) + '</span>' +
+      '<input value="' + esc(s.title || '') + '" oninput="updScene(' + i + ',\'title\',this.value)" style="width:180px">' +
+      statusBadge(s.status === 'draft' ? 'queued' : s.status) +
+      '<span class="chip">' + (s.duration || 15) + 's · ' + esc(s.ratio || '9:16') + '</span>' +
+      '<span class="spacer" style="flex:1"></span>' +
+      '<button class="btn sm" onclick="sceneMore(' + i + ')">⋯ 更多</button>' +
+      '<button class="btn sm primary" onclick="submitScenes([' + i + '])">⚡ 生成此镜</button>' +
+      '<button class="btn sm danger" onclick="delScene(' + i + ')">✕</button>' +
+    '</header><div class="cols">' +
+      '<div><label class="f">原始文案</label><textarea oninput="updScene(' + i + ',\'script\',this.value)" placeholder="这一镜的文案 / 描述">' + esc(s.script || '') + '</textarea></div>' +
+      '<div><label class="f">视频提示词（投喂模型）</label><textarea oninput="updScene(' + i + ',\'prompt\',this.value)" placeholder="详细的视频生成提示词">' + esc(s.prompt || '') + '</textarea></div>' +
+      '<div><label class="f">参数与预览</label><div class="row">' +
+        '<select style="flex:1" onchange="updScene(' + i + ',\'duration\',Number(this.value))">' +
+          [5,10,15,30].map(d => '<option value="' + d + '"' + (Number(s.duration) === d ? ' selected' : '') + '>' + d + '秒</option>').join('') + '</select>' +
+        '<select style="flex:1" onchange="updScene(' + i + ',\'ratio\',this.value)">' +
+          ['9:16','16:9','1:1'].map(r => '<option' + (s.ratio === r ? ' selected' : '') + '>' + r + '</option>').join('') + '</select>' +
+      '</div>' +
+      '<div class="video-box" style="margin-top:10px;min-height:200px">' +
+        (s.video_url ? '<video src="' + s.video_url + '" controls></video>' :
+          '<span style="padding:14px;text-align:center">' +
+          (s.status === 'failed' ? '❌ ' + esc((s.error || '生成失败').slice(0, 120)) :
+           s.status === 'running' ? '⏳ 生成中 ' + (s.progress || 0) + '%' :
+           s.status === 'queued' ? '🕒 排队中' : '等待生成') + '</span>') + '</div>' +
+        (s.task_id ? '<div class="dim mono" style="margin-top:6px">任务 ' + esc(s.task_id) + '</div>' : '') +
+      '</div></div></div>').join('');
+}
+function updScene(i, k, v){
+  if (!state.scenes[i]) return;
+  state.scenes[i][k] = v;
+  if (k === 'duration' || k === 'ratio') renderScenes();
+  saveScenes(state.scenes);
+}
+function delScene(i){ state.scenes.splice(i, 1); saveScenes(state.scenes); renderScenes(); }
+function sceneMore(i){
+  const s = state.scenes[i];
+  formModal('镜头 ' + (i+1) + ' 更多操作', [
+    {key:'hint', label:'可直接修改标题 / 参考图路径', type:'text', value: s.ref_image || '', placeholder:'参考图路径（/uploads/xxx.jpg），可留空'},
+  ], async (d) => {
+    s.ref_image = d.hint; saveScenes(state.scenes);
+  }, '保存');
+  modalBox.insertAdjacentHTML('beforeend',
+    '<div class="row"><button class="btn" onclick="closeModal();submitScenes([' + i + '])">⚡ 生成此镜</button>' +
+    '<button class="btn" onclick="closeModal();copyScenePrompt(' + i + ')">⧉ 复制提示词</button></div>');
+}
+function copyScenePrompt(i){
+  navigator.clipboard.writeText(state.scenes[i].prompt || '').then(() => toast('提示词已复制'));
+}
+async function submitScenes(indexes){
+  const items = indexes.map(i => state.scenes[i]).filter(s => (s.prompt || '').trim());
+  if (!items.length) return toast('没有可提交的提示词', true);
+  try {
+    const payload = items.map(s => ({prompt: s.prompt, duration: Number(s.duration) || 15, ratio: s.ratio || '9:16',
+      model: (Number(s.duration) || 15) <= 15 ? 'seedance_v2.0' : 'seedance_v2.5',
+      ref_images: s.ref_image || ''}));
+    const r = await api('api/tasks', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({tasks: payload})});
+    indexes.forEach((idx, k) => {
+      if (state.scenes[idx]) { state.scenes[idx].task_id = r.ids[k]; state.scenes[idx].status = 'queued'; state.scenes[idx].progress = 0; }
+    });
+    saveScenes(state.scenes); renderScenes();
+    toast('已提交 ' + r.count + ' 个镜头任务');
+  } catch(e){ toast(e.message, true); }
+}
+async function pollScenes(){
+  const ids = state.scenes.filter(s => s.task_id && s.status !== 'completed').map(s => s.task_id);
+  if (!ids.length) return;
+  try {
+    const tasks = await api('api/tasks?limit=500');
+    let changed = false;
+    state.scenes.forEach(s => {
+      if (!s.task_id) return;
+      const t = tasks.find(x => x.id === s.task_id);
+      if (!t) return;
+      if (s.status !== t.status || s.progress !== t.progress || (t.video_url && s.video_url !== t.video_url)){
+        s.status = t.status; s.progress = t.progress; s.error = t.error || t.result;
+        if (t.video_url) s.video_url = t.video_url;
+        changed = true;
+      }
+    });
+    if (changed && state.page === 'storyboard'){ saveScenes(state.scenes); renderScenes(); }
+  } catch(e){ /* 忽略轮询错误 */ }
+}
+
+/* ==================== 节点画布 ==================== */
+async function pageCanvas(){
+  const [wfs] = await Promise.all([api('api/workflows')]);
+  view.innerHTML =
+    '<div class="panel" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">' +
+      '<div><b>节点式工作流</b><div class="dim" style="font-size:12px">拖拽节点编排提示词 → 提交生成任务，画布可保存到服务端</div></div>' +
+      '<span class="spacer" style="flex:1"></span>' +
+      '<button class="btn sm" onclick="window.open(\'/canvas\',\'_blank\')">↗ 新窗口打开</button>' +
+      '<button class="btn sm" onclick="loadWorkflowIntoFrame()">⇧ 加载服务端工作流</button>' +
+      '<span class="chip">服务端已存 ' + wfs.length + ' 个</span>' +
+    '</div>' +
+    '<div class="panel" style="padding:0;overflow:hidden;height:calc(100vh - 190px);min-height:520px">' +
+      '<iframe id="cvFrame" src="/canvas" style="width:100%;height:100%;border:0;display:block"></iframe>' +
+    '</div>';
+}
+function loadWorkflowIntoFrame(){
+  const frame = $('cvFrame');
+  if (frame && frame.contentWindow && frame.contentWindow.loadServerWorkflow) frame.contentWindow.loadServerWorkflow();
+  else toast('请在画布内使用「加载工作流」按钮');
+}
+
+/* ==================== 任务页 ==================== */
+async function pageTasks(){
+  const [stats, tasks] = await Promise.all([api('api/stats'), api('api/tasks?limit=500')]);
+  state.tasks = tasks;
+  view.innerHTML =
+    '<div class="grid g4" style="margin-bottom:16px">' +
+      '<div class="stat"><div class="k">运行中</div><div class="v" style="color:#7bc8e2">' + stats.running_tasks + '</div><div class="s">排队 ' + stats.queued_tasks + '</div></div>' +
+      '<div class="stat"><div class="k">已完成</div><div class="v" style="color:var(--ok)">' + stats.completed_tasks + '</div><div class="s">24h 内 ' + stats.today_completed + '</div></div>' +
+      '<div class="stat"><div class="k">失败</div><div class="v" style="color:var(--bad)">' + stats.failed_tasks + '</div><div class="s">可一键重试</div></div>' +
+      '<div class="stat"><div class="k">成片占用</div><div class="v">' + fmtBytes(stats.output_bytes) + '</div><div class="s">output 目录</div></div>' +
+    '</div>' +
+    '<div class="panel"><div class="row" style="margin-bottom:12px">' +
+      '<input id="tq" placeholder="搜索任务 ID 或提示词" style="flex:1;min-width:180px" oninput="drawTaskTable()">' +
+      '<select id="ts" style="width:140px" onchange="drawTaskTable()">' +
+        '<option value="">全部状态</option><option value="running">生成中</option><option value="queued">排队中</option>' +
+        '<option value="completed">已完成</option><option value="failed">失败</option></select>' +
+      '<button class="btn" onclick="render()">↻ 刷新</button>' +
+      '<button class="btn" onclick="retryAllFailed()">↻ 一键重试失败</button></div>' +
+      '<div id="taskTable">' + taskTable(tasks, false) + '</div></div>';
+  setTimers([silentRefreshTasks]);
+}
+function drawTaskTable(){
+  const q = ($('tq').value || '').toLowerCase(), s = $('ts').value;
+  const filtered = state.tasks.filter(t =>
+    (!s || t.status === s) && (!q || (t.id + ' ' + (t.prompt || '')).toLowerCase().includes(q)));
+  $('taskTable').innerHTML = taskTable(filtered, false);
+}
+async function silentRefreshTasks(){
+  if (state.page !== 'tasks') return;
+  try {
+    state.tasks = await api('api/tasks?limit=500');
+    drawTaskTable();
+    refreshPills();
+  } catch(e){ /* ignore */ }
+}
+
+/* ==================== 账号池 ==================== */
+async function pageAccounts(){
+  const accounts = await api('api/accounts');
+  state.accounts = accounts;
+  view.innerHTML =
+    '<div class="panel"><h2>♧ 账号池 <small>每个账号同时只跑一个任务，按今日用量自动轮询</small></h2>' +
+      '<div class="row">' +
+        '<button class="btn primary" onclick="addAccount()">+ 新增账号</button>' +
+        '<button class="btn" onclick="importAccounts()">⇧ 批量导入</button>' +
+        '<button class="btn" id="checkAll">✓ 一键验活</button>' +
+        '<button class="btn" onclick="render()">↻ 刷新</button>' +
+        '<span class="chip">共 ' + accounts.length + ' 个</span>' +
+      '</div></div>' +
+    '<div class="panel">' + (accounts.length ? '<div class="scroll-x"><table><thead><tr>' +
+      '<th>ID</th><th>名称</th><th>状态</th><th>今日用量</th><th>验活</th><th>最近检查</th><th>操作</th>' +
+      '</tr></thead><tbody>' + accounts.map(a =>
+        '<tr><td class="mono">#' + a.id + '</td><td>' + esc(a.name) + '</td>' +
+        '<td><span class="badge ' + (a.status === 'ready' ? 'ok' : a.status === 'invalid' ? 'bad' : 'dim') + '">' + esc(a.status) + '</span></td>' +
+        '<td style="min-width:140px"><div class="row"><span class="mono">' + (a.today_usage || 0) + '/' + (a.quota || 0) + '</span>' +
+          '<div class="bar" style="flex:1"><i style="width:' + Math.min(100, Math.round(100 * (a.today_usage||0) / (a.quota||1))) + '%"></i></div></div></td>' +
+        '<td><span class="badge ' + (a.check_state === 'ready' || a.check_state === 'local_ready' ? 'ok' : a.check_state === 'invalid' ? 'bad' : 'dim') + '">' +
+          esc(a.check_state || 'unchecked') + '</span><div class="dim" style="font-size:11px">' + esc((a.check_detail || '').slice(0, 40)) + '</div></td>' +
+        '<td class="dim mono">' + fmtTime(a.last_checked) + '</td>' +
+        '<td style="white-space:nowrap"><button class="btn sm" onclick="checkAccount(' + a.id + ')">验活</button> ' +
+        '<button class="btn sm danger" onclick="delAccount(' + a.id + ')">删除</button></td></tr>').join('') +
+      '</tbody></table></div>' : '<div class="empty">还没有账号。点击「批量导入」粘贴 Dola Cookie（每行一个）</div>') + '</div>';
+  $('checkAll').onclick = async () => {
+    const r = await api('api/accounts/check-all', {method:'POST'});
+    toast('已检查 ' + r.count + ' 个账号'); render();
+  };
+}
+function addAccount(){
+  formModal('新增 Dola 账号', [
+    {key:'name', label:'名称', placeholder:'例：账号 A'},
+    {key:'cookie', label:'Cookie', type:'textarea', placeholder:'sessionid=...; sid_guard=...'},
+    {key:'verify', label:'立即联网验活', type:'select', options:['否','是'], value:'否'},
+  ], async (d) => {
+    await api('api/accounts', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({name: d.name, cookie: d.cookie, verify: d.verify === '是'})});
+    toast('账号已添加'); render();
+  });
+}
+function importAccounts(){
+  openModal('批量导入账号', '<p class="muted">粘贴 Cookie（每行一个），或选择 .txt / .csv / .json 文件</p>' +
+    '<textarea id="impCookies" style="min-height:170px" placeholder="sessionid=...\nsessionid=..."></textarea>' +
+    '<div style="margin-top:12px"><input type="file" id="impFile" accept=".txt,.csv,.json"></div>' +
+    '<div class="foot"><button class="btn" onclick="closeModal()">取消</button>' +
+    '<button class="btn primary" id="impBtn">⇧ 开始导入</button></div>');
+  $('impBtn').onclick = async () => {
+    const fd = new FormData();
+    fd.append('cookies', $('impCookies').value);
+    const f = $('impFile').files[0];
+    if (f) fd.append('file', f);
+    try {
+      const r = await api('api/import', {method:'POST', body: fd});
+      closeModal(); toast('已导入 ' + r.count + ' 个账号'); render();
+    } catch(e){ toast(e.message, true); }
+  };
+}
+function checkAccount(id){
+  api('api/accounts/' + id + '/check', {method:'POST'}).then(r => {
+    toast('#' + id + ' → ' + r.state + '：' + r.detail); render();
+  }).catch(e => toast(e.message, true));
+}
+function delAccount(id){
+  confirmAction('删除账号 #' + id + '？', async () => {
+    await api('api/accounts/' + id, {method:'DELETE'}); toast('已删除'); render();
+  });
+}
+
+/* ==================== 代理 ==================== */
+async function pageProxies(){
+  const [status, list] = await Promise.all([api('api/proxy-status?probe=1'), api('api/proxies')]);
+  view.innerHTML =
+    '<div class="grid g2"><div class="panel"><h2>◈ 出口 IP 状态</h2>' +
+      '<div class="card"><div class="k muted">连通性</div>' +
+      '<div style="font-size:20px;font-weight:700;color:' + (status.connected ? 'var(--ok)' : 'var(--bad)') + '">' +
+        (status.connected ? '已连接' : '未连接') + '</div>' +
+      '<div class="row between" style="margin-top:10px"><span class="muted">出口 IP</span><span class="mono">' + esc(status.ip || '–') + '</span></div>' +
+      '<div class="row between"><span class="muted">区域</span><span>' + esc(status.region || '–') + '</span></div>' +
+      '<div class="row between"><span class="muted">粘性时长</span><span>' + (status.sticky_min || 0) + ' 分钟</span></div>' +
+      '<div class="row between"><span class="muted">供应商</span><span>' + esc(status.provider || '–') + '</span></div>' +
+      (status.error ? '<div class="badge bad" style="margin-top:10px">' + esc(status.error) + '</div>' : '') +
+      '<div class="row" style="margin-top:12px"><button class="btn" onclick="refreshProxyStatus().then(render)">↻ 重新检测</button>' +
+      '<button class="btn primary" onclick="refreshProxyIp().then(render)">⟳ 刷新代理 IP</button></div></div>' +
+      '<p class="dim" style="font-size:12px">真实生成时由 <span class="mono">gen/dola_gen_clean.py</span> 按任务自动轮换住宅 IP（同任务同 IP 50 分钟）。' +
+      '如需统一出入口，请配置环境变量 <span class="mono">DOLA_PROXY</span> 或 <span class="mono">HTTPS_PROXY</span>。</p>' +
+    '</div>' +
+    '<div class="panel"><h2>代理节点池</h2>' +
+      '<div class="row" style="margin-bottom:12px"><button class="btn primary" onclick="addProxy()">+ 新增代理</button>' +
+      '<button class="btn" onclick="render()">↻ 刷新</button></div>' +
+      (list.length ? '<div class="scroll-x"><table><thead><tr><th>ID</th><th>主机</th><th>端口</th><th>区域</th><th>用户名</th><th>操作</th></tr></thead><tbody>' +
+        list.map(p => '<tr><td class="mono">#' + p.id + '</td><td class="mono">' + esc(p.host) + '</td><td>' + esc(p.port) + '</td>' +
+          '<td>' + esc(p.region || '–') + '</td><td>' + esc(p.username || '–') + '</td>' +
+          '<td><button class="btn sm danger" onclick="delProxy(' + p.id + ')">删除</button></td></tr>').join('') +
+      '</tbody></table></div>' : '<div class="empty">还没有配置代理节点</div>') +
+    '</div></div>';
+}
+function addProxy(){
+  formModal('新增代理', [
+    {key:'host', label:'主机', placeholder:'hk.rrp.bestgo.work'},
+    {key:'port', label:'端口', placeholder:'6666'},
+    {key:'username', label:'用户名'},
+    {key:'password', label:'密码', type:'password'},
+    {key:'region', label:'区域标签', placeholder:'香港 / 台湾 / 新加坡'},
+  ], async (d) => {
+    await api('api/proxies', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(d)});
+    toast('代理已添加'); render();
+  });
+}
+function delProxy(id){
+  confirmAction('删除代理 #' + id + '？', async () => { await api('api/proxies/' + id, {method:'DELETE'}); toast('已删除'); render(); });
+}
+
+/* ==================== 资产库 ==================== */
+async function pageAssets(){
+  const assets = await api('api/assets');
+  view.innerHTML =
+    '<div class="panel"><h2>▤ 资产库 <small>角色 / 场景 / 道具参考图，可在分镜中引用</small></h2>' +
+      '<div class="row"><button class="btn primary" onclick="document.getElementById(\'assetFile\').click()">⇧ 上传资产</button>' +
+      '<input type="file" id="assetFile" accept="image/*" style="display:none">' +
+      '<button class="btn" onclick="render()">↻ 刷新</button><span class="chip">共 ' + assets.length + ' 个</span></div></div>' +
+    (assets.length ? '<div class="grid g4">' + assets.map(a =>
+      '<div class="card"><img class="thumb" style="width:100%;height:150px" src="' + esc(a.path && a.path.startsWith('/') ? a.path : ('/uploads/' + esc(a.filename || ''))) + '" onerror="this.style.opacity=.15">' +
+      '<div style="margin-top:10px"><b>' + esc(a.name) + '</b> <span class="chip">' + esc(a.type) + '</span></div>' +
+      '<div class="dim" style="font-size:12px;min-height:34px;margin-top:4px">' + esc((a.features || '').slice(0, 90)) + '</div>' +
+      '<div class="row" style="margin-top:8px"><button class="btn sm" onclick="editAsset(' + a.id + ')">编辑</button>' +
+      '<button class="btn sm" onclick="copyAsset(' + a.id + ')">⧉ 路径</button>' +
+      '<button class="btn sm danger" onclick="delAsset(' + a.id + ')">删除</button></div></div>').join('') + '</div>'
+      : '<div class="panel"><div class="empty">还没有资产，上传一张参考图试试</div></div>');
+  $('assetFile').onchange = async (e) => {
+    const f = e.target.files[0]; if (!f) return;
+    const fd = new FormData(); fd.append('file', f);
+    try {
+      const up = await api('api/upload-image', {method:'POST', body: fd});
+      await api('api/assets', {method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({name: f.name.replace(/\.[^.]+$/, ''), type:'character', path: up.path, filename: up.url.split('/').pop()})});
+      toast('资产已上传'); render();
+    } catch(err){ toast(err.message, true); }
+  };
+  state.assets = assets;
+}
+function copyAsset(id){
+  const a = state.assets.find(x => x.id === id);
+  if (!a) return;
+  navigator.clipboard.writeText(a.path || ('/uploads/' + a.filename)).then(() => toast('路径已复制'));
+}
+function editAsset(id){
+  const a = state.assets.find(x => x.id === id) || {};
+  formModal('编辑资产', [
+    {key:'name', label:'名称', value: a.name},
+    {key:'type', label:'类型', type:'select', options:['character','scene','prop','style','other'], value: a.type},
+    {key:'features', label:'特征描述（会写进提示词）', type:'textarea', value: a.features, placeholder:'黑色长发，宽松衣裙，外放灵动…'},
+  ], async (d) => {
+    await api('api/assets/' + id, {method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(d)});
+    toast('已保存'); render();
+  });
+}
+function delAsset(id){
+  confirmAction('删除该资产？', async () => { await api('api/assets/' + id, {method:'DELETE'}); toast('已删除'); render(); });
+}
+
+/* ==================== API 密钥 ==================== */
+async function pageKeys(){
+  const keys = await api('api/keys');
+  view.innerHTML =
+    '<div class="panel"><h2>⚿ API 密钥 <small>用于外部系统调用 /api/tasks 提交任务</small></h2>' +
+      '<div class="row"><button class="btn primary" onclick="createKey()">+ 创建密钥</button>' +
+      '<button class="btn" onclick="render()">↻ 刷新</button></div></div>' +
+    '<div class="panel">' + (keys.length ? '<table><thead><tr><th>ID</th><th>名称</th><th>密钥</th><th>创建时间</th><th>操作</th></tr></thead><tbody>' +
+      keys.map(k => '<tr><td class="mono">#' + k.id + '</td><td>' + esc(k.label) + '</td><td class="mono">' + esc(k.key) + '</td>' +
+        '<td class="dim mono">' + fmtTime(k.created_at) + '</td>' +
+        '<td><button class="btn sm danger" onclick="delKey(' + k.id + ')">删除</button></td></tr>').join('') +
+      '</tbody></table>' : '<div class="empty">还没有密钥</div>') + '</div>' +
+    '<div class="panel"><h2>调用示例</h2>' +
+      '<pre class="mono" style="white-space:pre-wrap;background:rgba(8,12,13,.8);padding:12px;border-radius:9px;border:1px solid var(--line)">' +
+'curl -X POST http://127.0.0.1:{{PORT}}/api/tasks \\\n  -H "Content-Type: application/json" \\\n  -H "X-Admin-Token: $DOLA_ADMIN_TOKEN" \\\n  -d \'{"prompt":"9:16 竖屏，雨夜霓虹街道，慢动作水花","duration":15,"ratio":"9:16"}\'</pre>' +
+      '<p class="dim" style="font-size:12px">批量为 {"tasks":[{...},{...}]}；查询任务 GET /api/tasks/{id}；一键重试 POST /api/tasks/retry-failed。</p></div>';
+}
+async function createKey(){
+  formModal('创建 API 密钥', [{key:'label', label:'名称', placeholder:'例：剪辑系统'}], async (d) => {
+    const r = await api('api/keys', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(d)});
+    openModal('密钥已创建（仅显示一次）',
+      '<div class="mono" style="background:rgba(8,12,13,.8);padding:12px;border-radius:9px;border:1px solid var(--line);word-break:break-all">' + esc(r.key) + '</div>' +
+      '<div class="foot"><button class="btn primary" onclick="closeModal();render()">我已保存</button></div>');
+  });
+}
+function delKey(id){
+  confirmAction('删除该密钥？', async () => { await api('api/keys/' + id, {method:'DELETE'}); toast('已删除'); render(); });
+}
+
+/* ==================== 设置 ==================== */
+async function pageSettings(){
+  const s = await api('api/settings');
+  view.innerHTML =
+    '<div class="grid g2">' +
+      '<div class="panel"><h2>⚙ 调度与限额</h2>' +
+        '<label class="f">最大并发数（1-100）</label>' +
+        '<input id="setConc" type="number" min="1" max="100" value="' + esc(s.max_concurrency) + '">' +
+        '<label class="f" style="margin-top:12px">每账号每日上限</label>' +
+        '<input id="setDaily" type="number" min="1" max="1000" value="' + esc(s.max_daily_per_account) + '">' +
+        '<label class="f" style="margin-top:12px">成片最小体积（字节，低于此值仅告警）</label>' +
+        '<input id="setMinBytes" type="number" min="0" value="' + esc(s.min_bytes_default) + '">' +
+        '<div class="row" style="margin-top:14px"><button class="btn primary" id="saveSettings">保存设置</button>' +
+        '<span class="dim" id="setHint"></span></div></div>' +
+      '<div class="panel"><h2>✦ AI 推理（Agnes）</h2>' +
+        '<label class="f">API Key ' + (s.ai_configured === '1' ? '<span class="badge ok">已配置</span>' : '<span class="badge">未配置</span>') + '</label>' +
+        '<input id="setAiKey" type="password" placeholder="sk-...（留空则不修改）">' +
+        '<label class="f" style="margin-top:12px">接口地址</label>' +
+        '<input id="setAiBase" value="' + esc(s.ai_base_url) + '">' +
+        '<label class="f" style="margin-top:12px">模型</label>' +
+        '<input id="setAiModel" value="' + esc(s.ai_model) + '">' +
+        '<p class="dim" style="font-size:12px">未配置时，AI 推理会自动降级为本地规则模板（仍可拆镜并生成提示词）。</p>' +
+        '<button class="btn primary" id="saveAi">保存 AI 配置</button></div>' +
+    '</div>' +
+    '<div class="panel"><h2>ℹ 运行信息</h2><div class="grid g3">' +
+      [['版本', s.version], ['运行模式', s.demo_mode === '1' ? '演示模式' : '生产模式'],
+       ['数据目录', s.data_dir], ['数据库', s.db_path], ['成片目录', s.output_dir],
+       ['服务地址', location.origin]].map(x =>
+        '<div class="card"><div class="k muted">' + x[0] + '</div><div class="mono" style="word-break:break-all">' + esc(x[1]) + '</div></div>').join('') +
+    '</div></div>' +
+    '<div class="panel"><h2>⚠ 维护</h2><div class="row">' +
+      '<button class="btn" onclick="clearLog(\'errors\')">清空错误日志</button>' +
+      '<button class="btn" onclick="clearLog(\'audits\')">清空审计日志</button>' +
+      '<button class="btn" onclick="window.open(\'/docs\',\'_blank\')">打开 API 文档（/docs）</button>' +
+      '<button class="btn" onclick="window.open(\'/api/health\',\'_blank\')">健康检查</button>' +
+    '</div></div>';
+  const save = async (payload, hintEl) => {
+    try {
+      const r = await api('api/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+      toast('设置已保存（并发 ' + r.max_concurrency + '）');
+      if (hintEl) hintEl.textContent = '已保存';
+      refreshPills();
+    } catch(e){ toast(e.message, true); }
+  };
+  $('saveSettings').onclick = () => save({max_concurrency: Number($('setConc').value),
+    max_daily_per_account: Number($('setDaily').value), min_bytes_default: Number($('setMinBytes').value)}, $('setHint'));
+  $('saveAi').onclick = () => save({ai_api_key: $('setAiKey').value, ai_base_url: $('setAiBase').value, ai_model: $('setAiModel').value});
+}
+function clearLog(kind){
+  confirmAction('清空' + (kind === 'errors' ? '错误' : '审计') + '日志？', async () => {
+    await api('api/' + kind, {method:'DELETE'}); toast('已清空'); render();
+  });
+}
+
+/* ==================== 日志 ==================== */
+async function pageLogs(){
+  const [errors, audits] = await Promise.all([api('api/errors?limit=200'), api('api/audits?limit=200')]);
+  view.innerHTML =
+    '<div class="panel"><h2>◉ 错误日志 <small>最近 200 条</small></h2>' +
+      '<div class="row" style="margin-bottom:10px"><button class="btn sm" onclick="render()">↻ 刷新</button>' +
+      '<button class="btn sm danger" onclick="clearLog(\'errors\')">清空</button></div>' +
+      (errors.length ? '<div class="scroll-x"><table><thead><tr><th>时间</th><th>级别</th><th>内容</th></tr></thead><tbody>' +
+        errors.map(e => '<tr><td class="dim mono" style="white-space:nowrap">' + fmtTime(e.created_at) + '</td>' +
+          '<td><span class="badge ' + (e.level === 'generate' || e.level === 'worker' ? 'bad' : '') + '">' + esc(e.level) + '</span></td>' +
+          '<td class="mono">' + esc(e.message) + '</td></tr>').join('') + '</tbody></table></div>'
+        : '<div class="empty">暂无错误日志</div>') + '</div>' +
+    '<div class="panel"><h2>◴ 审计日志 <small>最近 200 条</small></h2>' +
+      '<div class="row" style="margin-bottom:10px"><button class="btn sm" onclick="render()">↻ 刷新</button>' +
+      '<button class="btn sm danger" onclick="clearLog(\'audits\')">清空</button></div>' +
+      (audits.length ? '<div class="scroll-x"><table><thead><tr><th>时间</th><th>动作</th><th>详情</th></tr></thead><tbody>' +
+        audits.map(a => '<tr><td class="dim mono" style="white-space:nowrap">' + fmtTime(a.created_at) + '</td>' +
+          '<td><span class="chip">' + esc(a.action) + '</span></td><td class="mono">' + esc(a.detail) + '</td></tr>').join('') +
+        '</tbody></table></div>' : '<div class="empty">暂无审计日志</div>') + '</div>';
+}
+
+/* ==================== 启动 ==================== */
+(async function boot(){
+  const token = localStorage.getItem('dola_token');
+  if (token) {
+    // 兼容：URL 带 ?token=xxx 时自动记忆，便于外部调用
+    const fromUrl = new URLSearchParams(location.search).get('token');
+    if (fromUrl) localStorage.setItem('dola_token', fromUrl);
+  }
+  nav(); await render();
+  setInterval(refreshPills, 8000);
+})();
+window.addEventListener('error', (e) => console.error('UI error:', e.message));
+</script>
+</body>
+</html>

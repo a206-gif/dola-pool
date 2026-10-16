@@ -168,7 +168,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
     <button class="secondary" onclick="location.href='/'">← 返回</button>
     <div class="spacer"></div>
     <button class="secondary" onclick="saveWorkflow()">💾 保存</button>
-    <button class="secondary" onclick="loadWorkflow()">📂 加载</button>
+    <button class="secondary" onclick="loadWorkflow()">📂 本地</button>
+    <button class="secondary" onclick="loadServerWorkflow()">☁ 服务端</button>
     <button class="danger" onclick="clearCanvas()">🗑 清空</button>
     <button onclick="executeWorkflow()" style="background:#078d78">▶ 执行工作流</button>
     <button class="secondary" onclick="zoomReset()">100%</button>
@@ -235,6 +236,34 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 <div class="help-hint">空格+拖拽=平移画布 | 滚轮=缩放 | Delete=删除选中 | 从端口拖拽=连线</div>
 
 <script>
+// ==================== 鉴权（DOLA_ADMIN_TOKEN）====================
+const _rawFetch = window.fetch;
+window.fetch = function (url, opts) {
+    opts = opts || {};
+    const token = localStorage.getItem('dola_token') || '';
+    opts.headers = Object.assign({}, opts.headers || {}, token ? {'X-Admin-Token': token} : {});
+    return _rawFetch(url, opts);
+};
+function applyCanvasWorkflow(wf) {
+    clearCanvas(false);
+    nodes = [];
+    connections = [];
+    (wf.nodes || []).forEach(n => {
+        nodes.push(n);
+        renderNode(n);
+        if (String(n.id).includes('node_')) {
+            const num = parseInt(String(n.id).split('_')[1]);
+            if (num >= nodeIdCounter) nodeIdCounter = num + 1;
+        }
+    });
+    connections = wf.connections || [];
+    zoom = wf.zoom || 1;
+    panX = wf.panX || 0;
+    panY = wf.panY || 0;
+    updateTransform();
+    updateConnections();
+}
+
 // ==================== 全局状态 ====================
 let nodes = [];
 let connections = [];
@@ -853,11 +882,40 @@ async function executeNode(node, nodeOutputs) {
 }
 
 // ==================== 保存/加载 ====================
-function saveWorkflow() {
+async function saveWorkflow() {
     const data = { nodes: nodes, connections: connections, zoom: zoom, panX: panX, panY: panY };
     localStorage.setItem('dola_node_workflow', JSON.stringify(data));
-    toast('工作流已保存到本地');
+    const name = prompt('保存到服务端的工作流名称：', '工作流 ' + new Date().toLocaleString('zh-CN', {hour12: false}));
+    if (name === null || name === '') { toast('已保存到浏览器本地'); return; }
+    try {
+        const r = await fetch('/api/workflows', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({name: name, data: data})
+        });
+        const d = await r.json();
+        if (d.error) throw new Error(d.error);
+        serverWorkflowId = d.id;
+        toast('已保存：' + d.name + '（# ' + d.id + '）');
+    } catch (e) { toast('服务端保存失败：' + e.message); }
 }
+
+// 打开服务端工作流列表
+async function loadServerWorkflow() {
+    try {
+        const r = await fetch('/api/workflows');
+        const list = await r.json();
+        if (!list.length) { toast('服务端还没有工作流'); return; }
+        const items = list.slice(0, 12).map(w => '#' + w.id + '  ' + w.name + '（' + w.nodes + ' 节点）').join('\n');
+        const pick = prompt('输入要加载的工作流编号：\n' + items, String(list[0].id));
+        if (!pick) return;
+        const one = await (await fetch('/api/workflows/' + pick.trim().replace('#', ''))).json();
+        if (one.error) throw new Error(one.error);
+        serverWorkflowId = one.id;
+        applyCanvasWorkflow(one.data || {});
+        toast('已加载：' + one.name);
+    } catch (e) { toast('加载失败：' + e.message); }
+}
+let serverWorkflowId = null;
 
 function loadWorkflow() {
     const data = localStorage.getItem('dola_node_workflow');

@@ -1,3 +1,10 @@
+# Dola Pool 依赖
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 python-multipart==0.0.20
+requests==2.32.3
+pycryptodome==3.21.0
+
+# 可选：仅制作静态资源（背景图 / 演示视频）时需要
+# pillow
+# imageio-ffmpeg

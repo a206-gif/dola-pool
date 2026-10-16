@@ -1,57 +1,56 @@
-#!/bin/bash
-# Dola Pool 自动清理脚本
-# 每5小时执行一次
+#!/usr/bin/env bash
+# Dola Pool 自动清理脚本（建议每 5 小时由 cron / systemd timer 执行一次）
+#
+# 只清理本项目自己的数据，不会动系统日志或 /tmp 里的其他文件：
+#   1. 删除 N 小时前的成片
+#   2. 删除 N 小时前的上传参考图
+#   3. 压缩 SQLite 数据库并清理 30 天前的错误 / 审计日志
+#   4. 打印磁盘占用
+#
+# 用法：
+#   DOLA_DATA_DIR=/opt/dola-pool/data VIDEO_KEEP_HOURS=24 ./cleanup.sh
+set -euo pipefail
 
-LOG_FILE="/opt/dola-pool/cleanup.log"
-OUTPUT_DIR="/opt/dola-pool/output"
-TMP_DIR="/tmp"
+DATA_DIR="${DOLA_DATA_DIR:-$(cd "$(dirname "$0")" && pwd)/data}"
+OUTPUT_DIR="${DOLA_OUTPUT_DIR:-$DATA_DIR/output}"
+UPLOAD_DIR="${DOLA_UPLOAD_DIR:-$DATA_DIR/uploads}"
+DB="${DOLA_DB:-$DATA_DIR/dola.db}"
+KEEP_HOURS="${VIDEO_KEEP_HOURS:-24}"
+LOG_FILE="${DOLA_CLEANUP_LOG:-$DATA_DIR/cleanup.log}"
 
-echo "========================================" >> $LOG_FILE
-echo "清理开始: $(date '+%Y-%m-%d %H:%M:%S')" >> $LOG_FILE
+mkdir -p "$DATA_DIR"
+{
+  echo "========================================"
+  echo "清理开始: $(date '+%Y-%m-%d %H:%M:%S')  (保留 ${KEEP_HOURS} 小时内文件)"
 
-# 1. 删除24小时前的视频文件
-echo "--- 1. 清理24小时前的视频文件 ---" >> $LOG_FILE
-BEFORE=$(ls $OUTPUT_DIR/*.mp4 2>/dev/null | wc -l)
-find $OUTPUT_DIR -name "*.mp4" -type f -mtime +1 -delete 2>/dev/null
-AFTER=$(ls $OUTPUT_DIR/*.mp4 2>/dev/null | wc -l)
-DELETED=$((BEFORE - AFTER))
-echo "删除视频文件: $DELETED 个 (清理前: $BEFORE, 清理后: $AFTER)" >> $LOG_FILE
+  if [ -d "$OUTPUT_DIR" ]; then
+    before=$(find "$OUTPUT_DIR" -type f -name '*.mp4' | wc -l)
+    find "$OUTPUT_DIR" -type f -name '*.mp4' -mmin "+$((KEEP_HOURS * 60))" -delete
+    after=$(find "$OUTPUT_DIR" -type f -name '*.mp4' | wc -l)
+    echo "成片: 删除 $((before - after)) 个（剩余 $after 个）"
+  fi
 
-# 2. 清理/tmp临时文件
-echo "--- 2. 清理/tmp临时文件 ---" >> $LOG_FILE
-TMP_BEFORE=$(du -sh $TMP_DIR 2>/dev/null | cut -f1)
-find $TMP_DIR -type f -mtime +1 -delete 2>/dev/null
-find $TMP_DIR -type d -empty -delete 2>/dev/null
-TMP_AFTER=$(du -sh $TMP_DIR 2>/dev/null | cut -f1)
-echo "/tmp目录: $TMP_BEFORE -> $TMP_AFTER" >> $LOG_FILE
+  if [ -d "$UPLOAD_DIR" ]; then
+    before=$(find "$UPLOAD_DIR" -type f | wc -l)
+    find "$UPLOAD_DIR" -type f -mmin "+$((KEEP_HOURS * 60))" -delete
+    after=$(find "$UPLOAD_DIR" -type f | wc -l)
+    echo "上传参考图: 删除 $((before - after)) 个（剩余 $after 个）"
+  fi
 
-# 3. 清理旧日志（系统日志保留7天）
-echo "--- 3. 清理旧日志 ---" >> $LOG_FILE
-LOG_BEFORE=$(du -sh /var/log 2>/dev/null | cut -f1)
-find /var/log -type f -name "*.log" -mtime +7 -delete 2>/dev/null
-find /var/log -type f -name "*.gz" -mtime +7 -delete 2>/dev/null
-find /var/log -type f -name "*.[0-9]" -mtime +7 -delete 2>/dev/null
-# 清理journal日志
-journalctl --vacuum-time=7d 2>/dev/null
-LOG_AFTER=$(du -sh /var/log 2>/dev/null | cut -f1)
-echo "/var/log目录: $LOG_BEFORE -> $LOG_AFTER" >> $LOG_FILE
+  if [ -f "$DB" ] && command -v sqlite3 >/dev/null 2>&1; then
+    sqlite3 "$DB" "delete from errors where created_at < datetime('now','-30 day');" 2>/dev/null || true
+    sqlite3 "$DB" "delete from audits where created_at < datetime('now','-30 day');" 2>/dev/null || true
+    sqlite3 "$DB" "vacuum;" 2>/dev/null || true
+    echo "数据库: 已清理 30 天前日志并压缩"
+  fi
 
-# 4. 清理apt缓存
-echo "--- 4. 清理apt缓存 ---" >> $LOG_FILE
-apt-get clean 2>/dev/null
-echo "apt缓存已清理" >> $LOG_FILE
+  echo "--- 磁盘占用 ---"
+  df -h "$DATA_DIR" | tail -1
+  du -sh "$DATA_DIR" 2>/dev/null || true
+  echo "清理完成: $(date '+%Y-%m-%d %H:%M:%S')"
+  echo ""
+} >> "$LOG_FILE"
 
-# 5. 显示当前磁盘使用情况
-echo "--- 5. 当前磁盘使用情况 ---" >> $LOG_FILE
-df -h / >> $LOG_FILE
-
-echo "清理完成: $(date '+%Y-%m-%d %H:%M:%S')" >> $LOG_FILE
-echo "========================================" >> $LOG_FILE
-echo "" >> $LOG_FILE
-
-# 只保留最近100行清理日志
-tail -100 $LOG_FILE > $LOG_FILE.tmp
-mv $LOG_FILE.tmp $LOG_FILE
-
-echo "清理完成！"
-
+# 日志只保留最近 200 行
+tail -200 "$LOG_FILE" > "$LOG_FILE.tmp" && mv "$LOG_FILE.tmp" "$LOG_FILE"
+echo "清理完成，日志：$LOG_FILE"
