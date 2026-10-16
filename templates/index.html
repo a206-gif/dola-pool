@@ -775,7 +775,8 @@ async function pageAccounts(){
         '<td><span class="badge ' + (a.check_state === 'ready' || a.check_state === 'local_ready' ? 'ok' : a.check_state === 'invalid' ? 'bad' : 'dim') + '">' +
           esc(a.check_state || 'unchecked') + '</span><div class="dim" style="font-size:11px">' + esc((a.check_detail || '').slice(0, 40)) + '</div></td>' +
         '<td class="dim mono">' + fmtTime(a.last_checked) + '</td>' +
-        '<td style="white-space:nowrap"><button class="btn sm" onclick="checkAccount(' + a.id + ')">验活</button> ' +
+        '<td style="white-space:nowrap"><button class="btn sm" onclick="checkAccount(' + a.id + ')" title="联网校验这个账号的 Cookie">验活</button> ' +
+        '<button class="btn sm" onclick="openAccountWeb(' + a.id + ')" title="在新窗口里打开这个账号的 Dola 页面（登录态已带好）">🌐 网页</button> ' +
         '<button class="btn sm danger" onclick="delAccount(' + a.id + ')">删除</button></td></tr>').join('') +
       '</tbody></table></div>' : '<div class="empty">还没有账号。点击「批量导入」粘贴 Dola Cookie（每行一个）</div>') + '</div>';
   $('checkAll').onclick = async () => {
@@ -822,6 +823,15 @@ function checkAccount(id){
   api('api/accounts/' + id + '/check', {method:'POST'}).then(r => {
     toast('#' + id + ' → ' + r.state + '：' + r.detail); render();
   }).catch(e => toast(e.message, true));
+}
+function openAccountWeb(id){
+  // 非桌面版要自己开标签页：先占位再填地址，否则异步回调里的 window.open 会被拦截
+  const pre = IS_DESKTOP ? null : window.open('', '_blank');
+  api('api/accounts/' + id + '/web', {method:'POST'}).then(r => {
+    if (r.mode === 'desktop') { if (pre) pre.close(); toast('已在新窗口打开 #' + id + ' 的 Dola 页面'); }
+    else if (pre) { pre.location = r.url; }
+    else { window.open(r.url, '_blank'); }
+  }).catch(e => { if (pre) pre.close(); toast(e.message, true); });
 }
 function delAccount(id){
   confirmAction('删除账号 #' + id + '？', async () => {

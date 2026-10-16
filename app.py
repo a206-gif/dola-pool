@@ -41,7 +41,13 @@ import threading
 import time
 import urllib.error
 import urllib.parse
+import urllib.parse
 import urllib.request
+
+try:  # 反向代理用；requirements.txt 已包含 requests
+    import requests as _requests
+except Exception:  # noqa: BLE001 - 缺失时「打开 Dola 网页」会给出可读提示
+    _requests = None
 
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
@@ -92,6 +98,15 @@ DEMO_MODE = _env_flag("DOLA_DEMO", False)          # 演示模式：不访问外
 DESKTOP_MODE = _env_flag("DOLA_DESKTOP", False)    # 桌面版（desktop.py 启动时置 1）
 DESKTOP_CONFIG = os.getenv("DOLA_DESKTOP_CONFIG", "").strip()
 DEMO_SECONDS = float(os.getenv("DOLA_DEMO_SECONDS", "6"))  # 演示渲染耗时
+
+# 「打开账号 Dola 网页」用的本地反向代理：窗口里访问 /dola-web/{账号id}/…，
+# 由后端注入该账号 Cookie 后再转发到 Dola。之所以不用 webview 直接开 dola.com，
+# 是因为登录 Cookie（sessionid / sid_guard）多半是 HttpOnly，网页 JS 写不进去，
+# 桌面 webview 也没有写 Cookie 的接口；走代理则 HttpOnly 一样生效。
+WEB_PROXY = _env_flag("DOLA_WEB_PROXY", True)
+DOLA_WEB_BASE = (os.getenv("DOLA_WEB_BASE", "").strip().rstrip("/")
+                 or DOLA_COOKIE_DOMAIN.strip().rstrip("/")
+                 or "https://www.dola.com")
 
 logging.basicConfig(
     level=os.getenv("DOLA_LOG_LEVEL", "INFO").upper(),
@@ -1778,6 +1793,360 @@ async def api_desktop_reveal(request: Request):
         return {"ok": True, "path": target}
     except Exception as exc:  # noqa: BLE001
         return JSONResponse({"error": f"打开失败：{exc}"}, 500)
+
+
+# --------------------------------------------------------------------------
+# 「打开 Dola 网页」：本地反向代理
+# --------------------------------------------------------------------------
+# 账号池里点【🌐 网页】会在新窗口打开 /dola-web/{账号id}/…
+# 后端拿该账号的 Cookie 去请求 Dola，把响应回给页面。
+# 这样即便登录 Cookie 是 HttpOnly（JS 写不进去）也能正常看到登录后的页面。
+WEB_PROXY_PREFIX = "/dola-web"
+_PROXY_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
+_PROXY_PREFIX_TAIL_RE = re.escape(WEB_PROXY_PREFIX.lstrip("/"))  # 斜杠会被正则吃掉，断言里不再带
+
+# dola.com 的绝对地址或协议相对地址（含任意子域）；负向断言避免误伤 dola.com.cn
+_RE_DOLA_URL = re.compile(r"(?:https?:)?//(?:[\w-]+\.)*dola\.com(?![\w.-])", re.I)
+# 以 / 开头的站内绝对路径（HTML 属性与 CSS url()）。
+# 正则会吃掉那个斜杠，所以两个断言都从斜杠「之后」开始看：
+#   (?!/)         排除协议相对的 //host
+#   (?!dola-web/) 排除已经加过前缀的，保证反复处理也幂等
+_RE_ROOT_ATTR = re.compile(
+    r"(\s(?:href|src|action|poster|formaction|data-src|data-original)\s*=\s*[\"'])/(?!/)(?!"
+    + _PROXY_PREFIX_TAIL_RE + r"/)", re.I)
+_RE_CSS_ROOT_URL = re.compile(r"(url\(\s*[\"']?)/(?!/)(?!" + _PROXY_PREFIX_TAIL_RE + r"/)", re.I)
+_RE_CSP_META = re.compile(
+    r"<meta[^>]+http-equiv\s*=\s*[\"']?content-security-policy[\"']?[^>]*>", re.I)
+_RE_BASE_TAG = re.compile(r"<base\b[^>]*>", re.I)
+_RE_INTEGRITY = re.compile(r"\s+integrity\s*=\s*(\"[^\"]*\"|'[^']*')", re.I)
+_RE_HEAD_OPEN = re.compile(r"<head\b[^>]*>", re.I)
+_RE_HTML_OPEN = re.compile(r"<html\b[^>]*>", re.I)
+
+# 转发给 Dola 时保留的请求头（Accept-Encoding 故意不保留：交给 requests 自己协商，
+# 否则上游可能返回 brotli/zstd 而我们解不开）
+_PROXY_KEEP_REQ = frozenset({
+    "user-agent", "accept", "accept-language", "content-type", "range",
+    "if-none-match", "if-modified-since", "cache-control", "pragma",
+    "x-requested-with", "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
+})
+# 回给浏览器时要丢掉的头：前四个会破坏本地代理，CSP/XFO/HSTS 会拦脚本或强制 HTTPS，
+# set-cookie 单独处理
+_PROXY_DROP_RESP = frozenset({
+    "content-encoding", "content-length", "transfer-encoding", "connection",
+    "keep-alive", "content-security-policy", "content-security-policy-report-only",
+    "x-frame-options", "strict-transport-security", "public-key-pins",
+    "report-to", "nel", "alt-svc", "upgrade", "trailer", "set-cookie",
+})
+
+
+def _html_escape(text) -> str:
+    return (str(text).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def _proxy_prefix(account_id: int) -> str:
+    return "%s/%d" % (WEB_PROXY_PREFIX, int(account_id))
+
+
+def _js_json(obj) -> str:
+    """把 Python 对象塞进 <script> 里的安全写法（转义 < > & 防提前闭合）。"""
+    return (json.dumps(obj, ensure_ascii=False)
+            .replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026"))
+
+
+def _rewrite_dola_urls(text: str, account_id: int) -> str:
+    """把 dola 的绝对地址换成代理地址，并把站内绝对路径也挂到代理下。"""
+    prefix = _proxy_prefix(account_id)
+    text = _RE_DOLA_URL.sub(prefix, text)
+    text = _RE_ROOT_ATTR.sub(lambda m: m.group(1) + prefix + "/", text)
+    text = _RE_CSS_ROOT_URL.sub(lambda m: m.group(1) + prefix + "/", text)
+    return text
+
+
+def _rewrite_location(location: str, account_id: int) -> str:
+    """重定向目标：绝对 dola 地址与站内绝对路径都要拉回代理。"""
+    m = _RE_DOLA_URL.match(location)
+    if m:
+        return _proxy_prefix(account_id) + location[m.end():]
+    if location.startswith("/") and not location.startswith("//"):
+        return _proxy_prefix(account_id) + location
+    return location
+
+
+def _merge_cookies(primary: str, secondary: str) -> str:
+    """账号 Cookie 优先；浏览器回传的只补缺，免得页面上的旧值盖掉账号的。"""
+    seen, out = set(), []
+    for chunk in (primary or "", secondary or ""):
+        for part in chunk.split(";"):
+            part = part.strip()
+            if not part or "=" not in part:
+                continue
+            key = part.split("=", 1)[0].strip().lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(part)
+    return "; ".join(out)
+
+
+def _patch_set_cookie(value: str, account_id: int) -> str:
+    """Dola 回写的 Cookie 落到本地代理上：去掉 Domain/Secure，Path 换成代理前缀。"""
+    parts = [p.strip() for p in (value or "").split(";")]
+    if not parts or "=" not in parts[0]:
+        return ""
+    out = [parts[0]]
+    for attr in parts[1:]:
+        low = attr.lower()
+        if low.startswith("domain=") or low.startswith("secure") or low.startswith("partitioned"):
+            continue  # 本地是 http，Secure 会让浏览器直接丢弃
+        if low.startswith("path="):
+            continue
+        if low.startswith("samesite=none"):
+            out.append("SameSite=Lax")
+            continue
+        out.append(attr)
+    out.append("Path=" + _proxy_prefix(account_id) + "/")
+    return "; ".join(out)
+
+
+def _proxy_snippet(account_id: int, account: dict) -> str:
+    """注入页面的样式 + 运行时脚本（把页面里动态发出的请求也拉回代理）。"""
+    prefix = _proxy_prefix(account_id)
+    cfg = _js_json({
+        "prefix": prefix,
+        "label": "账号 #%s %s" % (account_id, (account.get("name") or "").strip()),
+        "real": DOLA_WEB_BASE + "/",
+    })
+    style = (
+        "<style>#dlp-bar{position:fixed;left:0;right:0;bottom:0;height:28px;z-index:2147483647;"
+        "background:rgba(10,22,20,.94);color:#bfe6de;font:12px/28px -apple-system,BlinkMacSystemFont,"
+        "'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;padding:0 12px;display:flex;"
+        "align-items:center;gap:14px;box-sizing:border-box;border-top:1px solid #1e6f61;"
+        "white-space:nowrap;overflow:hidden;text-align:left}#dlp-bar a{color:#7fd4c4;"
+        "text-decoration:none;cursor:pointer}#dlp-bar a:hover{text-decoration:underline}"
+        "#dlp-bar .dlp-x{margin-left:auto;cursor:pointer;color:#7fa9a2}</style>"
+    )
+    script = """<script>(function(){
+var C = __CFG__;
+var RE = /^(?:https?:)?\\/\\/(?:[\\w-]+\\.)*dola\\.com(?![\\w.-])/i;
+function fix(u){
+  if (typeof u !== 'string' || !u) return u;
+  if (u.indexOf(C.prefix + '/') === 0 || u === C.prefix) return u;
+  var m = u.match(RE);
+  if (m) return C.prefix + u.slice(m[0].length);
+  if (u.charAt(0) === '/' && u.charAt(1) !== '/') return C.prefix + u;
+  return u;
+}
+try {
+  var _f = window.fetch;
+  if (_f) window.fetch = function(input, init){
+    try {
+      if (typeof input === 'string') { input = fix(input); }
+      else if (input && typeof input.url === 'string') {
+        var n = fix(input.url);
+        if (n !== input.url) { try { input = new Request(n, input); } catch(e) { input = n; } }
+      }
+    } catch(e){}
+    return _f.call(this, input, init);
+  };
+} catch(e){}
+try {
+  var _o = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function(m, u){ try { arguments[1] = fix(u); } catch(e){} return _o.apply(this, arguments); };
+} catch(e){}
+try {
+  var _w = window.open;
+  window.open = function(u){ try { arguments[0] = fix(u); } catch(e){} return _w.apply(this, arguments); };
+} catch(e){}
+try { if (navigator.serviceWorker) { navigator.serviceWorker.register = function(){ return Promise.reject(new Error('service worker disabled by local proxy')); }; } } catch(e){}
+function bar(){
+  if (document.getElementById('dlp-bar')) return;
+  var d = document.createElement('div');
+  d.id = 'dlp-bar';
+  var s1 = document.createElement('span'); s1.textContent = '🔗 本地代理';
+  var s2 = document.createElement('span'); s2.textContent = C.label;
+  var a1 = document.createElement('a'); a1.textContent = '在浏览器打开真实站点';
+  a1.href = C.real; a1.target = '_blank'; a1.rel = 'noopener';
+  var a2 = document.createElement('a'); a2.textContent = '↻ 重载';
+  a2.href = 'javascript:void 0'; a2.onclick = function(){ location.reload(); };
+  var x = document.createElement('span'); x.className = 'dlp-x'; x.textContent = '✕ 隐藏';
+  x.onclick = function(){ d.style.display = 'none'; };
+  d.appendChild(s1); d.appendChild(s2); d.appendChild(a1); d.appendChild(a2); d.appendChild(x);
+  (document.body || document.documentElement).appendChild(d);
+}
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bar); else bar();
+})();</script>"""
+    return style + script.replace("__CFG__", cfg)
+
+
+def _proxy_inject(text: str, account_id: int, account: dict) -> str:
+    """把提示条脚本插到 <head>（插在 head 里最不容易被页面自身的样式影响）。"""
+    snippet = _proxy_snippet(account_id, account)
+    m = _RE_HEAD_OPEN.search(text) or _RE_HTML_OPEN.search(text)
+    if m:
+        return text[:m.end()] + snippet + text[m.end():]
+    return snippet + text
+
+
+def _rewrite_dola_html(text: str, account_id: int, account: dict) -> str:
+    text = _RE_CSP_META.sub("", text)                                    # 站点 CSP 会拦注入脚本
+    text = _RE_INTEGRITY.sub("", text)                                   # 改了地址，SRI 校验必然不过
+    text = _RE_BASE_TAG.sub(lambda m: _rewrite_dola_urls(m.group(0), account_id), text)
+    text = _rewrite_dola_urls(text, account_id)
+    return _proxy_inject(text, account_id, account)
+
+
+def _proxy_notice(title: str, message: str, status: int = 200) -> HTMLResponse:
+    """代理自己产生的说明页（账号不存在、连不上 Dola 等）。"""
+    page = (
+        "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
+        "<title>" + _html_escape(title) + "</title><style>"
+        "body{margin:0;min-height:100vh;background:#0a0f11;color:#e6efed;display:flex;"
+        "align-items:center;justify-content:center;font:15px/1.7 -apple-system,BlinkMacSystemFont,"
+        "'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;padding:24px}"
+        ".c{max-width:560px;background:#141a1c;border:1px solid #33413f;border-radius:14px;padding:26px}"
+        "h1{margin:0 0 10px;font-size:18px;color:#0ca58c}p{margin:0 0 10px;color:#c9d8d6;white-space:pre-wrap}"
+        "small{color:#8ba1a1}</style></head><body><div class=\"c\"><h1>"
+        + _html_escape(title) + "</h1><p>" + _html_escape(message) + "</p>"
+        "<small>Dola Pool 本地代理 · " + _html_escape(DOLA_WEB_BASE) + "</small>"
+        "</div></body></html>"
+    )
+    return HTMLResponse(page, status_code=status)
+
+
+def _upstream_url(rest: str, query: str) -> str:
+    rest = (rest or "").lstrip("/")
+    url = DOLA_WEB_BASE + "/" + rest if rest else DOLA_WEB_BASE + "/"
+    if query:
+        url += "?" + query
+    return url
+
+
+@app.api_route("/dola-web/{account_id}", methods=_PROXY_METHODS)
+@app.api_route("/dola-web/{account_id}/{rest:path}", methods=_PROXY_METHODS)
+async def api_dola_web(account_id: int, request: Request, rest: str = ""):
+    """把某个账号的 Dola 页面代理到本地，供 webview / 浏览器查看。"""
+    if not WEB_PROXY:
+        return _proxy_notice("本地代理已关闭", "启动时设置了 DOLA_WEB_PROXY=0。", 403)
+    if _requests is None:
+        return _proxy_notice("缺少 requests 库", "请执行 pip install -r requirements.txt", 500)
+
+    # 入口 /dola-web/2 补一个尾斜杠，否则页面里的相对路径会解析到 /dola-web/ 下。
+    # 只在「没有后续路径」时补：/static/app.js、/api/me 这类真实文件路径补了就成 404。
+    if not rest and not request.url.path.endswith("/"):
+        target = request.url.path + "/"
+        if request.url.query:
+            target += "?" + request.url.query
+        return RedirectResponse(target, status_code=307)
+
+    # 只允许代理到配置的 Dola 站点，防止被当成任意中转
+    if "://" in rest or any(seg == ".." for seg in rest.split("/")):
+        return _proxy_notice("请求被拒绝", "路径不合法。", 400)
+
+    conn = db()
+    row = conn.execute("select * from accounts where id=?", (account_id,)).fetchone()
+    conn.close()
+    if row is None:
+        return _proxy_notice("账号不存在", "账号 #%s 已被删除，请刷新账号池。" % account_id, 404)
+    account = dict(row)
+    cookie = (account.get("cookie") or "").strip()
+    if not cookie:
+        return _proxy_notice("该账号没有 Cookie", "先在账号池里编辑这个账号，填入 Cookie。", 400)
+
+    url = _upstream_url(rest, request.url.query)
+    headers = {}
+    for key, value in request.headers.items():
+        if key.lower() in _PROXY_KEEP_REQ:
+            headers[key] = value
+    headers["Cookie"] = _merge_cookies(cookie, request.headers.get("cookie", ""))
+    headers["Origin"] = DOLA_WEB_BASE
+    ref = request.headers.get("referer", "")
+    if ref:
+        parsed = urllib.parse.urlparse(ref)
+        path = parsed.path
+        prefix = _proxy_prefix(account_id)
+        if path.startswith(prefix):
+            path = path[len(prefix):] or "/"
+        headers["Referer"] = DOLA_WEB_BASE + path + (("?" + parsed.query) if parsed.query else "")
+
+    body = None
+    if request.method not in ("GET", "HEAD", "OPTIONS"):
+        body = await request.body()
+
+    try:
+        up = _requests.request(request.method, url, headers=headers, data=body,
+                               allow_redirects=False, timeout=(10, 90))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("代理请求失败 %s %s：%s", request.method, url, exc)
+        return _proxy_notice(
+            "连不上 Dola",
+            "请求 %s 失败：%s\n\n请检查电脑网络；如果开了 VPN / 代理，确认它能访问 dola.com。" % (url, exc),
+            502,
+        )
+
+    content_type = (up.headers.get("content-type") or "").lower()
+    payload = up.content
+    if "text/html" in content_type or "application/xhtml" in content_type:
+        charset = up.encoding or "utf-8"
+        try:
+            text = payload.decode(charset, errors="replace")
+        except LookupError:
+            text = payload.decode("utf-8", errors="replace")
+            charset = "utf-8"
+        text = _rewrite_dola_html(text, account_id, account)
+        payload = text.encode(charset, errors="replace")
+    elif "text/css" in content_type or "javascript" in content_type or "ecmascript" in content_type:
+        charset = up.encoding or "utf-8"
+        try:
+            text = payload.decode(charset, errors="replace")
+        except LookupError:
+            text = payload.decode("utf-8", errors="replace")
+            charset = "utf-8"
+        payload = _rewrite_dola_urls(text, account_id).encode(charset, errors="replace")
+
+    resp = Response(content=payload, status_code=up.status_code)
+    for key, value in up.headers.items():
+        low = key.lower()
+        if low in _PROXY_DROP_RESP:
+            continue
+        resp.headers.append(key, value)
+    if "location" in up.headers:
+        resp.headers["location"] = _rewrite_location(up.headers["location"], account_id)
+    for raw in (up.raw.headers.get_all("Set-Cookie") or []):
+        patched = _patch_set_cookie(raw, account_id)
+        if patched:
+            resp.headers.append("set-cookie", patched)
+    resp.headers["cache-control"] = "no-store"
+    return resp
+
+
+@app.post("/api/accounts/{account_id}/web")
+def api_account_web(account_id: int):
+    """在 webview（桌面版）或新标签页（Web 版）里打开该账号的 Dola 页面。"""
+    if not WEB_PROXY:
+        return JSONResponse({"error": "本地代理已关闭（DOLA_WEB_PROXY=0）"}, 400)
+    conn = db()
+    row = conn.execute("select id,name,cookie from accounts where id=?", (account_id,)).fetchone()
+    conn.close()
+    if row is None:
+        return JSONResponse({"error": "账号不存在"}, 404)
+    account = dict(row)
+    cookie, _note = sanitize_cookie(account.get("cookie") or "")
+    if not cookie:
+        return JSONResponse({"error": "该账号没有可用的 Cookie，先补上再打开网页"}, 400)
+    url = _proxy_prefix(account_id) + "/"
+    title = "Dola · #%s %s" % (account_id, (account.get("name") or "").strip())
+    audit("account.web", "id=%s" % account_id)
+    if DESKTOP_MODE and _control_hook:
+        try:
+            # pywebview 要求「start() 之后 + 非主线程」才会立刻建窗口，
+            # 这里和 restart / quit 一样丢到线程里执行
+            threading.Thread(target=_control_hook, args=("open_web", {"url": url, "title": title}),
+                             daemon=True).start()
+            return {"ok": True, "mode": "desktop", "url": url, "title": title}
+        except Exception as exc:  # noqa: BLE001
+            log.warning("桌面窗口打开失败，退回浏览器：%s", exc)
+    return {"ok": True, "mode": "browser", "url": url, "title": title}
 
 
 # --------------------------------------------------------------------------

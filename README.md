@@ -130,7 +130,7 @@ docker compose up -d --build
 | **生成** | 单条 / 整行批量提交；模型（SD2.0 / SD2.5）、时长（5/10/15/30s）、比例（9:16 / 16:9 / 1:1）、画质、参考图（最多 9 张）、指定账号或自动选号 |
 | **任务队列** | SQLite 持久化，并发可热调整（1-100）；实时进度、断线重连后自动恢复未完成任务、失败一键重试、完成后在线播放 / 下载 |
 | **分镜工作台** | 粘贴文案 → AI 推理拆镜（Agnes AI；未配置 Key 时自动降级为本地规则模板）→ 逐镜编辑提示词 → 一键全量提交 → 卡片内跟踪进度与成片 |
-| **账号池** | Cookie 批量导入（txt / csv / json）、格式与接口双重验活、每日限额、同号单任务、按今日用量最少自动轮询 |
+| **账号池** | Cookie 批量导入（txt / csv / json）、格式与接口双重验活、每日限额、同号单任务、按今日用量最少自动轮询；每行【🌐 网页】可在新窗口打开**该账号登录态下**的 Dola 页面 |
 | **代理与 IP** | 出口 IP 连通性检测；真实生成时由生成器按任务自动轮换住宅 IP（同任务同 IP，粘性 50 分钟）；可一键刷新代理 |
 | **资产库** | 角色 / 场景 / 道具参考图与特征描述，便于复用（图片走 `/uploads` 静态服务） |
 | **节点画布** | 可视化节点编排工作流，可保存到服务端（`/api/workflows`）并可加载回来，画布内可直接建任务 |
@@ -152,6 +152,8 @@ docker compose up -d --build
 | `DOLA_DEMO` | `0` | `1` = 演示模式，不访问外网，任务用内置示例成片 |
 | `DOLA_HOST_BIND` / `DOLA_PORT` | `0.0.0.0` / `8000` | 监听地址 |
 | `DOLA_DESKTOP` | 桌面版自动设为 `1` | 启用 `/api/desktop/*`（模式切换 / 打开目录 / 退出） |
+| `DOLA_WEB_PROXY` | `1` | 是否启用「🌐 网页」本地代理；设 `0` 关闭 |
+| `DOLA_WEB_BASE` | `DOLA_COOKIE_DOMAIN` | 代理的上游站点地址，默认 `https://www.dola.com` |
 | `DOLA_ADMIN_TOKEN` | 空 | 设置后控制台与 API 需携带令牌（登录页 / 请求头 `X-Admin-Token` / `?token=`） |
 | `DOLA_DATA_DIR` | `./data` | 数据根目录，内含 `dola.db`、`output/`、`uploads/` |
 | `DOLA_OUTPUT_DIR` / `DOLA_UPLOAD_DIR` / `DOLA_DB` | 派生自上面 | 可分别覆盖 |
@@ -191,6 +193,8 @@ curl -X POST http://127.0.0.1:8000/api/tasks -H "Content-Type: application/json"
 | POST | `/api/tasks/{id}/retry` · `/api/tasks/retry-failed` | 重试单个 / 全部失败任务 |
 | DELETE | `/api/tasks/{id}` | 删除任务（连同成片文件） |
 | GET/POST/DELETE | `/api/accounts` · `/api/accounts/{id}/check` · `/api/accounts/check-all` · `/api/import` | 账号池 |
+| POST | `/api/accounts/{id}/web` | 打开该账号登录态下的 Dola 页面（桌面版交给启动器开窗口，Web 版返回 `/dola-web/{id}/`） |
+| GET/POST/… | `/dola-web/{id}/…` | 「🌐 网页」用的本地反向代理入口：注入该账号 Cookie 后转发到 Dola，并改写页面内的地址与 CSP |
 | GET/POST/DELETE | `/api/proxies` · `/api/proxies/refresh` · `/api/proxy-status` | 代理 |
 | GET/POST/DELETE | `/api/assets` · `/api/upload-image` | 资产库与图片上传 |
 | POST | `/api/ai-reason` | 分镜推理 `{script, style, duration, image_url}` → `{scenes, engine}` |
@@ -221,6 +225,7 @@ dola-pool/
 ├── tools/make_assets.py       # 重建背景图 / 演示视频
 ├── tools/smoke_test.py        # 端到端自检（只依赖标准库）
 ├── tools/desktop_test.py      # 桌面版无头自检
+├── tools/webproxy_test.py     # 「🌐 网页」本地代理自检（自带模拟 Dola 站点）
 ├── tools/build_desktop.py     # 打包成免安装桌面程序（PyInstaller）
 ├── requirements-desktop.txt   # 桌面版依赖
 ├── scripts/refresh-proxy.sh   # 代理刷新（cron 友好）
@@ -234,6 +239,14 @@ dola-pool/
 ```bash
 python tools/smoke_test.py
 # DOLA_BASE=http://127.0.0.1:9000 DOLA_ADMIN_TOKEN=xxx python tools/smoke_test.py
+```
+
+其它自检（都能在无图形界面的环境跑）：
+
+```bash
+python tools/desktop_test.py     # 桌面接口 / 模式切换重启 / 账号网页窗口（18 项）
+python tools/check_launcher.py   # 三平台启动器静态与动态检查（16 项）
+python tools/webproxy_test.py    # 「🌐 网页」本地代理，自带模拟 Dola 站点（32 项）
 ```
 
 重建静态资源（可选）：

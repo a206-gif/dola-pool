@@ -55,6 +55,19 @@ def call(method, path, payload=None, timeout=10):
         return 0, str(exc)
 
 
+def live_proxy_check(acc_id):
+    """代理入口必须是可读的页面：能连上 Dola → 200；连不上 → 502 说明页。都不该是 500。"""
+    try:
+        with urllib.request.urlopen(f"{BASE}/dola-web/{acc_id}/", timeout=20) as r:
+            return r.status == 200 and "<html" in r.read().decode("utf-8", "replace").lower()
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", "replace")
+        # 没有外网的测试环境里，这是预期结果（说明页而不是崩溃）
+        return exc.code == 502 and "连不上 Dola" in body
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def wait_up(should_be_up=True, timeout=45):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -134,14 +147,30 @@ def main():
         check("重启后以生产模式运行（demo_mode=%s）" % (restarted and "false"), restarted)
         check("旧进程已退出", proc.poll() is None and restarted, "pid %s" % pid)
 
-        print("\n== 4. reveal 路径处理 ==")
+        print("\n== 4. 打开账号网页（本地代理）==")
+        status, res = call("POST", "/api/accounts",
+                           {"name": "代理测试号", "cookie": "sessionid=abc123; sid_guard=x"})
+        acc_id = res.get("id") if isinstance(res, dict) else None
+        check("建号成功（id=%s）" % acc_id, status == 200 and acc_id, res)
+        status, res = call("POST", "/api/accounts/%s/web" % acc_id)
+        check("桌面版返回 desktop 模式（由启动器开原生窗口）",
+              status == 200 and isinstance(res, dict) and res.get("mode") == "desktop"
+              and res.get("url") == "/dola-web/%s/" % acc_id, res)
+        status, res = call("POST", "/api/accounts/999999/web")
+        check("不存在的账号 → 404", status == 404, str(res)[:80])
+        status, res = call("POST", "/api/accounts", {"name": "空号", "cookie": ""})
+        check("空 Cookie 建号被拒（不会再存进坏数据）", status == 400 and "Cookie" in str(res), str(res)[:110])
+        check("代理入口可访问（沙箱无外网时给出「连不上 Dola」说明页，而不是 500）",
+              live_proxy_check(acc_id), "GET /dola-web/%s/" % acc_id)
+
+        print("\n== 5. reveal 路径处理 ==")
         status, res = call("POST", "/api/desktop/reveal", {"path": "/etc/passwd"})
         check("越权路径被拦截", status == 400, res)
         status, res = call("POST", "/api/desktop/reveal", {"path": "/output/task_demo.mp4"})
         check("静态 URL 被解析到成片目录（无文件时返回打开失败而非越权）",
               status in (200, 500) and "允许范围" not in str(res), str(res)[:120])
 
-        print("\n== 5. 退出接口 ==")
+        print("\n== 6. 退出接口 ==")
         status, res = call("POST", "/api/desktop/quit")
         check("退出请求被接受", status == 200 and isinstance(res, dict) and res.get("ok"), res)
         gone, _ = wait_up(should_be_up=False, timeout=20)

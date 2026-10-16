@@ -167,15 +167,20 @@ class Backend:
 
 
 # --------------------------------------------------------------------------
-# 控制信号（切换运行模式 / 退出应用）
+# 控制信号（切换运行模式 / 退出应用 / 打开账号网页窗口）
 # --------------------------------------------------------------------------
 class Control:
     def __init__(self):
         self.action = None          # None | "quit" | "restart"
         self.window = None
+        self.base_url = ""          # 后端地址，main() 里设置，用于把 /dola-web/… 补成绝对地址
+        self.web_windows = []       # 「打开账号网页」开出的窗口
 
-    def __call__(self, action: str) -> None:
+    def __call__(self, action: str, payload=None) -> None:
         """由后端接口触发。"""
+        if action == "open_web":
+            self.open_web(payload or {})
+            return
         self.action = action
         print(f"[desktop] 收到指令：{action}")
         win = self.window
@@ -185,6 +190,57 @@ class Control:
                 threading.Thread(target=win.destroy, daemon=True).start()
             except Exception as exc:
                 print(f"[desktop] 关闭窗口失败：{exc}")
+
+    def open_web(self, payload: dict) -> None:
+        """开一个原生窗口看某个账号在 Dola 的页面。
+
+        注意：pywebview 只有在 start() 之后、且从非主线程调用 create_window，
+        新窗口才会立刻出现（见 pywebview 源码 create_window 末尾）。
+        这里的调用来自后端 uvicorn 线程，正好满足条件。
+        """
+        url = str(payload.get("url") or "")
+        if not url:
+            return
+        if url.startswith("/"):
+            url = (self.base_url or "").rstrip("/") + url
+        title = str(payload.get("title") or "Dola 账号网页")
+        try:
+            import webview
+        except Exception as exc:  # noqa: BLE001
+            print(f"[desktop] 没装 pywebview（{exc}），改用系统浏览器")
+            _open_in_browser(url)
+            return
+        if getattr(webview, "guilib", None) is None:
+            # --headless / --browser / 原生窗口启动失败时没有 GUI 循环，
+            # 此时 create_window 只会静默返回一个不显示的窗口，所以直接走浏览器
+            print("[desktop] 当前没有原生窗口环境，改用系统浏览器打开账号网页")
+            _open_in_browser(url)
+            return
+        try:
+            win = webview.create_window(
+                title, url,
+                width=1180, height=860,
+                min_size=(720, 520),
+                text_select=True,
+            )
+            self.web_windows.append(win)
+            print(f"[desktop] 已打开账号网页窗口：{title}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[desktop] 打开账号网页窗口失败（{exc}），改用系统浏览器")
+            _open_in_browser(url)
+
+    def close_web_windows(self) -> None:
+        """主窗口关闭时把账号网页窗口一起收掉。
+
+        否则 webview.start() 会因为还有窗口活着而不返回，程序就卡住不退出/不重启了。
+        """
+        for win in list(self.web_windows):
+            try:
+                win.destroy()
+            except Exception:  # noqa: BLE001
+                pass
+        self.web_windows.clear()
+
 
 
 # --------------------------------------------------------------------------
@@ -255,6 +311,13 @@ def open_window(url: str, title: str, size, storage_path: str, control: Control,
             text_select=True,
         )
         control.window = window
+        control.base_url = url
+        # 主窗口一关，就把「打开 Dola 网页」开出的子窗口一起收掉，
+        # 否则 webview.start() 会因为还有窗口活着而不返回，退不掉也重启不了
+        try:
+            window.events.closing += control.close_web_windows
+        except Exception as exc:  # noqa: BLE001
+            print(f"[desktop] 注册窗口关闭回调失败（不影响使用）：{exc}")
         # private_mode=False + storage_path：界面里的 localStorage（分镜、画布工作流、
         # 管理令牌）才会在重启后保留
         kwargs = {
@@ -273,6 +336,14 @@ def open_window(url: str, title: str, size, storage_path: str, control: Control,
         print("[desktop] 提示：Linux 需要 WebKitGTK，例如 sudo apt install python3-gi gir1.2-webkit2-4.1")
         print("[desktop]       也可以 pip install \"pywebview[qt]\" 使用 Qt 后端")
         return False
+
+
+def _open_in_browser(url: str) -> None:
+    """打开系统浏览器；无图形环境时只记日志，绝不抛异常。"""
+    try:
+        webbrowser.open(url)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[desktop] 打开系统浏览器失败：{exc}")
 
 
 def open_browser(url: str) -> None:
