@@ -44,6 +44,15 @@ HIDDEN = [
 ]
 
 
+
+def _pillow_version() -> str:
+    """Pillow 版本（macOS 打包图标等场景需要它）。"""
+    try:
+        import PIL
+        return getattr(PIL, "__version__", "已安装")
+    except ImportError:
+        return "未安装（macOS 打图标时需要：pip install pillow）"
+
 def preflight() -> None:
     """打包前的环境自检：把常见的失败原因提前说清楚。"""
     problems = []
@@ -67,6 +76,13 @@ def preflight() -> None:
         import webview  # noqa: F401
     except ImportError:
         problems.append("缺少 pywebview，请先执行： pip install -r requirements-desktop.txt")
+    # 便于排错：把版本信息打出来（云端打包失败时能从日志/注解里直接看到）
+    try:
+        import PyInstaller
+        print("[build] PyInstaller %s / Pillow %s / %s" % (
+            PyInstaller.__version__, _pillow_version(), platform.platform()), flush=True)
+    except Exception:  # noqa: BLE001
+        pass
 
     if problems:
         print("[build] ⚠ 打包前自检发现问题：", flush=True)
@@ -122,10 +138,41 @@ def main() -> int:
 
     print("[build] 当前平台：%s / Python %s" % (platform.system(), platform.python_version()), flush=True)
     print("[build] 执行：PyInstaller …（首次打包约 1-3 分钟）", flush=True)
-    proc = subprocess.run(cmd, cwd=ROOT)
-    if proc.returncode != 0:
-        print("[build] ❌ 打包失败，请检查上面的 PyInstaller 输出")
-        return proc.returncode
+
+    log_path = os.path.join(ROOT, "build", "pyinstaller.log")
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    tail: list[str] = []
+    proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True,
+                            encoding="utf-8", errors="replace", bufsize=1)
+    with open(log_path, "w", encoding="utf-8", errors="replace") as fh:
+        for line in proc.stdout or ():
+            sys.stdout.write(line)
+            fh.write(line)
+            tail.append(line.rstrip("\r\n"))
+            del tail[:-80]
+    code = proc.wait()
+
+    if code != 0:
+        last = "\n".join(tail[-25:]) or "（PyInstaller 没有输出）"
+        print("[build] ❌ 打包失败（退出码 %d）" % code)
+        print("[build] ── PyInstaller 输出尾部 ──")
+        print(last)
+        print("[build] 完整日志：%s" % log_path)
+        if os.getenv("GITHUB_ACTIONS"):
+            # 云端打包时，把原因写成一条 GitHub 注解 —— 这样用 API 就能读到，
+            # 不必登录网页翻几万行日志。
+            flat = " | ".join(x for x in tail[-14:] if x.strip())[:900]
+            print("::error title=PyInstaller 打包失败::" + flat, flush=True)
+        summary = os.getenv("GITHUB_STEP_SUMMARY")
+        if summary:
+            try:
+                with open(summary, "a", encoding="utf-8") as sf:
+                    sf.write("### PyInstaller 打包失败（%s）\n\n```\n%s\n```\n" % (
+                        platform.system(), "\n".join(tail[-80:])))
+            except OSError:
+                pass
+        return code
 
     target = os.path.join(ROOT, "dist", args.name + (".app" if platform.system() == "Darwin" else ""))
     if not os.path.exists(target):

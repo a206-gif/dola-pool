@@ -25,6 +25,7 @@ jobs:
   build:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30          # 防止某一步卡死跑到 6 小时（曾因 --help 不自退卡住）
     strategy:
       fail-fast: false
       matrix:
@@ -46,18 +47,21 @@ jobs:
       - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements-desktop.txt pyinstaller
+          pip install -r requirements-desktop.txt pyinstaller pillow
+          # pillow：macOS 打包时把 PNG 图标转成 .icns 需要它
 
       - name: 打包（单目录版）
         run: python tools/build_desktop.py --clean
 
-      - name: 自检（Linux 上跑一次端到端，确保打包内容完整）
+      - name: 自检（Linux 上确认产物存在；控制台版程序不带 --help，必须限时）
         if: runner.os == 'Linux'
         run: |
-          python tools/smoke_test.py --help >/dev/null 2>&1 || true
-          python app.py --help >/dev/null 2>&1 || true
-          ./dist/DolaPool/DolaPool --help >/dev/null 2>&1 || true
-          echo "（可执行文件已生成）"
+          ls -la dist/DolaPool/ | head -20
+          # 注意：这是窗口版程序，--help 不一定自己退出，必须加 timeout，
+          # 否则这一步会一直挂着把整个 job 拖到超时。
+          timeout 45 ./dist/DolaPool/DolaPool --help >/dev/null 2>&1 \
+            && echo "（--help 正常返回）" \
+            || echo "（--help 未返回，属正常：窗口版程序无控制台输出）"
 
       - name: 整理产物
         shell: bash
