@@ -104,6 +104,9 @@ DEMO_SECONDS = float(os.getenv("DOLA_DEMO_SECONDS", "6"))  # 演示渲染耗时
 # 是因为登录 Cookie（sessionid / sid_guard）多半是 HttpOnly，网页 JS 写不进去，
 # 桌面 webview 也没有写 Cookie 的接口；走代理则 HttpOnly 一样生效。
 WEB_PROXY = _env_flag("DOLA_WEB_PROXY", True)
+# 打开账号网页时先落到哪个路径。Dola 的主界面是 /chat/，直接进这里比进根路径靠谱；
+# 想改成根路径就把 DOLA_WEB_START 设成 /（留空表示不改写，直接请求根路径）
+WEB_PROXY_START = os.getenv("DOLA_WEB_START", "/chat/").strip()
 DOLA_WEB_BASE = (os.getenv("DOLA_WEB_BASE", "").strip().rstrip("/")
                  or DOLA_COOKIE_DOMAIN.strip().rstrip("/")
                  or "https://www.dola.com")
@@ -1815,6 +1818,21 @@ _RE_ROOT_ATTR = re.compile(
     r"(\s(?:href|src|action|poster|formaction|data-src|data-original)\s*=\s*[\"'])/(?!/)(?!"
     + _PROXY_PREFIX_TAIL_RE + r"/)", re.I)
 _RE_CSS_ROOT_URL = re.compile(r"(url\(\s*[\"']?)/(?!/)(?!" + _PROXY_PREFIX_TAIL_RE + r"/)", re.I)
+# 下面几条是「浏览器端拦不住」的写法，只能在文本层面改写：
+#   import("/assets/x.js")      —— 动态导入不是函数调用，注入脚本覆写不了
+#   new Worker("/w.js")         —— Worker 里是另一个上下文
+#   @import "/x.css"            —— CSS 的另一种写法
+#   srcset="/a.png 1x, /b.png"  —— 图片多倍图
+_RE_DYNAMIC_IMPORT = re.compile(
+    r"\bimport\s*\(\s*([\"'])/(?!/)(?!" + _PROXY_PREFIX_TAIL_RE + r"/)")
+_RE_WORKER = re.compile(
+    r"\bnew\s+(?:Shared)?Worker\s*\(\s*([\"'])/(?!/)(?!" + _PROXY_PREFIX_TAIL_RE + r"/)")
+_RE_IMPORT_SCRIPTS = re.compile(
+    r"\bimportScripts\s*\(\s*([\"'])/(?!/)(?!" + _PROXY_PREFIX_TAIL_RE + r"/)")
+_RE_CSS_IMPORT = re.compile(
+    r"(@import\s*)([\"'])/(?!/)(?!" + _PROXY_PREFIX_TAIL_RE + r"/)", re.I)
+_RE_SRCSET = re.compile(r"(\ssrcset\s*=\s*[\"'])([^\"']*)([\"'])", re.I)
+_RE_SRCSET_URL = re.compile(r"(^|,\s*)/(?!/)(?!" + _PROXY_PREFIX_TAIL_RE + r"/)")
 _RE_CSP_META = re.compile(
     r"<meta[^>]+http-equiv\s*=\s*[\"']?content-security-policy[\"']?[^>]*>", re.I)
 _RE_BASE_TAG = re.compile(r"<base\b[^>]*>", re.I)
@@ -1860,6 +1878,13 @@ def _rewrite_dola_urls(text: str, account_id: int) -> str:
     text = _RE_DOLA_URL.sub(prefix, text)
     text = _RE_ROOT_ATTR.sub(lambda m: m.group(1) + prefix + "/", text)
     text = _RE_CSS_ROOT_URL.sub(lambda m: m.group(1) + prefix + "/", text)
+    text = _RE_DYNAMIC_IMPORT.sub(lambda m: "import(" + m.group(1) + prefix + "/", text)
+    text = _RE_WORKER.sub(lambda m: "new Worker(" + m.group(1) + prefix + "/", text)
+    text = _RE_IMPORT_SCRIPTS.sub(lambda m: "importScripts(" + m.group(1) + prefix + "/", text)
+    text = _RE_CSS_IMPORT.sub(lambda m: m.group(1) + m.group(2) + prefix + "/", text)
+    text = _RE_SRCSET.sub(
+        lambda m: m.group(1) + _RE_SRCSET_URL.sub(lambda mm: mm.group(1) + prefix + "/", m.group(2)) + m.group(3),
+        text)
     return text
 
 
@@ -1909,74 +1934,322 @@ def _patch_set_cookie(value: str, account_id: int) -> str:
     return "; ".join(out)
 
 
+_PROXY_CSS = (
+    "<style>#dlp-bar{position:fixed;left:0;right:0;bottom:0;min-height:28px;z-index:2147483647;"
+    "background:rgba(10,22,20,.95);color:#bfe6de;font:12px/28px -apple-system,BlinkMacSystemFont,"
+    "'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;padding:0 12px;display:flex;flex-wrap:wrap;"
+    "align-items:center;gap:14px;box-sizing:border-box;border-top:1px solid #1e6f61;text-align:left}"
+    "#dlp-bar a{color:#7fd4c4;text-decoration:none;cursor:pointer}"
+    "#dlp-bar a:hover{text-decoration:underline}"
+    "#dlp-bar .dlp-x{margin-left:auto;cursor:pointer;color:#7fa9a2}"
+    "#dlp-log{flex:0 0 100%;max-height:38vh;overflow:auto;padding:6px 0 8px;color:#ffb4a8;"
+    "font:11.5px/1.6 ui-monospace,Consolas,Menlo,monospace;white-space:pre-wrap;word-break:break-all;"
+    "border-top:1px solid #1e6f61;margin-top:4px}</style>"
+)
+
+_PROXY_JS = r"""/* Dola Pool 本地代理：注入页面的运行时脚本（单独存放便于语法检查，实际由 app.py 内联下发） */
+(function () {
+  var C = window.__DLP__ || {};
+  var P = C.prefix || '';
+  var RE = /^(?:https?:)?\/\/(?:[\w-]+\.)*dola\.com(?![\w.-])/i;
+
+  // 把 dola 绝对地址、协议相对地址、站内绝对路径统一拉回本地代理
+  function fix(u) {
+    if (typeof u !== 'string' || !u) return u;
+    if (u.indexOf(P + '/') === 0 || u === P) return u;
+    var m = u.match(RE);
+    if (m) return P + u.slice(m[0].length);
+    if (u.charAt(0) === '/' && u.charAt(1) !== '/') return P + u;
+    return u;
+  }
+  window.__dlpFix = fix;
+
+  // ---------------------------------------------------------------- 诊断面板
+  var diag = { errors: [], failed: [] };
+  var painted = null;
+  function report(kind, text) {
+    if (diag[kind].length >= 30) return;
+    text = String(text).slice(0, 240);
+    if (diag[kind].indexOf(text) >= 0) return;
+    diag[kind].push(text);
+    paint();
+  }
+  window.addEventListener('error', function (e) {
+    if (e && e.target && e.target !== window && (e.target.src || e.target.href)) {
+      report('failed', '资源失败 ' + (e.target.src || e.target.href));
+      return;
+    }
+    report('errors', (e && e.message ? e.message : String(e)) + (e && e.filename ? ' @ ' + e.filename : ''));
+  }, true);
+  window.addEventListener('unhandledrejection', function (e) {
+    var r = e && e.reason;
+    report('errors', 'Promise 未捕获 ' + ((r && (r.message || r)) || ''));
+  });
+
+  // ---------------------------------------------------------------- 网络拦截
+  try {
+    var _fetch = window.fetch;
+    if (_fetch) {
+      window.fetch = function () {
+        try {
+          var a = arguments;
+          if (typeof a[0] === 'string') a[0] = fix(a[0]);
+          else if (a[0] && typeof a[0].url === 'string') {
+            var n = fix(a[0].url);
+            if (n !== a[0].url) { try { a[0] = new Request(n, a[0]); } catch (e2) { a[0] = n; } }
+          }
+        } catch (e) {}
+        var p = _fetch.apply(this, arguments);
+        try {
+          p.then(function (r) {
+            if (r && r.status >= 400) report('failed', 'HTTP ' + r.status + ' ' + String(r.url || '').slice(0, 120));
+            return r;
+          }, function (err) { report('errors', 'fetch 失败 ' + ((err && err.message) || err)); });
+        } catch (e) {}
+        return p;
+      };
+    }
+  } catch (e) {}
+
+  try {
+    var _open = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function (m, u) {
+      try { arguments[1] = fix(u); } catch (e) {}
+      return _open.apply(this, arguments);
+    };
+    var _send = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.send = function () {
+      var xhr = this;
+      try {
+        xhr.addEventListener('loadend', function () {
+          if (xhr.status >= 400) report('failed', 'XHR ' + xhr.status + ' ' + String(xhr.responseURL || '').slice(0, 120));
+        });
+      } catch (e) {}
+      return _send.apply(this, arguments);
+    };
+  } catch (e) {}
+
+  try {
+    var _wopen = window.open;
+    window.open = function (u) {
+      try { arguments[0] = fix(u); } catch (e) {}
+      return _wopen.apply(this, arguments);
+    };
+  } catch (e) {}
+
+  try {
+    var _beacon = navigator.sendBeacon && navigator.sendBeacon.bind(navigator);
+    if (_beacon) navigator.sendBeacon = function (u, d) { return _beacon(fix(u), d); };
+  } catch (e) {}
+
+  // ---------------------------------------------------------------- 元素属性拦截
+  var ATTRS = { src: 1, href: 1, action: 1, poster: 1, data: 1, 'data-src': 1, formaction: 1 };
+  var _setAttr = Element.prototype.setAttribute;
+  Element.prototype.setAttribute = function (name, value) {
+    try { if (ATTRS[String(name).toLowerCase()] && typeof value === 'string') value = fix(value); } catch (e) {}
+    return _setAttr.call(this, name, value);
+  };
+
+  function patchProp(ctor, prop) {
+    try {
+      if (!ctor) return;
+      var d = Object.getOwnPropertyDescriptor(ctor.prototype, prop);
+      if (!d || !d.set || !d.get) return;
+      var setter = d.set, getter = d.get;
+      Object.defineProperty(ctor.prototype, prop, {
+        configurable: true, enumerable: d.enumerable,
+        get: function () { return getter.call(this); },
+        set: function (v) { return setter.call(this, typeof v === 'string' ? fix(v) : v); }
+      });
+    } catch (e) {}
+  }
+  patchProp(window.HTMLScriptElement, 'src');
+  patchProp(window.HTMLImageElement, 'src');
+  patchProp(window.HTMLLinkElement, 'href');
+  patchProp(window.HTMLIFrameElement, 'src');
+  patchProp(window.HTMLMediaElement, 'src');
+  patchProp(window.HTMLSourceElement, 'src');
+  patchProp(window.HTMLTrackElement, 'src');
+  patchProp(window.HTMLAnchorElement, 'href');
+  patchProp(window.HTMLFormElement, 'action');
+  patchProp(window.HTMLObjectElement, 'data');
+  patchProp(window.HTMLEmbedElement, 'src');
+
+  function fixNode(node) {
+    try {
+      if (!node) return;
+      if (node.nodeType === 1) {
+        if (node.attributes) {
+          for (var i = 0; i < node.attributes.length; i++) {
+            var a = node.attributes[i];
+            if (a && ATTRS[String(a.name).toLowerCase()]) {
+              var nv = fix(a.value);
+              if (nv !== a.value) _setAttr.call(node, a.name, nv);
+            }
+          }
+        }
+      } else if (node.nodeType === 11) { /* DocumentFragment */
+        var kids = node.childNodes;
+        for (var k = 0; k < kids.length; k++) fixNode(kids[k]);
+        return;
+      } else {
+        return;
+      }
+      var list = node.querySelectorAll ? node.querySelectorAll('*') : null;
+      if (list) for (var j = 0; j < list.length; j++) fixNode(list[j]);
+    } catch (e) {}
+  }
+
+  try {
+    var _append = Node.prototype.appendChild;
+    Node.prototype.appendChild = function (n) { fixNode(n); return _append.call(this, n); };
+    var _insert = Node.prototype.insertBefore;
+    Node.prototype.insertBefore = function (n, ref) { fixNode(n); return _insert.call(this, n, ref); };
+    var _replace = Node.prototype.replaceChild;
+    Node.prototype.replaceChild = function (n, old) { fixNode(n); return _replace.call(this, n, old); };
+  } catch (e) {}
+
+  try {
+    var dHtml = Object.getOwnPropertyDescriptor(Element.prototype, 'innerHTML');
+    if (dHtml && dHtml.set) {
+      Object.defineProperty(Element.prototype, 'innerHTML', {
+        configurable: true, enumerable: dHtml.enumerable, get: dHtml.get,
+        set: function (v) { var r = dHtml.set.call(this, v); fixNode(this); return r; }
+      });
+    }
+  } catch (e) {}
+
+  try {
+    if (window.MutationObserver) {
+      var mo = new MutationObserver(function (muts) {
+        for (var i = 0; i < muts.length; i++) {
+          var m = muts[i];
+          if (m.type === 'attributes') fixNode(m.target);
+          else for (var j = 0; j < m.addedNodes.length; j++) fixNode(m.addedNodes[j]);
+        }
+      });
+      var startMo = function () {
+        try {
+          mo.observe(document.documentElement, {
+            childList: true, subtree: true, attributes: true,
+            attributeFilter: ['src', 'href', 'action', 'poster', 'data-src', 'formaction']
+          });
+        } catch (e) {}
+      };
+      if (document.documentElement) startMo();
+      else document.addEventListener('DOMContentLoaded', startMo);
+    }
+  } catch (e) {}
+
+  try {
+    if (navigator.serviceWorker && navigator.serviceWorker.register) {
+      navigator.serviceWorker.register = function () {
+        return Promise.reject(new Error('service worker disabled by local proxy'));
+      };
+    }
+  } catch (e) {}
+
+  // ---------------------------------------------------------------- 底部提示条
+  function inDesktop() {
+    return !!(window.pywebview && window.pywebview.api && window.pywebview.api.open_external);
+  }
+
+  function openExternal() {
+    var url = location.href;
+    if (inDesktop()) {
+      try { window.pywebview.api.open_external(url); return; } catch (e) {}
+    }
+    try { window.open(url, '_blank'); } catch (e) {}
+  }
+  window.__dlpOpenExternal = openExternal;
+
+  function paint() {
+    try {
+      var badge = document.getElementById('dlp-badge');
+      if (badge) {
+        var n = diag.errors.length + diag.failed.length;
+        badge.textContent = n ? ('⚠ ' + n) : '';
+        badge.style.display = n ? '' : 'none';
+      }
+      var log = document.getElementById('dlp-log');
+      if (log && log.style.display !== 'none') {
+        log.textContent = '';
+        var all = diag.errors.concat(diag.failed);
+        for (var i = 0; i < all.length; i++) {
+          var line = document.createElement('div');
+          line.textContent = '· ' + all[i];
+          log.appendChild(line);
+        }
+        if (!all.length) log.textContent = '暂无错误';
+      }
+    } catch (e) {}
+  }
+
+  function buildBar() {
+    if (document.getElementById('dlp-bar')) return;
+    var d = document.createElement('div');
+    d.id = 'dlp-bar';
+
+    var mk = function (tag, text, cls) {
+      var el = document.createElement(tag);
+      if (text) el.textContent = text;
+      if (cls) el.className = cls;
+      return el;
+    };
+
+    d.appendChild(mk('span', '🔗 本地代理'));
+    d.appendChild(mk('span', C.label || ''));
+    var ext = mk('a', '🌐 用系统浏览器打开', 'dlp-act');
+    ext.href = 'javascript:void 0';
+    ext.onclick = openExternal;
+    d.appendChild(ext);
+    var re = mk('a', '↻ 重载', 'dlp-act');
+    re.href = 'javascript:void 0';
+    re.onclick = function () { location.reload(); };
+    d.appendChild(re);
+
+    var badge = mk('a', '', 'dlp-act');
+    badge.id = 'dlp-badge';
+    badge.href = 'javascript:void 0';
+    badge.style.display = 'none';
+    badge.onclick = function () {
+      var log = document.getElementById('dlp-log');
+      if (!log) return;
+      log.style.display = log.style.display === 'none' ? '' : 'none';
+      paint();
+    };
+    d.appendChild(badge);
+
+    var hide = mk('span', '✕ 隐藏', 'dlp-x');
+    hide.onclick = function () { d.style.display = 'none'; };
+    d.appendChild(hide);
+
+    var log = mk('div', '');
+    log.id = 'dlp-log';
+    log.style.display = 'none';
+    d.appendChild(log);
+
+    (document.body || document.documentElement).appendChild(d);
+    paint();
+  }
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', buildBar);
+  else buildBar();
+})();"""
+
+
 def _proxy_snippet(account_id: int, account: dict) -> str:
-    """注入页面的样式 + 运行时脚本（把页面里动态发出的请求也拉回代理）。"""
-    prefix = _proxy_prefix(account_id)
+    """注入页面的样式 + 运行时脚本。
+
+    脚本单独放在 _PROXY_JS 里（tools/webproxy_test.py 会从本文件抠出来做语法与行为检查），
+    配置先塞进 window.__DLP__ 再执行脚本本身，保证测试的就是上线的那一份。
+    """
     cfg = _js_json({
-        "prefix": prefix,
+        "prefix": _proxy_prefix(account_id),
         "label": "账号 #%s %s" % (account_id, (account.get("name") or "").strip()),
         "real": DOLA_WEB_BASE + "/",
     })
-    style = (
-        "<style>#dlp-bar{position:fixed;left:0;right:0;bottom:0;height:28px;z-index:2147483647;"
-        "background:rgba(10,22,20,.94);color:#bfe6de;font:12px/28px -apple-system,BlinkMacSystemFont,"
-        "'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;padding:0 12px;display:flex;"
-        "align-items:center;gap:14px;box-sizing:border-box;border-top:1px solid #1e6f61;"
-        "white-space:nowrap;overflow:hidden;text-align:left}#dlp-bar a{color:#7fd4c4;"
-        "text-decoration:none;cursor:pointer}#dlp-bar a:hover{text-decoration:underline}"
-        "#dlp-bar .dlp-x{margin-left:auto;cursor:pointer;color:#7fa9a2}</style>"
-    )
-    script = """<script>(function(){
-var C = __CFG__;
-var RE = /^(?:https?:)?\\/\\/(?:[\\w-]+\\.)*dola\\.com(?![\\w.-])/i;
-function fix(u){
-  if (typeof u !== 'string' || !u) return u;
-  if (u.indexOf(C.prefix + '/') === 0 || u === C.prefix) return u;
-  var m = u.match(RE);
-  if (m) return C.prefix + u.slice(m[0].length);
-  if (u.charAt(0) === '/' && u.charAt(1) !== '/') return C.prefix + u;
-  return u;
-}
-try {
-  var _f = window.fetch;
-  if (_f) window.fetch = function(input, init){
-    try {
-      if (typeof input === 'string') { input = fix(input); }
-      else if (input && typeof input.url === 'string') {
-        var n = fix(input.url);
-        if (n !== input.url) { try { input = new Request(n, input); } catch(e) { input = n; } }
-      }
-    } catch(e){}
-    return _f.call(this, input, init);
-  };
-} catch(e){}
-try {
-  var _o = XMLHttpRequest.prototype.open;
-  XMLHttpRequest.prototype.open = function(m, u){ try { arguments[1] = fix(u); } catch(e){} return _o.apply(this, arguments); };
-} catch(e){}
-try {
-  var _w = window.open;
-  window.open = function(u){ try { arguments[0] = fix(u); } catch(e){} return _w.apply(this, arguments); };
-} catch(e){}
-try { if (navigator.serviceWorker) { navigator.serviceWorker.register = function(){ return Promise.reject(new Error('service worker disabled by local proxy')); }; } } catch(e){}
-function bar(){
-  if (document.getElementById('dlp-bar')) return;
-  var d = document.createElement('div');
-  d.id = 'dlp-bar';
-  var s1 = document.createElement('span'); s1.textContent = '🔗 本地代理';
-  var s2 = document.createElement('span'); s2.textContent = C.label;
-  var a1 = document.createElement('a'); a1.textContent = '在浏览器打开真实站点';
-  a1.href = C.real; a1.target = '_blank'; a1.rel = 'noopener';
-  var a2 = document.createElement('a'); a2.textContent = '↻ 重载';
-  a2.href = 'javascript:void 0'; a2.onclick = function(){ location.reload(); };
-  var x = document.createElement('span'); x.className = 'dlp-x'; x.textContent = '✕ 隐藏';
-  x.onclick = function(){ d.style.display = 'none'; };
-  d.appendChild(s1); d.appendChild(s2); d.appendChild(a1); d.appendChild(a2); d.appendChild(x);
-  (document.body || document.documentElement).appendChild(d);
-}
-if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bar); else bar();
-})();</script>"""
-    return style + script.replace("__CFG__", cfg)
+    return _PROXY_CSS + "<script>window.__DLP__=" + cfg + ";</script>" + _PROXY_JS
 
 
 def _proxy_inject(text: str, account_id: int, account: dict) -> str:
@@ -2022,22 +2295,12 @@ def _upstream_url(rest: str, query: str) -> str:
     return url
 
 
-@app.api_route("/dola-web/{account_id}", methods=_PROXY_METHODS)
-@app.api_route("/dola-web/{account_id}/{rest:path}", methods=_PROXY_METHODS)
-async def api_dola_web(account_id: int, request: Request, rest: str = ""):
-    """把某个账号的 Dola 页面代理到本地，供 webview / 浏览器查看。"""
+async def _serve_dola_proxy(account_id: int, rest: str, request: Request):
+    """代理核心：把 rest 对应的 Dola 路径取回来、改写后交给窗口。"""
     if not WEB_PROXY:
         return _proxy_notice("本地代理已关闭", "启动时设置了 DOLA_WEB_PROXY=0。", 403)
     if _requests is None:
         return _proxy_notice("缺少 requests 库", "请执行 pip install -r requirements.txt", 500)
-
-    # 入口 /dola-web/2 补一个尾斜杠，否则页面里的相对路径会解析到 /dola-web/ 下。
-    # 只在「没有后续路径」时补：/static/app.js、/api/me 这类真实文件路径补了就成 404。
-    if not rest and not request.url.path.endswith("/"):
-        target = request.url.path + "/"
-        if request.url.query:
-            target += "?" + request.url.query
-        return RedirectResponse(target, status_code=307)
 
     # 只允许代理到配置的 Dola 站点，防止被当成任意中转
     if "://" in rest or any(seg == ".." for seg in rest.split("/")):
@@ -2052,6 +2315,17 @@ async def api_dola_web(account_id: int, request: Request, rest: str = ""):
     cookie = (account.get("cookie") or "").strip()
     if not cookie:
         return _proxy_notice("该账号没有 Cookie", "先在账号池里编辑这个账号，填入 Cookie。", 400)
+
+    # 入口 /dola-web/2 补尾斜杠，并跳到 Dola 的真正主界面（默认 /chat/）。
+    # 尾斜杠只在这里补：/static/app.js、/api/me 这类真实文件路径补了就成 404。
+    if not rest:
+        if not request.url.path.endswith("/"):
+            target = request.url.path + "/"
+            if request.url.query:
+                target += "?" + request.url.query
+            return RedirectResponse(target, status_code=307)
+        if WEB_PROXY_START:
+            return RedirectResponse(_proxy_prefix(account_id) + WEB_PROXY_START, status_code=302)
 
     url = _upstream_url(rest, request.url.query)
     headers = {}
@@ -2120,6 +2394,13 @@ async def api_dola_web(account_id: int, request: Request, rest: str = ""):
     return resp
 
 
+@app.api_route("/dola-web/{account_id}", methods=_PROXY_METHODS)
+@app.api_route("/dola-web/{account_id}/{rest:path}", methods=_PROXY_METHODS)
+async def api_dola_web(account_id: int, request: Request, rest: str = ""):
+    """「🌐 网页」的入口：/dola-web/{账号id}/…"""
+    return await _serve_dola_proxy(account_id, rest, request)
+
+
 @app.post("/api/accounts/{account_id}/web")
 def api_account_web(account_id: int):
     """在 webview（桌面版）或新标签页（Web 版）里打开该账号的 Dola 页面。"""
@@ -2147,6 +2428,25 @@ def api_account_web(account_id: int):
         except Exception as exc:  # noqa: BLE001
             log.warning("桌面窗口打开失败，退回浏览器：%s", exc)
     return {"ok": True, "mode": "browser", "url": url, "title": title}
+
+
+_RE_PROXY_REFERER = re.compile(
+    "^https?://[^/]+" + re.escape(WEB_PROXY_PREFIX) + r"/(\d+)(?:/|$)", re.I)
+
+
+@app.api_route("/{fallback_path:path}", methods=_PROXY_METHODS, include_in_schema=False)
+async def api_fallback(fallback_path: str, request: Request):
+    """兜底：页面里没被改写干净的站内绝对路径（比如 JS 里 location.href='/chat/x'）。
+
+    这些请求会落到本机根路径上。只要 Referer 指向某个账号的代理页面，
+    就按同一个账号转发给 Dola —— 浏览器端拦不住的跳转也能正常工作。
+    （/static、/output、/uploads 是静态挂载，走不到这里；页面里那类路径由注入脚本改写。）
+    """
+    referer = request.headers.get("referer", "") or request.headers.get("Referer", "")
+    m = _RE_PROXY_REFERER.match(referer or "")
+    if m and WEB_PROXY:
+        return await _serve_dola_proxy(int(m.group(1)), fallback_path, request)
+    return JSONResponse({"error": "Not Found", "path": "/" + fallback_path}, 404)
 
 
 # --------------------------------------------------------------------------

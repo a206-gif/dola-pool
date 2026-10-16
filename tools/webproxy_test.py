@@ -64,7 +64,7 @@ HOME_HTML = """<!doctype html>
 <script src="https://www.dola.com/static/ext.js"></script>
 </head><body>
 <h1>假 Dola 首页</h1>
-<img src="/img/logo.png" alt="logo">
+<img src="/img/logo.png" srcset="/img/logo.png 1x, /img/logo2x.png 2x" alt="logo">
 <a id="abs" href="https://www.dola.com/chat/123">绝对链接</a>
 <a id="proto" href="//www.dola.com/chat/456">协议相对链接</a>
 <a id="root" href="/chat/789">站内绝对路径</a>
@@ -76,9 +76,13 @@ APP_JS = """// 假 Dola 的前端脚本
 var BASE = "https://www.dola.com";
 function load(){ return fetch(BASE + "/api/me").then(function(r){ return r.json(); }); }
 fetch("/api/me2");
+var chunk = import("/assets/chunk-abc.js");
+new Worker("/wk/sw.js");
+importScripts("/sw-helper.js");
 """
 
-APP_CSS = """body{background:#111 url(/img/bg.png) no-repeat}
+APP_CSS = """@import "/styles/base.css";
+body{background:#111 url(/img/bg.png) no-repeat}
 .logo{background-image:url("https://www.dola.com/img/logo2.png")}
 """
 
@@ -106,7 +110,9 @@ class FakeDola(BaseHTTPRequestHandler):
     # -- 路由 --------------------------------------------------------
     def do_GET(self):
         path = self.path.split("?", 1)[0]
-        if path == "/":
+        if path in ("/", "/chat"):          # 模拟真实站点把根路径跳到主界面
+            self._send(302, b"", {"Location": "/chat/"})
+        elif path == "/chat/":
             self._send(200, HOME_HTML.encode("utf-8"), {
                 "Content-Type": "text/html; charset=utf-8",
                 "Content-Security-Policy": "default-src 'self'",
@@ -149,8 +155,9 @@ class FakeDola(BaseHTTPRequestHandler):
             raw = "<html><head><title>gz</title></head><body>gzip 页面</body></html>".encode("utf-8")
             self._send(200, gzip.compress(raw), {
                 "Content-Type": "text/html; charset=utf-8", "Content-Encoding": "gzip"})
-        elif path == "/chat/123":
-            self._send(200, b"<html><body>chat 123</body></html>", {"Content-Type": "text/html"})
+        elif path.startswith("/chat/"):
+            self._send(200, ("<html><body>chat 子页 " + path + "</body></html>").encode(),
+                       {"Content-Type": "text/html; charset=utf-8"})
         else:
             self._send(404, b"<html><body>not found</body></html>", {"Content-Type": "text/html"})
 
@@ -232,6 +239,30 @@ def call(url: str, method: str = "GET", data=None, headers=None, follow: bool = 
 
 
 # --------------------------------------------------------------------------
+def run_inject_test():
+    """顺带跑一遍注入脚本的行为测试（需要 node + jsdom，没有就跳过）。"""
+    script = os.path.join(BASE_DIR, "tools", "inject_test.js")
+    if not os.path.exists(script):
+        return 0
+    try:
+        r = subprocess.run(["node", script], capture_output=True, text=True, timeout=90)
+    except FileNotFoundError:
+        print("\n⚠️  没装 node，跳过注入脚本行为测试（tools/inject_test.js）")
+        return 0
+    except Exception as exc:  # noqa: BLE001
+        print("\n⚠️  注入脚本行为测试未能执行：%s" % exc)
+        return 0
+    out = (r.stdout or "").strip().splitlines()
+    print("\n== 注入脚本行为测试（node + jsdom）==")
+    if r.returncode == 0 and out:
+        print("  " + out[-1])
+        if "未安装 jsdom" in r.stdout:
+            print("  （npm i jsdom 后可跑完整用例）")
+        return 0
+    print(r.stdout or r.stderr)
+    return 1
+
+
 def main() -> int:
     fake, fake_port = start_fake_dola()
     web_base = f"http://127.0.0.1:{fake_port}"
@@ -252,8 +283,13 @@ def main() -> int:
         acc_id = acc["id"]
         prefix = f"/dola-web/{acc_id}"
 
-        print("\n== 首页 HTML 改写 ==")
-        status, raw, hdr = call(base + prefix + "/")
+        print("\n== 入口与首页 HTML 改写 ==")
+        status, _, hdr = call(base + prefix + "/", follow=False)
+        loc = hdr.get("Location") or hdr.get("location") or ""
+        check("入口 /dola-web/N/ 跳到主界面 /chat/",
+              status == 302 and loc == prefix + "/chat/", f"{status} {loc}")
+
+        status, raw, hdr = call(base + prefix + "/chat/")
         html = raw.decode("utf-8", "replace")
         check("首页返回 200", status == 200, status)
         check("dola.com 绝对地址已改写到代理",
@@ -261,6 +297,9 @@ def main() -> int:
               [s for s in html.split('"') if "dola.com" in s][:3])
         check("站内绝对路径 /static/app.js 已加代理前缀", f'href="{prefix}/static/app.css"' in html)
         check("integrity 属性已剥离", "integrity" not in html)
+        check("srcset 里的根路径已改写",
+              ('srcset="' + prefix + '/img/logo.png 1x, ' + prefix + '/img/logo2x.png 2x"') in html,
+              [x for x in html.split('"') if "srcset" in html and "logo2x" in x][:1])
         check("站点 CSP meta 已移除", "Content-Security-Policy" not in html)
         import re as _re
         _base = _re.search(r"<base[^>]*>", html)
@@ -276,11 +315,18 @@ def main() -> int:
         js = raw.decode("utf-8", "replace")
         check("JS 文件返回 200", status == 200, status)
         check("JS 里的 dola.com 绝对地址已改写", "dola.com" not in js, js[:80])
+        check("JS 里的动态 import()/Worker 根路径已改写",
+              ('import("' + prefix + '/assets/chunk-abc.js")') in js
+              and ('Worker("' + prefix + '/wk/sw.js")') in js
+              and ('importScripts("' + prefix + '/sw-helper.js")') in js,
+              [l for l in js.splitlines() if "import" in l or "Worker" in l][:3])
         status, raw, _ = call(base + prefix + "/static/app.css")
         css = raw.decode("utf-8")
         check("CSS 里的 url(/img/bg.png) 已改写",
               f"url({prefix}/img/bg.png)" in css, css.splitlines()[0])
         check("CSS 里的绝对 url 已改写", "dola.com" not in css)
+        check("CSS 里的 @import 根路径已改写",
+              ('@import "' + prefix + '/styles/base.css"') in css, css.splitlines()[0])
 
         status, raw, _ = call(base + prefix + "/img/logo.png")
         check("图片二进制原样转发", status == 200 and raw == PNG, f"{status} {len(raw)}B")
@@ -331,11 +377,27 @@ def main() -> int:
         loc = hdr.get("Location") or hdr.get("location") or ""
         check("不带尾斜杠 → 307 补斜杠", status == 307 and loc.endswith(prefix + "/"), f"{status} {loc}")
 
+        check("注入脚本含元素属性与 DOM 插入拦截（SPA 动态加载 chunk 靠它）",
+              all(k in html for k in ("HTMLScriptElement", "setAttribute",
+                                      "appendChild", "MutationObserver", "__dlpFix")),
+              "关键 hook 齐全")
+        check("提示条提供「用系统浏览器打开」与错误面板",
+              "用系统浏览器打开" in html and "dlp-log" in html)
+
         status, raw, _ = call(base + "/dola-web/999999/")
         check("账号不存在 → 404 说明页", status == 404 and "账号不存在" in raw.decode("utf-8", "replace"), status)
 
         status, raw, _ = call(base + prefix + "/http://evil.example.com/")
         check("带 :// 的路径被拒绝", status == 400 and "请求被拒绝" in raw.decode("utf-8", "replace"), status)
+
+        # 页面里 location.href='/chat/xxx' 这类跳转浏览器端拦不住，
+        # 会落到本机根路径；带上前一页的 Referer 时要能继续走代理
+        status, _, _ = call(base + "/chat/page9", follow=False)
+        check("本机未知路径无 Referer → 404（不会被当成开放代理）", status == 404, status)
+        status, raw, _ = call(base + "/chat/page9",
+                              headers={"Referer": base + prefix + "/chat/"})
+        check("带代理页面 Referer 的未知路径 → 转发给 Dola",
+              status == 200 and b"chat" in raw, f"{status} {raw[:60]}")
 
         status, raw, _ = call(base + f"/api/accounts/{acc_id}/web", "POST", b"")
         info = json.loads(raw) if status == 200 else {}
@@ -352,10 +414,13 @@ def main() -> int:
         import shutil
         shutil.rmtree(data_dir, ignore_errors=True)
 
+    rc = run_inject_test()
+
     print("\n================ 结果 ================")
     print(f"通过 {len(PASS)} 项，失败 {len(FAIL)} 项")
-    if FAIL:
-        print("失败用例：" + "；".join(FAIL))
+    if FAIL or rc:
+        if FAIL:
+            print("失败用例：" + "；".join(FAIL))
         return 1
     print("✅ 本地代理各环节均正常")
     return 0

@@ -166,6 +166,22 @@ class Backend:
             self.thread.join(timeout=8)
 
 
+class _WebWindowApi:
+    """账号网页窗口能调用的少量能力。
+
+    只做一件事：把当前页面丢到系统浏览器里打开 —— WebView2 万一渲染不出来，
+    用户点提示条上的「🌐 用系统浏览器打开」就能换个浏览器对照。
+    只接受本机地址，免得页面脚本借这个口子去开任意网址。
+    """
+
+    def open_external(self, url: str = "") -> dict:
+        target = str(url or "").strip()
+        if not target.startswith(("http://127.0.0.1", "http://localhost", "http://[::1]")):
+            return {"ok": False, "detail": "只允许打开本机地址"}
+        _open_in_browser(target)
+        return {"ok": True, "url": target}
+
+
 # --------------------------------------------------------------------------
 # 控制信号（切换运行模式 / 退出应用 / 打开账号网页窗口）
 # --------------------------------------------------------------------------
@@ -222,8 +238,13 @@ class Control:
                 width=1180, height=860,
                 min_size=(720, 520),
                 text_select=True,
+                js_api=_WebWindowApi(),
             )
             self.web_windows.append(win)
+            try:  # 用户自己关掉窗口后从列表里摘掉，免得 accumulate
+                win.events.closed += lambda: self.web_windows.remove(win) if win in self.web_windows else None
+            except Exception:
+                pass
             print(f"[desktop] 已打开账号网页窗口：{title}")
         except Exception as exc:  # noqa: BLE001
             print(f"[desktop] 打开账号网页窗口失败（{exc}），改用系统浏览器")

@@ -18,6 +18,10 @@ build/
 dist/
 *.spec
 
+# 注入脚本行为测试用（tools/inject_test.js）
+node_modules/
+package-lock.json
+
 # 系统
 .DS_Store
 Thumbs.db
