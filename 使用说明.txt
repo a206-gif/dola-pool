@@ -58,13 +58,29 @@ Linux   ：终端执行  ./start-linux.sh
 
 五、想做成免安装的 .exe / .app（可选）
 ----------------------------------------------------------------
-需要在该系统上执行一次（PyInstaller 不能跨平台打包）：
+说明：dist\DolaPool\ 不是仓库里自带的东西，而是【运行打包命令后现场生成】的
+      输出目录（已被 .gitignore 排除，所以仓库里永远看不到它）。
+      不打包也完全能用 —— 直接双击 start-windows.bat 就够了，
+      只是那种方式要求电脑上装了 Python。
 
+想拿到"别人电脑上不装 Python 也能跑"的程序，两种做法：
+
+【方式一】在自己电脑上打包（需要装一次 Python + PyInstaller）
     pip install -r requirements-desktop.txt pyinstaller
     python tools/build_desktop.py
+  执行完成后，打包脚本会打印产物路径，形如：
+    Windows  仓库目录\dist\DolaPool\DolaPool.exe
+    macOS    仓库目录/dist/DolaPool.app
+    Linux    仓库目录/dist/DolaPool/DolaPool
+  把整个 DolaPool 文件夹拷给别人，双击即可运行。
+  注意 PyInstaller 不能跨平台：Windows 的 exe 必须在 Windows 上打。
 
-产物在 dist\DolaPool\ 目录下（Windows 是 DolaPool.exe）。
-把整个 dist\DolaPool 文件夹拷给别人，双击即可运行，无需装 Python。
+【方式二】用 GitHub 云端打包（本机什么都不用装）
+    1. 把仓库推到 GitHub（仓库里已带 .github/workflows/build-desktop.yml）
+    2. 打开仓库 → Actions → 选 "Build Desktop App" → Run workflow
+    3. 跑完后在该次运行页面底部 Artifacts 里下载 DolaPool-Windows，
+       解压就是我们给你打好的 DolaPool\DolaPool.exe
+    打 tag（如 v2.0.0）推送时还会自动建 Release，三平台产物都挂上去。
 
 
 六、出问题了怎么办

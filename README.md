@@ -58,7 +58,14 @@ python tools/build_desktop.py --onefile  # 单文件版，便于分发
 ```
 
 产物在 `dist/DolaPool/`（Windows 为 `DolaPool.exe`，macOS 为 `DolaPool.app`）。
-PyInstaller 不能跨平台打包，请在目标系统上执行。
+
+> `dist/` 是**运行打包命令后现场生成**的输出目录，不在仓库里（`.gitignore` 已排除
+> `build/`、`dist/`、`*.spec`）。仓库里只有打包脚本本身 `tools/build_desktop.py`。
+
+PyInstaller 不能跨平台打包，请在目标系统上执行；若不想在本地装环境，可以用仓库自带的
+云端工作流：推到 GitHub 后打开 **Actions → Build Desktop App → Run workflow**，
+跑完在 Artifacts 里下载 `DolaPool-Windows`，解压即得 `DolaPool.exe`
+（打 `v*` tag 推送时还会自动创建 Release 挂上三平台产物）。
 
 自检：`python tools/desktop_test.py`（无头环境也能跑，覆盖启动 / 模式切换重启 / 退出 / 路径校验）
 
