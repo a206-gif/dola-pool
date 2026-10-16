@@ -22,6 +22,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -94,16 +95,37 @@ class FakeCore:
 
 
 class FakeControl:
-    def __init__(self, core=None):
-        self.CoreWebView2 = core
+    """模拟 WebView2 控件：CoreWebView2 只允许在 UI 线程（Invoke 期间）访问。
 
-    def Invoke(self, fn):  # 真机上这里是 WinForms 的 Invoke(委托)
-        raise AssertionError("测试里应该走 _ui_invoke 接缝")
+    真机上从别的线程读它会抛
+      System.InvalidOperationException: CoreWebView2 can only be accessed from the UI thread
+    —— 这里用同样的限制，保证这个 bug 不会再回来。
+    """
+
+    def __init__(self, core=None):
+        self._core = core
+        self._ui_thread = None
+
+    @property
+    def CoreWebView2(self):
+        if self._ui_thread is not threading.current_thread():
+            raise RuntimeError("CoreWebView2 can only be accessed from the UI thread")
+        return self._core
 
 
 class FakeBrowserView:
-    def __init__(self, core):
+    """模拟 pywebview 的 WinForms 窗体：Invoke 就是「切到 UI 线程」。"""
+
+    def __init__(self, core=None):
         self.webview = FakeControl(core)
+
+    def Invoke(self, fn):
+        prev = self.webview._ui_thread
+        self.webview._ui_thread = threading.current_thread()
+        try:
+            return fn()
+        finally:
+            self.webview._ui_thread = prev
 
 
 class FakeWin:
@@ -136,6 +158,9 @@ class FakePyWindow:
     def load_url(self, url):
         self.loaded.append(url)
         self.url = url
+
+    def load_html(self, html, base_uri=None):
+        self.html_shown = html
 
     def destroy(self):
         pass
@@ -175,14 +200,14 @@ def cookie_injection_checks():
 
     # 后面走接缝：假装 clr 可用 + 直接在「UI 线程」同步执行
     desktop._clr_ready = lambda: (True, "")
-    desktop._ui_invoke = lambda ctrl, fn: fn()
+    desktop._ui_invoke = lambda holder, fn: holder.Invoke(fn)   # 经由窗体的 Invoke（=切 UI 线程）
     desktop._can_inject_cookies = lambda: True   # 本测试跑在 Linux 上，手动打开注入开关
     desktop._INJECT_TIMEOUT = 0.5               # 真机是 15 秒；测试别干等
 
     # c) 正常注入：域名 / HttpOnly / Secure 都要设上
     win = FakeWin(FakeCore())
     ok, why = desktop._inject_webview2_cookies(win, "sessionid=abc; sid_guard=xyz", ".dola.com", timeout=1)
-    added = win.native.webview.CoreWebView2.CookieManager.added
+    added = win.native.webview._core.CookieManager.added   # 直接读假对象内部，绕开「只能 UI 线程」限制
     check("注入成功并返回数量", ok is True and "2 个" in why, why)
     check("Cookie 的域名/路径/HttpOnly/Secure 都对",
           [c.Name for c in added] == ["sessionid", "sid_guard"]
@@ -192,7 +217,11 @@ def cookie_injection_checks():
 
     # d) 内核迟迟不给 CoreWebView2 → 超时返回失败（不卡死）
     ok, why = desktop._inject_webview2_cookies(FakeWin(None, have_native=False), "a=1", timeout=0.3)
-    check("拿不到内核时超时返回失败并说明原因", ok is False and "就绪" in why, why)
+    check("拿不到内核控件时明确失败并说明原因", ok is False and "内核" in why, why)
+
+    # d2) 内核还没就绪（窗口刚建好）→ 轮询到超时后失败，不是卡死
+    ok, why = desktop._inject_webview2_cookies(FakeWin(None), "a=1", timeout=0.4)
+    check("内核未就绪时轮询到超时、返回可读原因", ok is False and "就绪" in why, why)
 
     # e) 整条路：Control.open_web → 注入成功 → 打开的是真实 dola.com
     import types
@@ -210,7 +239,10 @@ def cookie_injection_checks():
             if win.loaded:
                 break
             time.sleep(0.1)
-        check("开始先在 about:blank 上等内核（而不是直接加载本地代理页）",
+        check("注入期间先显示「正在准备」页（不是空白窗口）",
+              "正在用该账号的登录态打开" in (getattr(win, "html_shown", "") or ""),
+              (getattr(win, "html_shown", "") or "")[:40])
+        check("注入成功后才打开真实 dola.com（中间不停留在空白页）",
               win.loaded[:1] == ["https://www.dola.com/chat/"], win.loaded)
         check("标题栏标明走的是真站", win.title.endswith("· dola.com"), win.title)
 

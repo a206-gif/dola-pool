@@ -213,10 +213,10 @@ def _parse_cookie_pairs(raw: str) -> list:
     return pairs
 
 
-def _ui_invoke(ctrl, fn) -> None:
-    """在浏览器内核的 UI 线程上执行 fn（WinForms 的控件只能从 UI 线程碰）。"""
+def _ui_invoke(holder, fn) -> None:
+    """把 fn 丢到 UI 线程上同步执行（WinForms 的窗体/控件只能从 UI 线程碰）。"""
     from System import Func, Type  # pythonnet，Windows 上装 pywebview 时自带
-    ctrl.Invoke(Func[Type](fn))
+    holder.Invoke(Func[Type](fn))
 
 
 def _clr_ready() -> tuple:
@@ -228,24 +228,39 @@ def _clr_ready() -> tuple:
         return False, str(exc)
 
 
-def _webview2_core(window):
-    """返回 (控件, CoreWebView2)；拿不到就返回 None。"""
+_WAIT_HTML = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<title>正在打开…</title><style>
+html,body{margin:0;height:100%;background:#0a0f11;color:#c9d8d6;
+font:14px/1.7 -apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;
+display:flex;align-items:center;justify-content:center;text-align:center}
+b{color:#0ca58c}
+</style></head><body><div>
+<div style="font-size:15px">正在用该账号的登录态打开 <b>Dola</b>…</div>
+<div style="opacity:.72;margin-top:6px">把该账号的 Cookie 写进浏览器内核后再跳转（最多等 15 秒）<br>
+写不进去会自动改用本机代理页</div>
+</div></body></html>"""
+
+
+def _webview_holder(window):
+    """拿到能 Invoke 到 UI 线程的宿主对象（pywebview 的 WinForms 窗体）。"""
     native = getattr(window, "native", None)
     if native is None:
         return None
-    for holder in (native, getattr(native, "browser", None)):
-        if holder is None:
-            continue
-        ctrl = getattr(holder, "webview", None)
-        core = getattr(ctrl, "CoreWebView2", None) if ctrl is not None else None
-        if core is not None:
-            return ctrl, core
+    if hasattr(native, "webview") or hasattr(native, "browser"):
+        return native
     return None
 
 
 def _inject_webview2_cookies(window, cookie: str, domain: str = ".dola.com",
                              timeout: float = 15.0) -> tuple:
-    """等内核就绪后把 Cookie 写进去。返回 (是否成功, 说明)。"""
+    """把 Cookie 写进浏览器内核（WebView2）。返回 (是否成功, 说明)。
+
+    真机踩过的坑：WebView2 的 CoreWebView2 属性**只能在 UI 线程上访问**，
+    在后台线程读它会抛
+      System.InvalidOperationException: CoreWebView2 can only be accessed from the UI thread
+    （底层是 COM 的 E_NOINTERFACE），整个后台线程就崩了 —— 窗口于是停在 about:blank 白屏。
+    所以「探测内核是否就绪」和「写入 Cookie」都必须包在 Invoke 里、在 UI 线程上做。
+    """
     pairs = _parse_cookie_pairs(cookie)
     if not pairs:
         return False, "Cookie 为空"
@@ -253,42 +268,62 @@ def _inject_webview2_cookies(window, cookie: str, domain: str = ".dola.com",
     if not ready:  # 尽早失败：pythonnet 不在就说明不是 Windows/WebView2 后端
         return False, "非 Windows 内核（%s）" % why
 
-    deadline = time.time() + max(0.0, timeout)
-    got = None
-    while True:
-        got = _webview2_core(window)
-        if got or time.time() >= deadline:
-            break
-        time.sleep(0.2)
-    if not got:
-        return False, "没等到浏览器内核就绪（拿不到 CoreWebView2）"
-    ctrl, core = got
+    state = {"done": False, "count": 0, "err": "", "fatal": False, "holder": None}
 
-    state = {"done": False, "err": "", "count": 0}
-
-    def _write():
+    def _probe_and_write():
+        """只在 UI 线程上跑：内核还没就绪就直接返回，等下一轮。"""
+        holder = state["holder"]
         try:
+            ctrl = getattr(holder, "webview", None)
+            if ctrl is None:
+                browser = getattr(holder, "browser", None)
+                ctrl = getattr(browser, "webview", None) if browser is not None else None
+            core = getattr(ctrl, "CoreWebView2", None) if ctrl is not None else None
+            if core is None:
+                return                      # 还没初始化好，下一轮再试
             manager = core.CookieManager
+            failed = []
             for name, value in pairs:
-                c = manager.CreateCookie(name, value, domain, "/")
-                for attr, val in (("IsHttpOnly", True), ("IsSecure", True)):
-                    try:
-                        setattr(c, attr, val)
-                    except Exception:  # noqa: BLE001
-                        pass
-                manager.AddOrUpdateCookie(c)
-                state["count"] += 1
-            state["done"] = True
+                try:                        # 单个 Cookie 失败不影响其它的
+                    c = manager.CreateCookie(name, value, domain, "/")
+                    for attr, val in (("IsHttpOnly", True), ("IsSecure", True)):
+                        try:
+                            setattr(c, attr, val)
+                        except Exception:  # noqa: BLE001
+                            pass
+                    manager.AddOrUpdateCookie(c)
+                    state["count"] += 1
+                except Exception as exc:  # noqa: BLE001
+                    failed.append("%s：%s" % (name, exc))
+            if failed:
+                state["err"] = "；".join(failed)[:200]
+            state["done"] = state["count"] > 0
         except Exception as exc:  # noqa: BLE001
             state["err"] = str(exc)
+            state["fatal"] = True            # 这类错误重试也没用，直接放弃
 
-    try:
-        _ui_invoke(ctrl, _write)
-    except Exception as exc:  # noqa: BLE001
-        return False, "写入时出错（%s）" % exc
-    if not state["done"]:
-        return False, "写入失败（%s）" % (state["err"] or "未知原因")
-    return True, "已写入 %d 个 Cookie（域 %s）" % (state["count"], domain)
+    deadline = time.time() + max(0.0, timeout)
+    while True:
+        holder = _webview_holder(window)
+        if holder is None:
+            return False, "拿不到浏览器内核控件（pywebview 的窗口还没建好）"
+        state["holder"] = holder
+        state["done"] = False
+        state["fatal"] = False
+        try:
+            _ui_invoke(holder, _probe_and_write)
+        except Exception as exc:  # noqa: BLE001
+            return False, "调用内核失败（%s）" % exc
+        if state["done"] or state["fatal"] or time.time() >= deadline:
+            break
+        time.sleep(0.25)
+
+    if state["done"]:
+        note = "已写入 %d 个 Cookie（域 %s）" % (state["count"], domain)
+        if state["err"]:
+            note += "，另有失败：" + state["err"]
+        return True, note
+    return False, (state["err"] or "等不到内核就绪（CoreWebView2 还没初始化）")
 
 
 # --------------------------------------------------------------------------
@@ -369,7 +404,12 @@ class Control:
             except Exception:
                 pass
             if try_cookie:
-                # 先把 Cookie 写进内核，再打开真正的 dola.com（写在后台线程里，
+                # 先摆一个「正在准备」页，别让用户对着空白窗口猜
+                try:
+                    win.load_html(_WAIT_HTML, "")
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[desktop] 显示等待页失败（不影响后续）：{exc}")
+                # 把 Cookie 写进内核，再打开真正的 dola.com（放后台线程，
                 # 免得等内核就绪把接口调用卡住）
                 threading.Thread(
                     target=self._finish_cookie_window,
@@ -385,7 +425,10 @@ class Control:
     def _finish_cookie_window(self, win, proxy_url: str, real_url: str,
                               cookie: str, domain: str, title: str) -> None:
         """注入 Cookie 成功就打开真实 dola.com，失败就退回本机代理页。"""
-        ok, note = _inject_webview2_cookies(win, cookie, domain, timeout=_INJECT_TIMEOUT)
+        try:
+            ok, note = _inject_webview2_cookies(win, cookie, domain, timeout=_INJECT_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001  任何意外都不能让窗口停在空白页
+            ok, note = False, "注入过程出错（%s）" % exc
         if ok:
             print(f"[desktop] {note}；打开真实站点：{real_url}")
             self._set_win_title(win, title + " · dola.com")
@@ -397,7 +440,11 @@ class Control:
         try:
             win.load_url(target)
         except Exception as exc:  # noqa: BLE001
-            print(f"[desktop] 打开 {target} 失败：{exc}")
+            print(f"[desktop] 打开 {target} 失败（{exc}），退回本机代理页")
+            try:
+                win.load_url(proxy_url)
+            except Exception as exc2:  # noqa: BLE001
+                print(f"[desktop] 本机代理页也打不开：{exc2}")
 
     @staticmethod
     def _set_win_title(win, text: str) -> None:
