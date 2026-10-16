@@ -23,6 +23,7 @@ import base64
 import gzip
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -35,6 +36,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PASS, FAIL = [], []
+
+
+def _proxy_js():
+    """把 app.py 里的 _PROXY_JS 常量抠出来（和 tools/inject_test.js 一样）。"""
+    try:
+        src = open(os.path.join(BASE_DIR, "app.py"), encoding="utf-8").read()
+        m = re.search(r'_PROXY_JS = r"""(.*?)"""', src, re.S)
+        return m.group(1) if m else ""
+    except Exception:  # noqa: BLE001
+        return ""
 
 # 假站点里的登录凭据（模拟 Dola 的会话 Cookie）
 GOOD_COOKIE = "sessionid=TESTCOOKIE123; sid_guard=guarded"
@@ -239,6 +250,24 @@ def call(url: str, method: str = "GET", data=None, headers=None, follow: bool = 
 
 
 # --------------------------------------------------------------------------
+def run_inject_e2e(proxy_url: str):
+    """让 jsdom 真的加载一遍代理页面，确认注入脚本被当脚本执行。"""
+    script = os.path.join(BASE_DIR, "tools", "inject_test.js")
+    if not os.path.exists(script):
+        return True, "没有 inject_test.js，跳过"
+    try:
+        r = subprocess.run(["node", script, proxy_url], capture_output=True, text=True, timeout=90)
+    except FileNotFoundError:
+        return True, "没装 node，跳过"
+    except Exception as exc:  # noqa: BLE001
+        return True, "未能执行：%s" % exc
+    out = (r.stdout or "").strip() or (r.stderr or "").strip()
+    if "未安装 jsdom" in out:
+        return True, "没装 jsdom，跳过"
+    detail = "；".join(l.strip() for l in out.splitlines() if l.strip().startswith("❌")) or "脚本正常执行"
+    return r.returncode == 0, detail
+
+
 def run_inject_test():
     """顺带跑一遍注入脚本的行为测试（需要 node + jsdom，没有就跳过）。"""
     script = os.path.join(BASE_DIR, "tools", "inject_test.js")
@@ -383,6 +412,12 @@ def main() -> int:
               "关键 hook 齐全")
         check("提示条提供「用系统浏览器打开」与错误面板",
               "用系统浏览器打开" in html and "dlp-log" in html)
+        js_src = _proxy_js()
+        check("注入的 JS 被 <script> 正确包裹（漏了会变成一屏代码文本）",
+              bool(js_src) and ("<script>" + js_src) in html and html.count("<script>" + js_src) == 1,
+              "已包裹" if js_src else "没抠到 _PROXY_JS 常量")
+        e2e_ok, e2e_detail = run_inject_e2e(base + prefix + "/chat/")
+        check("端到端：jsdom 加载代理页面后脚本真的执行了", e2e_ok, e2e_detail)
 
         status, raw, _ = call(base + "/dola-web/999999/")
         check("账号不存在 → 404 说明页", status == 404 and "账号不存在" in raw.decode("utf-8", "replace"), status)

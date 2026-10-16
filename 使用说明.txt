@@ -132,7 +132,7 @@ Linux   ：终端执行  ./start-linux.sh
     2. 打开仓库 → Actions → 选 "Build Desktop App" → Run workflow
     3. 跑完后在该次运行页面底部 Artifacts 里下载 DolaPool-Windows，
        解压就是我们给你打好的 DolaPool\DolaPool.exe
-    打 tag（如 v2.0.0）推送时还会自动建 Release，三平台产物都挂上去。
+    打 tag（如 v2.0.4）推送时还会自动建 Release，三平台产物都挂上去。
 
 
 七、出问题了怎么办

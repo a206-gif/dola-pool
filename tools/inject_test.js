@@ -39,6 +39,44 @@ const errs = [];
 const vc = new VirtualConsole();
 vc.on('jsdomError', e => errs.push('jsdomError: ' + ((e.detail && e.detail.message) || e.message)));
 
+// 带 URL 参数时做端到端检查：让 jsdom 真的把代理页面加载一遍。
+// 这一步专门防「注入的 JS 没被 <script> 包住 → 浏览器把代码当文本显示」这类问题：
+// 那种情况下 window.__dlpFix 根本不会存在。
+const targetUrl = process.argv[2];
+if (targetUrl) {
+  (async () => {
+    let dom;
+    try {
+      dom = await JSDOM.fromURL(targetUrl, {
+        runScripts: 'dangerously', pretendToBeVisual: true, virtualConsole: vc,
+      });
+    } catch (e) {
+      console.log('❌ 页面加载失败：' + e.message);
+      process.exit(1);
+    }
+    await new Promise(r => setTimeout(r, 1200));
+    const w = dom.window, d = w.document;
+    const hasCfg = typeof w.__DLP__ === 'object' && !!w.__DLP__.prefix;
+    const hasFix = typeof w.__dlpFix === 'function';
+    const hasBar = !!d.getElementById('dlp-bar');
+    const bodyText = (d.body ? d.body.textContent : '');
+    const leaked = bodyText.includes('Dola Pool 本地代理') || bodyText.includes('__dlpFix');
+    console.log('===== 注入脚本端到端检查（' + targetUrl + '）=====');
+    console.log((hasCfg ? '✅' : '❌') + ' window.__DLP__ 配置到位（脚本被当成脚本执行了）');
+    console.log((hasFix ? '✅' : '❌') + ' window.__dlpFix 可调用');
+    console.log((hasBar ? '✅' : '❌') + ' 底部提示条已生成');
+    console.log((!leaked ? '✅' : '❌') + ' 页面里没有把注入脚本当文本显示出来' +
+      (leaked ? '（说明 <script> 标签漏了）' : ''));
+    const bad = [!hasCfg, !hasFix, !hasBar, leaked].filter(Boolean).length;
+    console.log(bad === 0 ? '\n✅ 端到端通过' : `\n❌ ${bad} 项失败`);
+    process.exit(bad === 0 ? 0 : 1);
+  })();
+} else {
+  runBehaviourTests();
+}
+
+function runBehaviourTests() {
+
 const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', {
   url: 'http://127.0.0.1:9999' + P + '/chat/',
   runScripts: 'dangerously',
@@ -144,3 +182,4 @@ for (const [name, ok, got, want] of out) {
 console.log('\nJS 错误：' + (errs.length ? errs.join('\n') : '无'));
 console.log(bad === 0 ? `\n✅ 全部通过（${out.length} 项）` : `\n❌ ${bad} 项失败`);
 process.exit(bad === 0 ? 0 : 1);
+}

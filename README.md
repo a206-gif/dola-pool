@@ -249,8 +249,9 @@ python tools/smoke_test.py
 ```bash
 python tools/desktop_test.py     # 桌面接口 / 模式切换重启 / 账号网页窗口（18 项）
 python tools/check_launcher.py   # 三平台启动器静态与动态检查（16 项）
-python tools/webproxy_test.py    # 「🌐 网页」本地代理，自带模拟 Dola 站点（40 项）
-node tools/inject_test.js        # 注入脚本行为（18 项，需 npm i jsdom；webproxy_test 会自动带上）
+python tools/webproxy_test.py    # 「🌐 网页」本地代理，自带模拟 Dola 站点（42 项，含端到端）
+node tools/inject_test.js        # 注入脚本行为（21 项，需 npm i jsdom；webproxy_test 会自动带上）
+node tools/inject_test.js <代理页URL>   # 端到端：用 jsdom 真加载一次代理页面，确认注入脚本被执行（不是显示成文本）
 ```
 
 重建静态资源（可选）：

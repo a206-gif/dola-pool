@@ -54,7 +54,7 @@ from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
                                RedirectResponse, Response)
 from fastapi.staticfiles import StaticFiles
 
-VERSION = "2.0.0"
+VERSION = "2.0.4"
 
 # --------------------------------------------------------------------------
 # 目录与配置
@@ -2249,7 +2249,11 @@ def _proxy_snippet(account_id: int, account: dict) -> str:
         "label": "账号 #%s %s" % (account_id, (account.get("name") or "").strip()),
         "real": DOLA_WEB_BASE + "/",
     })
-    return _PROXY_CSS + "<script>window.__DLP__=" + cfg + ";</script>" + _PROXY_JS
+    # 注意：_PROXY_JS 是纯 JS（方便 tools/inject_test.js 直接抠出来 eval），
+    # 这里必须自己补 <script> 标签 —— 漏了的话浏览器会把整段代码当文本显示出来
+    return (_PROXY_CSS
+            + "<script>window.__DLP__=" + cfg + ";</script>"
+            + "<script>" + _PROXY_JS + "</script>")
 
 
 def _proxy_inject(text: str, account_id: int, account: dict) -> str:
