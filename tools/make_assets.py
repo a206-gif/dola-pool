@@ -143,25 +143,71 @@ def make_demo_video(size, name, seconds=6, title="DOLA POOL", subtitle="演示�
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def make_app_icon():
-    """生成桌面版图标：static/app_icon.png（窗口图标）与 static/app_icon.ico（Windows 打包）。"""
-    from PIL import Image, ImageDraw, ImageFont
+def _ico_from_image(img, sizes):
+    """手工构造 ICO（每个条目用 BMP 编码）。
 
-    sizes = [16, 32, 48, 64, 128, 256]
-    base = Image.new("RGBA", (512, 512), (0, 0, 0, 0))
+    为什么不用 Pillow 直接 save('.ico')：Pillow 会把条目写成 PNG 压缩格式，
+    而 Windows 的 System.Drawing.Icon（pywebview 设置窗口图标时用它）
+    对 PNG 条目支持很差，会抛 System.ArgumentException，导致应用启动即崩溃。
+    """
+    import struct
+
+    entries = []
+    for size in sizes:
+        frame = img.resize((size, size), 1).convert("RGBA")  # 1 == LANCZOS
+        px = frame.load()
+
+        # XOR 位图：BGRA，自下而上
+        xor = bytearray()
+        for y in range(size - 1, -1, -1):
+            for x in range(size):
+                r, g, b, a = px[x, y]
+                xor += bytes((b, g, r, a))
+
+        # AND 掩码：1bpp，每行补齐到 4 字节，自下而上（32 位图下可为全 0，但必须存在）
+        row_bytes = ((size + 31) // 32) * 4
+        and_mask = bytearray(row_bytes * size)
+
+        header = struct.pack(
+            "<IiiHHIIiiII",
+            40, size, size * 2, 1, 32, 0, len(xor), 0, 0, 0, 0,
+        )
+        entries.append((size, header + bytes(xor) + bytes(and_mask)))
+
+    out = bytearray(struct.pack("<HHH", 0, 1, len(entries)))
+    offset = 6 + 16 * len(entries)
+    for size, data in entries:
+        out += struct.pack(
+            "<BBBBHHII",
+            0 if size >= 256 else size,
+            0 if size >= 256 else size,
+            0, 0, 1, 32, len(data), offset,
+        )
+        offset += len(data)
+    for _size, data in entries:
+        out += data
+    return bytes(out)
+
+
+def make_app_icon():
+    """生成桌面版图标：static/app_icon.png（窗口图标）与 static/app_icon.ico（Windows 专用）。"""
+    from PIL import Image, ImageDraw
+
+    base = Image.new("RGBA", (256, 256), (0, 0, 0, 0))
     d = ImageDraw.Draw(base)
-    # 圆角底板
-    d.rounded_rectangle([16, 16, 496, 496], radius=104, fill=(12, 110, 94, 255))
-    d.rounded_rectangle([16, 16, 496, 496], radius=104, outline=(24, 190, 160, 255), width=8)
-    # 中央方块（沿用界面里的 ▣ 标记）
-    d.rounded_rectangle([140, 140, 372, 372], radius=34, outline=(233, 250, 246, 255), width=26)
-    d.rounded_rectangle([208, 208, 304, 304], radius=14, fill=(233, 250, 246, 255))
+    d.rounded_rectangle([8, 8, 248, 248], radius=52, fill=(12, 110, 94, 255))
+    d.rounded_rectangle([8, 8, 248, 248], radius=52, outline=(24, 190, 160, 255), width=4)
+    d.rounded_rectangle([70, 70, 186, 186], radius=17, outline=(233, 250, 246, 255), width=13)
+    d.rounded_rectangle([104, 104, 152, 152], radius=7, fill=(233, 250, 246, 255))
+
     os.makedirs(os.path.join(ROOT, "static"), exist_ok=True)
-    png = os.path.join(ROOT, "static", "app_icon.png")
-    base.resize((256, 256), Image.LANCZOS).save(png, "PNG")
-    base.save(os.path.join(ROOT, "static", "app_icon.ico"),
-              sizes=[(s, s) for s in sizes])
-    print("[+] 已生成应用图标 -> static/app_icon.png / app_icon.ico")
+    png_path = os.path.join(ROOT, "static", "app_icon.png")
+    base.save(png_path, "PNG")
+
+    ico_path = os.path.join(ROOT, "static", "app_icon.ico")
+    with open(ico_path, "wb") as f:
+        f.write(_ico_from_image(base, [16, 24, 32, 48, 64, 128]))
+    print("[+] 已生成应用图标 -> static/app_icon.png / app_icon.ico（BMP 编码，Windows 可用）")
 
 
 def main():

@@ -148,6 +148,21 @@ Linux   ：终端执行  ./start-linux.sh
    很多包还没有对应的预编译文件 —— 请改装普通版 Python 3.12。
 
 
+【最常见 3】应用启动即崩溃，报错里出现：
+   System.ArgumentException: 参数"picture"必须是可用作 Icon 的图片
+   （或 未经处理的异常 … System.Drawing.Icon.Initialize）
+
+   原因：Windows 下窗口图标必须是 .ico 格式，旧版误用了 .png，
+        .NET 直接抛异常导致进程崩溃。
+
+   新版已解决：Windows 自动使用 .ico、其他系统用 .png，
+   并且在传图标前会先校验文件有效性，读不了就干脆不带图标启动。
+
+   另外那次崩溃时你可能会看到 "[1/4] Python found:" 后面是空的 ——
+   那是启动器的另一个 bug（虚拟环境已存在时忘了给变量赋值），也已修好。
+   现在这里会正常显示 Python 版本号。
+
+
 【其它】
 · start-windows.bat 里的提示是英文的 → 因为中文写在批处理里会导致乱码
   甚至窗口闪退（编码问题），所以批处理里只用英文；中文说明就是本文件。

@@ -81,7 +81,11 @@ PyInstaller 不能跨平台打包，请在目标系统上执行；若不想在�
 跑完在 Artifacts 里下载 `DolaPool-Windows`，解压即得 `DolaPool.exe`
 （打 `v*` tag 推送时还会自动创建 Release 挂上三平台产物）。
 
-自检：`python tools/desktop_test.py`（无头环境也能跑，覆盖启动 / 模式切换重启 / 退出 / 路径校验）
+自检：
+- `python tools/desktop_test.py` —— 桌面版端到端（启动 / 模式切换重启 / 退出 / 路径校验）
+- `python tools/check_launcher.py` —— 批处理启动器检查，含一个小型批处理解释器，
+  会在多种环境（无 Python / 官方源失败 / 缺 WebView / 窗口崩溃…）下模拟执行，
+  确认任何路径都不会出现「窗口一闪即关」
 
 ---
 

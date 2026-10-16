@@ -8,15 +8,23 @@ echo    Dola Pool Desktop  -  Launcher
 echo ============================================================
 echo.
 
-rem ---------- 0) self-heal: drop a broken .venv left by a failed run ----------
+rem ============================================================
+rem  0) Reuse the existing .venv when it is healthy, rebuild it
+rem     when it is broken. Always assign PY before leaving here.
+rem ============================================================
 if not exist ".venv\Scripts\python.exe" goto findpy
 ".venv\Scripts\python.exe" -c "import sys" >nul 2>nul
-if not errorlevel 1 goto havepy
-echo [i] Existing .venv is broken - rebuilding it...
-rmdir /s /q ".venv"
-goto findpy
+if errorlevel 1 goto brokenvenv
+set "PY=%CD%\.venv\Scripts\python.exe"
+goto havepy
 
-rem ---------- 1) find a usable Python ----------
+:brokenvenv
+echo [i] Existing .venv looks broken - rebuilding it...
+rmdir /s /q ".venv"
+
+rem ============================================================
+rem  1) Find a usable Python interpreter
+rem ============================================================
 :findpy
 py -3 -c "import sys" >nul 2>nul
 if not errorlevel 1 set "PY=py -3"
@@ -32,16 +40,26 @@ if defined PY goto havepy
 
 goto nopython
 
+rem ============================================================
+rem  2) Sanity check the interpreter we picked
+rem ============================================================
 :havepy
+if not defined PY goto nopython
+%PY% -c "import sys" >nul 2>nul
+if errorlevel 1 goto nopython
+
 echo [1/4] Python found: %PY%
-%PY% --version
-%PY% -c "import sysconfig;print('  [WARN] this is a free-threaded build - packages may have no wheel') if sysconfig.get_config_var('Py_GIL_DISABLED') else ''"
-%PY% -c "import sys;sys.exit(0 if sys.version_info[:2] < (3,14) else 1)"
+%PY% -c "import sys;print('      version', sys.version.split()[0])"
+%PY% -c "import sysconfig;print('      [WARN] free-threaded build detected - many packages have no wheel for it') if sysconfig.get_config_var('Py_GIL_DISABLED') else ''"
+%PY% -c "import sys;sys.exit(0 if sys.version_info[:2] <= (3,13) else 1)"
 if not errorlevel 1 goto newvenv
-echo   [i] Python 3.14+ is very new. If installation keeps failing,
-echo       installing Python 3.12 is the most reliable choice.
+echo      [i] Python 3.14 or newer detected. If installation keeps failing,
+echo          using Python 3.12 is the most reliable choice.
 echo.
 
+rem ============================================================
+rem  3) Virtual environment
+rem ============================================================
 :newvenv
 if exist ".venv\Scripts\python.exe" goto depscheck
 echo [2/4] Creating virtual environment (first run only)...
@@ -49,8 +67,11 @@ echo [2/4] Creating virtual environment (first run only)...
 if errorlevel 1 goto venvfail
 echo.
 
-rem ---------- 2) dependencies ----------
+rem ============================================================
+rem  4) Dependencies (official source, then CN mirrors)
+rem ============================================================
 :depscheck
+if not exist ".venv\Scripts\python.exe" goto venvfail
 set "PY=%CD%\.venv\Scripts\python.exe"
 %PY% -c "import fastapi, uvicorn, requests, Crypto, multipart" >nul 2>nul
 if not errorlevel 1 goto softcheck
@@ -82,14 +103,16 @@ echo.
 echo       Dependencies installed.
 echo.
 
+rem ============================================================
+rem  5) Native window needs pywebview; otherwise use the browser
+rem ============================================================
 :softcheck
 %PY% -c "import webview" >nul 2>nul
 if not errorlevel 1 goto run
-echo [i] pywebview is not installed - the app will open in your web browser
+echo [i] pywebview is missing - the app will open in your web browser
 echo     instead of a native window. That works fine.
 echo.
 
-rem ---------- 3) run ----------
 :run
 echo [4/4] Starting Dola Pool...
 echo       A window should appear in a few seconds.
@@ -103,21 +126,20 @@ goto end
 
 :nopython
 echo.
-echo [ERROR] Python was not found on this computer.
+echo [ERROR] No usable Python interpreter was found.
 echo.
-echo   Please install Python 3.10 or newer:
+echo   Please install Python 3.10 or newer (3.12 is recommended):
 echo       https://www.python.org/downloads/
 echo.
 echo   IMPORTANT: during installation, tick the checkbox
 echo              "Add Python to PATH"
 echo.
-echo   Recommended version: 3.12 (most reliable for this app)
 echo   Then double-click start-windows.bat again.
 goto end
 
 :venvfail
 echo.
-echo [ERROR] Failed to create the virtual environment (.venv).
+echo [ERROR] Failed to create or use the virtual environment (.venv).
 echo.
 echo   Please run these commands manually in this folder:
 echo       %PY% -m venv .venv
@@ -132,18 +154,16 @@ echo [ERROR] Dependency installation failed on all three sources.
 echo.
 echo   This is almost always a network problem. Options:
 echo.
-echo   1) Use a mirror permanently, then run this file again:
+echo   1) Set a mirror permanently, then run this file again:
 echo        .venv\Scripts\python.exe -m pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
 echo.
 echo   2) Install manually with a mirror:
 echo        .venv\Scripts\python.exe -m pip install -r requirements-desktop.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 echo.
-echo   3) If you see errors about building "pyyaml" from source,
-echo      you are using an OLD copy of this package. Download the
-echo      latest one: the new requirements no longer need pyyaml.
+echo   3) If errors mention building "pyyaml" from source, you are using an
+echo      old copy of this package - download the latest one.
 echo.
-echo   4) If you use Python 3.13/3.14 and it still fails, install
-echo      Python 3.12 instead - it has prebuilt packages for everything.
+echo   4) If you use Python 3.13/3.14 and it still fails, install Python 3.12.
 echo.
 
 :runfail

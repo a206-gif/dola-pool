@@ -208,6 +208,34 @@ def banner(url: str, demo: bool, data_dir: str) -> None:
 """, flush=True)
 
 
+def window_icon():
+    """按平台挑选窗口图标，并校验文件真实有效。
+
+    Windows 的 pywebview 走 .NET System.Drawing.Icon，只吃 .ico，
+    且不能是 PNG 压缩条目；传错会让应用启动即崩溃（System.ArgumentException）。
+    """
+    system = platform.system()
+    name = "app_icon.ico" if system == "Windows" else "app_icon.png"
+    path = os.path.join(HERE, "static", name)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "rb") as f:
+            head = f.read(16)
+        if system == "Windows":
+            # ICONDIR: reserved=0, type=1, count>0
+            if head[0:2] != b"\x00\x00" or head[2:4] != b"\x01\x00" or int.from_bytes(head[4:6], "little") == 0:
+                print("[desktop] 图标文件不是有效的 .ico，已忽略")
+                return None
+        elif head[:8] != b"\x89PNG\r\n\x1a\n":
+            print("[desktop] 图标文件不是有效的 .png，已忽略")
+            return None
+    except Exception as exc:
+        print(f"[desktop] 图标读取失败（已忽略）：{exc}")
+        return None
+    return path
+
+
 def open_window(url: str, title: str, size, storage_path: str, control: Control, debug: bool = False):
     """用 pywebview 打开原生窗口；返回 False 表示环境不支持（调用方回退到浏览器）。"""
     try:
@@ -229,14 +257,14 @@ def open_window(url: str, title: str, size, storage_path: str, control: Control,
         control.window = window
         # private_mode=False + storage_path：界面里的 localStorage（分镜、画布工作流、
         # 管理令牌）才会在重启后保留
-        icon = os.path.join(HERE, "static", "app_icon.png")
         kwargs = {
             "debug": debug,
             "private_mode": False,
             "storage_path": storage_path,
             "http_server": False,
         }
-        if os.path.exists(icon):
+        icon = window_icon()
+        if icon:
             kwargs["icon"] = icon
         webview.start(**kwargs)
         return True
@@ -324,16 +352,19 @@ def main(argv=None) -> int:
                          (args.width, args.height), storage_path, control, debug=args.debug)
 
     action = control.action
-    backend.stop()
 
     if not opened:
+        # 没有原生窗口（缺 GUI 库 / 窗口启动失败）：保持服务在线，改用浏览器
         if action == "quit":
+            backend.stop()
             return 0
         try:
             open_browser(backend.url)
         finally:
             backend.stop()
         return 0
+
+    backend.stop()
 
     if action == "restart":
         print("[desktop] 正在以新的运行模式重启…", flush=True)
