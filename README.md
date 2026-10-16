@@ -110,6 +110,10 @@ DOLA_DEMO=0 DOLA_ADMIN_TOKEN=你的令牌 python app.py
 # 控制台「账号池 → 批量导入」粘贴 Cookie（每行一个），然后到「生成」页提任务
 ```
 
+Cookie 就是浏览器 F12 → Network 里某个 dola.com 请求的 `Cookie:` 请求头那一行
+（形如 `sessionid=xxx; sid_guard=yyy; ...`）。粘错内容不用怕：粘贴 JSON 时会自动把
+Cookie 字段抽取出来；识别不出来会直接拒绝并说明原因，不会存成坏数据。
+
 Docker 方式：
 
 ```bash
@@ -225,7 +229,7 @@ dola-pool/
 ├── requirements.txt · Dockerfile · docker-compose.yml · .env.example
 ```
 
-自检（服务启动后执行，演示模式下约 10 秒跑完 26 项）：
+自检（服务启动后执行，演示模式下约 15 秒跑完 32 项）：
 
 ```bash
 python tools/smoke_test.py

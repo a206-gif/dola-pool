@@ -76,9 +76,9 @@ AI_API_KEY = os.getenv("AGNES_API_KEY", "").strip()
 AI_BASE_URL = os.getenv("AGNES_BASE_URL", "https://apihub.agnes-ai.com/v1").rstrip("/")
 AI_MODEL = os.getenv("AGNES_MODEL", "agnes-3.0-flash")
 DOLA_COOKIE_DOMAIN = os.getenv("DOLA_COOKIE_DOMAIN", "https://www.dola.com")
-ACCOUNT_CHECK_URL = os.getenv(
-    "DOLA_ACCOUNT_CHECK_URL", "https://www.dola.com/passport/account/info/v2/"
-)
+# 官方账号验证接口：默认留空。留空时「验活」只做本地格式检查 + 连通性探测，
+# 不会因为接口地址不对而把好账号误判为失效。知道真实接口时可自行配置。
+ACCOUNT_CHECK_URL = os.getenv("DOLA_ACCOUNT_CHECK_URL", "").strip()
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -337,23 +337,140 @@ def select_account_for_task():
     return best, f"今日已用 {best_usage}/{MAX_DAILY_PER_ACCOUNT}"
 
 
+# ---------------------------------------------------------------- Cookie 归一化
+_COOKIE_KEYS = (
+    "cookie", "cookies", "cookie_str", "cookiestr", "cookie_string", "cookiestring",
+    "cookie_header", "cookieheader", "session", "value",
+)
+_WRAPPER_KEYS = ("accounts", "data", "items", "list", "result", "results", "rows", "content")
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _cookie_from_node(node, depth: int = 0) -> list:
+    """从任意 JSON 结构里尽力提取 Cookie 字符串（支持嵌套数组/对象）。"""
+    if depth > 4:
+        return []
+    found = []
+    if isinstance(node, str):
+        text = node.strip()
+        if text and "=" in text:
+            found.append(text)
+    elif isinstance(node, dict):
+        low = {str(k).lower(): v for k, v in node.items()}
+        for key in _COOKIE_KEYS:
+            value = low.get(key)
+            if isinstance(value, str) and "=" in value:
+                found.append(value.strip())
+                break
+        else:
+            for key in _WRAPPER_KEYS:
+                if key in low:
+                    found.extend(_cookie_from_node(low[key], depth + 1))
+                    break
+    elif isinstance(node, (list, tuple)):
+        # Playwright / DevTools 风格：[{"name": "sessionid", "value": "..."}, ...]
+        pairs = []
+        for item in node:
+            if isinstance(item, dict):
+                low = {str(k).lower(): v for k, v in item.items()}
+                name, value = low.get("name"), low.get("value")
+                if isinstance(name, str) and value is not None and not isinstance(value, (dict, list)):
+                    pairs.append(f"{name}={value}")
+        if pairs:
+            found.append("; ".join(pairs))
+        else:
+            for item in node:
+                found.extend(_cookie_from_node(item, depth + 1))
+    return found
+
+
+def sanitize_cookie(raw) -> tuple:
+    """把用户粘贴的内容整理成一行合法 Cookie，返回 (cookie, 错误说明)。
+
+    能识别：纯 Cookie 文本、多行文本（取第一条）、JSON 数组/对象
+    （含 cookie / cookies / value 字段，或 name+value 键值对）。
+    这样即使把整个 JSON 文件粘进来，也不会像以前那样被当成 Cookie 存下来，
+    进而在发请求时炸出 "Invalid header value b'[\\n {\\n'"。
+    """
+    if raw is None:
+        return "", "未检测到 Cookie"
+    if not isinstance(raw, str):
+        candidates = _cookie_from_node(raw)
+        return (candidates[0], "") if candidates else ("", "内容里没有找到 Cookie 字段")
+
+    text = raw.strip()
+    if not text:
+        return "", "未检测到 Cookie"
+
+    if text[0] in "[{":
+        try:
+            data = json.loads(text)
+        except Exception as exc:  # noqa: BLE001
+            return "", f"这段内容以 JSON 开头但解析失败（{exc}）；请只粘贴 Cookie 本身"
+        candidates = _cookie_from_node(data)
+        if not candidates:
+            return "", ("识别出这是 JSON，但里面没有可用的 Cookie 字段；"
+                        "请粘贴 Cookie 本身，形如 sessionid=xxx; sid_guard=yyy")
+        text = candidates[0]
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return "", "未检测到 Cookie"
+    cookie = _CONTROL_CHARS.sub(" ", lines[0]).strip()
+    if "=" not in cookie:
+        return "", ("这不是 Cookie：缺少 name=value 结构；"
+                    "请粘贴形如 sessionid=xxx; sid_guard=yyy 的内容")
+    if len(cookie) < 8:
+        return "", "Cookie 太短，格式不完整"
+    return cookie, ""
+
+
+_probe_cache = {"at": 0.0, "result": (True, "")}
+
+
+def _probe_reachable(timeout: float = 8.0) -> tuple:
+    """轻量探测能否连通 dola.com，用来区分「网络不通」和「Cookie 无效」。"""
+    now = time.time()
+    if now - _probe_cache["at"] < 60:
+        return _probe_cache["result"]
+    url = DOLA_COOKIE_DOMAIN.rstrip("/") or "https://www.dola.com"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 DolaPool"}, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            resp.read(1)
+            result = (resp.status < 500, f"HTTP {resp.status}")
+    except urllib.error.HTTPError as exc:
+        result = (True, f"HTTP {exc.code}")  # 拿到状态码就说明网络通
+    except Exception as exc:  # noqa: BLE001
+        result = (False, f"{type(exc).__name__}: {exc}")
+    _probe_cache.update(at=now, result=result)
+    return result
+
+
 def local_account_check(account_id: int, deep: bool = True) -> dict:
-    """账号验活：本地格式检查 +（可选）调用官方接口验证 Cookie 是否有效。"""
+    """账号验活：规范化 Cookie → 本地格式检查 →（可选）联网验证。"""
     conn = db()
     row = conn.execute("select id,name,cookie from accounts where id=?", (account_id,)).fetchone()
     if not row:
         conn.close()
         return {"ok": False, "id": account_id, "state": "missing", "detail": "账号不存在"}
 
-    cookie = (row["cookie"] or "").strip()
-    if not cookie:
-        state, detail, text_ok = "invalid", "未检测到 Cookie", 0
-    elif "=" not in cookie or len(cookie) < 8:
-        state, detail, text_ok = "invalid", "Cookie 格式不完整", 0
+    stored = row["cookie"] or ""
+    cookie, problem = sanitize_cookie(stored)
+    note = ""
+    if not problem and cookie != stored.strip():
+        # 粘贴内容里包着 JSON / 多行文本：自动提取并写回，免得每次验活都报错
+        conn.execute("update accounts set cookie=? where id=?", (cookie, account_id))
+        conn.commit()
+        note = "已从粘贴内容中自动提取 Cookie；"
+
+    if problem:
+        state, detail, text_ok = "invalid", problem, 0
     elif DEMO_MODE or not deep:
-        state, detail, text_ok = "local_ready", "本地格式检查通过（演示模式未联网验证）", 1
+        state, detail, text_ok = "local_ready", note + "本地格式检查通过（演示模式未联网验证）", 1
     else:
         state, detail, text_ok = _remote_account_check(cookie)
+        detail = note + detail
 
     checked = utcnow()
     conn.execute(
@@ -375,29 +492,40 @@ def local_account_check(account_id: int, deep: bool = True) -> dict:
 
 
 def _remote_account_check(cookie: str) -> tuple:
-    req = urllib.request.Request(
-        ACCOUNT_CHECK_URL,
-        headers={
-            "Cookie": cookie,
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-            "Accept": "application/json, text/plain, */*",
-        },
-    )
+    """联网验证 Cookie；未配置官方验证接口时退化为「能否连通 dola.com」。"""
+    if not ACCOUNT_CHECK_URL:
+        reachable, detail = _probe_reachable()
+        if reachable:
+            return ("local_ready",
+                    "本地格式通过；dola.com 可达（未配置官方验证接口，无法确认 Cookie 是否有效）", 1)
+        return ("unknown",
+                f"本地格式通过；但连不上 dola.com（{detail}）——请检查网络 / VPN / 代理", 1)
+
+    headers = {
+        "Cookie": cookie,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+    }
     try:
+        req = urllib.request.Request(ACCOUNT_CHECK_URL, headers=headers)
         with urllib.request.urlopen(req, timeout=20) as resp:
             body = resp.read().decode("utf-8", "replace")
-        if '"error"' in body and '"code":0' not in body.replace(" ", ""):
-            return "invalid", f"接口返回异常：{body[:120]}", 0
-        return "ready", "官方接口验证通过", 1
+    except ValueError as exc:
+        # http.client 对非法请求头（含换行等）抛 ValueError
+        return "invalid", f"Cookie 无法作为请求头发送：{exc}", 0
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):
             return "invalid", f"Cookie 已失效（HTTP {exc.code}）", 0
         if exc.code == 429:
             return "rate_limited", "被限流，稍后重试", 1
-        return "unknown", f"HTTP {exc.code}", 1
-    except Exception as exc:
-        return "unknown", f"联网检查失败：{exc}", 1
+        return "unknown", f"验证接口返回 HTTP {exc.code}（检查 DOLA_ACCOUNT_CHECK_URL 是否正确）", 1
+    except Exception as exc:  # noqa: BLE001
+        return "unknown", f"联网检查失败：{exc}（请检查网络 / VPN / 代理）", 1
+
+    if '"error"' in body and '"code":0' not in body.replace(" ", ""):
+        return "invalid", f"接口返回异常：{body[:120]}", 0
+    return "ready", "官方接口验证通过", 1
 
 
 def ensure_demo_account() -> int:
@@ -983,9 +1111,9 @@ def api_accounts() -> list:
 async def api_add_account(request: Request):
     x = await request.json()
     name = (x.get("name") or "").strip() or f"账号 {utcnow()[:16]}"
-    cookie = (x.get("cookie") or "").strip()
-    if not cookie:
-        return JSONResponse({"error": "请填写 Cookie"}, 400)
+    cookie, problem = sanitize_cookie(x.get("cookie"))
+    if problem:
+        return JSONResponse({"error": problem}, 400)
     conn = db()
     cur = conn.execute(
         "insert into accounts(name,cookie,points,created_at,note) values(?,?,?,?,?)",
@@ -1059,14 +1187,26 @@ async def api_import(request: Request, file: UploadFile = File(None), cookies: s
     except Exception as exc:  # noqa: BLE001
         return JSONResponse({"error": f"解析失败：{exc}"}, 400)
 
+    # Playwright / DevTools 导出的形式：一组 {"name":..., "value":...} 属于同一个账号
+    if items and all(isinstance(i, dict) and "name" in i and "value" in i for i in items):
+        joined = "; ".join(
+            f"{i['name']}={i['value']}" for i in items
+            if not isinstance(i["value"], (dict, list)) and i.get("name")
+        )
+        items = [{"cookie": joined}] if joined else []
+
     conn = db()
-    added = 0
+    added, skipped, reasons = 0, 0, []
     for i, item in enumerate(items, 1):
         item = {"cookie": item} if isinstance(item, str) else item
         if not isinstance(item, dict):
             continue
-        cookie = item.get("cookie") or item.get("cookies") or item.get("value") or ""
-        if not cookie:
+        raw = item.get("cookie") or item.get("cookies") or item.get("value") or item
+        cookie, problem = sanitize_cookie(raw)
+        if problem:
+            skipped += 1
+            if len(reasons) < 3:
+                reasons.append(problem)
             continue
         conn.execute(
             "insert into accounts(name,cookie,created_at,note) values(?,?,?,?)",
@@ -1075,8 +1215,8 @@ async def api_import(request: Request, file: UploadFile = File(None), cookies: s
         added += 1
     conn.commit()
     conn.close()
-    audit("account.import", str(added))
-    return {"ok": True, "count": added}
+    audit("account.import", f"ok={added} skipped={skipped}")
+    return {"ok": True, "count": added, "skipped": skipped, "reasons": reasons}
 
 
 # ---------------------------------- 任务 ----------------------------------

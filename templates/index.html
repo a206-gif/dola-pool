@@ -786,7 +786,8 @@ async function pageAccounts(){
 function addAccount(){
   formModal('新增 Dola 账号', [
     {key:'name', label:'名称', placeholder:'例：账号 A'},
-    {key:'cookie', label:'Cookie', type:'textarea', placeholder:'sessionid=...; sid_guard=...'},
+    {key:'cookie', label:'Cookie', type:'textarea', placeholder:'sessionid=...; sid_guard=...',
+     hint:'只填 Cookie 本身；粘贴 JSON 文件内容也会自动识别提取'},
     {key:'verify', label:'立即联网验活', type:'select', options:['否','是'], value:'否'},
   ], async (d) => {
     await api('api/accounts', {method:'POST', headers:{'Content-Type':'application/json'},
@@ -795,7 +796,8 @@ function addAccount(){
   });
 }
 function importAccounts(){
-  openModal('批量导入账号', '<p class="muted">粘贴 Cookie（每行一个），或选择 .txt / .csv / .json 文件</p>' +
+  openModal('批量导入账号', '<p class="muted">粘贴 Cookie（每行一个），或选择 .txt / .csv / .json 文件；' +
+    'JSON 会自动识别其中的 cookie 字段与 name/value 键值对。</p>' +
     '<textarea id="impCookies" style="min-height:170px" placeholder="sessionid=...\nsessionid=..."></textarea>' +
     '<div style="margin-top:12px"><input type="file" id="impFile" accept=".txt,.csv,.json"></div>' +
     '<div class="foot"><button class="btn" onclick="closeModal()">取消</button>' +
@@ -807,7 +809,11 @@ function importAccounts(){
     if (f) fd.append('file', f);
     try {
       const r = await api('api/import', {method:'POST', body: fd});
-      closeModal(); toast('已导入 ' + r.count + ' 个账号'); render();
+      closeModal();
+      let msg = '已导入 ' + r.count + ' 个账号';
+      if (r.skipped) msg += '，跳过 ' + r.skipped + ' 条' + (r.reasons && r.reasons[0] ? '（' + r.reasons[0] + '）' : '');
+      toast(msg, !r.count);
+      render();
     } catch(e){ toast(e.message, true); }
   };
 }

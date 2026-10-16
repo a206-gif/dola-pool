@@ -27,6 +27,11 @@ Linux   ：终端执行  ./start-linux.sh
 2. 点【切换到生产模式】→ 窗口会自动重启（几秒钟）
 3. 左侧【账号池】→【批量导入】→ 粘贴你的 Dola 账号 Cookie
    （每行一个，或拖入 .txt / .csv / .json 文件）
+
+   Cookie 从哪来：浏览器 F12 → Network（网络）→ 随便点一个 dola.com
+   的请求 → Request Headers 里的 "Cookie:" 后面那一整行
+   （形如 sessionid=xxxxx; sid_guard=yyyyy; ... 是一段带分号的文本，
+    不是 JSON）。
 4. 左侧【生成】→ 填提示词 → 【提交任务】
 
 注意：生产模式会真实调用 Dola 生成，需要账号自身有可用额度；
@@ -163,12 +168,35 @@ Linux   ：终端执行  ./start-linux.sh
    现在这里会正常显示 Python 版本号。
 
 
+【最常见 4】验活/检查账号时报错，提示里出现：
+   联网检查失败：Invalid header value b'[\n {\n'
+   （或 Invalid header value、http.client.InvalidURL 之类）
+
+   原因：账号的 Cookie 字段里存的其实是**一段 JSON 文本**，
+        不是 Cookie 本身。常见于直接把导出的 .json 文件、
+        浏览器插件导出的 {"name":..,"value":..} 数组当 Cookie 粘了进来。
+        验活时这段 JSON 被当成 HTTP 请求头发出去，Python 就直接报错。
+        （这跟有没有开 VPN 无关。）
+
+   新版已解决：
+   1) 粘贴 JSON 时会自动从里面把 Cookie 抽出来再保存，
+      验活时如果发现是历史遗留的坏数据，也会自动提取并修好，
+      并在提示里告诉你「已从粘贴内容中自动提取 Cookie」。
+   2) 识别不了内容时会直接拒绝并说明原因，不会再抛那句天书报错。
+
+   如果看到下面这句，说明粘贴的内容里确实没有 Cookie：
+     识别出这是 JSON，但里面没有可用的 Cookie 字段
+   —— 请按上面第「二」节第 3 步重新复制 Cookie 文本。
+
+
 【其它】
 · start-windows.bat 里的提示是英文的 → 因为中文写在批处理里会导致乱码
   甚至窗口闪退（编码问题），所以批处理里只用英文；中文说明就是本文件。
 · 提示 GTK/QT 加载失败    → Linux 缺 GUI 库，用 --browser 参数先跑起来
                            或 sudo apt install python3-gi gir1.2-webkit2-4.1
 · 任务一直是"失败"        → 检查【账号池】里有没有导入可用 Cookie
+· 导入后账号一直"检查中"  → 联网验活依赖 Dola 官方接口，接口没配置时
+                            只做本地格式检查，不影响提交任务
 · 想要更多说明            → 见 README.md
 
 

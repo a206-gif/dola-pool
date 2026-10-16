@@ -24,6 +24,20 @@ TOKEN = os.getenv("DOLA_ADMIN_TOKEN", "")
 PASS, FAIL = [], []
 
 
+def _local_db_path():
+    """本地服务时返回数据库路径，用于构造“历史坏数据”用例。"""
+    if not BASE.startswith(("http://127.0.0.1", "http://localhost")):
+        return None
+    candidates = [
+        os.getenv("DOLA_DB", ""),
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "dola.db"),
+    ]
+    for path in candidates:
+        if path and os.path.exists(path):
+            return path
+    return None
+
+
 def call(method, path, data=None, files=None, raw=False, timeout=60):
     url = BASE + path
     headers = {"X-Admin-Token": TOKEN} if TOKEN else {}
@@ -101,6 +115,46 @@ def main():
     status, tasks = call("GET", "/api/tasks")
     check("任务列表 / 进度字段完整", status == 200 and any(t.get("video_url") for t in tasks))
 
+    print("\n== Cookie 规范化（防止把 JSON 当成 Cookie）==")
+    json_paste = json.dumps([{"name": "账号A", "cookie": "sessionid=REAL_COOKIE; sid_guard=abc"}],
+                            ensure_ascii=False, indent=1)
+    status, acc2 = call("POST", "/api/accounts", {"name": "JSON 粘贴", "cookie": json_paste})
+    check("粘贴 JSON 时自动提取 Cookie 建号", status == 200 and acc2.get("ok"), acc2)
+    acc2_id = acc2.get("id") if isinstance(acc2, dict) else None
+    if acc2_id:
+        status, chk = call("POST", "/api/accounts/%s/check" % acc2_id)
+        detail = str(chk.get("detail", ""))
+        check("验活返回可读结果，不再出现 Invalid header value",
+              status == 200 and "Invalid header" not in detail, detail)
+
+    # 模拟「升级前就已存进去的坏数据」：直接写库，再验活应自动修复
+    db_path = _local_db_path()
+    if db_path:
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        conn.execute("insert into accounts(name,cookie,created_at) values(?,?,?)",
+                     ("旧格式坏数据", json_paste, "2026-01-01T00:00:00Z"))
+        legacy_id = conn.execute("select last_insert_rowid()").fetchone()[0]
+        conn.commit()
+        conn.close()
+        status, chk2 = call("POST", "/api/accounts/%s/check" % legacy_id)
+        check("历史坏数据在验活时被自动修复",
+              status == 200 and "自动提取" in str(chk2.get("detail", "")), chk2.get("detail"))
+        call("DELETE", "/api/accounts/%s" % legacy_id)
+    else:
+        check("历史坏数据自动修复", True, "服务非本地，跳过")
+    status, bad = call("POST", "/api/accounts", {"name": "坏数据", "cookie": '[\n {\n "x": 1\n}\n]'})
+    check("无法提取的 JSON 被拒绝并给出可读提示",
+          status == 400 and "JSON" in str(bad), bad)
+    status, imp2 = call("POST", "/api/import", {"cookies": json.dumps(
+        [{"note": "没有 cookie 字段"}, "sessionid=good; sid_guard=x"], ensure_ascii=False)})
+    check("导入时跳过无 Cookie 条目、保留有效条目",
+          status == 200 and imp2.get("count") == 1 and imp2.get("skipped") == 1, imp2)
+    status, imp3 = call("POST", "/api/import", {"cookies": json.dumps(
+        [{"name": "sessionid", "value": "AAA"}, {"name": "sid_guard", "value": "BBB"}])})
+    check("支持 name/value 键值对形式（Playwright 导出）",
+          status == 200 and imp3.get("count") == 1, imp3)
+
     print("\n== AI 分镜推理 ==")
     status, ai = call("POST", "/api/ai-reason", {"script": "女孩等在便利店门口。男生递上雨伞，两人并肩走远。",
                                                  "style": "movie quality", "duration": 15})
@@ -152,6 +206,8 @@ def main():
     call("DELETE", "/api/workflows/%s" % wf["id"])
     if account_id:
         call("DELETE", "/api/accounts/%s" % account_id)
+    if isinstance(locals().get("acc2"), dict) and acc2.get("id"):
+        call("DELETE", "/api/accounts/%s" % acc2["id"])
     check("自检数据已清理", True)
 
     print("\n================ 结果 ================")
