@@ -26,6 +26,29 @@ import shutil
 import subprocess
 import sys
 
+
+def _make_output_robust() -> None:
+    """让中文输出在 Windows 控制台上不再抛 UnicodeEncodeError。
+
+    背景：GitHub 的 Windows 机器上 stdout 是 cp1252，脚本第一行中文就崩，
+    表现为「打包步骤 1 秒失败、看不到任何 PyInstaller 输出」，很难查。
+    CI 里强制 UTF-8（日志/注解按 UTF-8 采集）；本地保留控制台编码（中文正常显示），
+    只把编码不下的字符替换掉。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if stream is None:
+            continue
+        try:
+            if os.getenv("GITHUB_ACTIONS"):
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            else:
+                stream.reconfigure(errors="replace")
+        except Exception:  # noqa: BLE001
+            pass
+
+
+_make_output_robust()
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENTRY = os.path.join(ROOT, "desktop.py")
 NAME = "DolaPool"

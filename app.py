@@ -54,7 +54,7 @@ from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
                                RedirectResponse, Response)
 from fastapi.staticfiles import StaticFiles
 
-VERSION = "2.0.6"
+VERSION = "2.0.7"
 
 # --------------------------------------------------------------------------
 # 目录与配置

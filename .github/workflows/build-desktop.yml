@@ -25,6 +25,9 @@ jobs:
   build:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    env:
+      PYTHONUTF8: "1"                 # Windows 上把默认编码改成 UTF-8
+      PYTHONIOENCODING: "utf-8"       # 否则打印中文会抛 UnicodeEncodeError
     timeout-minutes: 30          # 防止某一步卡死跑到 6 小时（曾因 --help 不自退卡住）
     strategy:
       fail-fast: false
@@ -75,6 +78,24 @@ jobs:
             cp -r dist/DolaPool out/
           fi
           ls -la out/ | head -20
+
+      - name: 失败诊断（写成注解，便于不用登录网页也能定位）
+        if: failure()
+        shell: bash
+        run: |
+          {
+            echo "=== build/pyinstaller.log 尾部 ==="
+            tail -25 build/pyinstaller.log 2>/dev/null || echo "(没有 build/pyinstaller.log)"
+            echo "=== 环境 ==="
+            python -c "import sys,platform;print(sys.version.split()[0], platform.platform())" 2>&1 | tail -1 || true
+            python -c "import PyInstaller;print('PyInstaller',PyInstaller.__version__)" 2>&1 | tail -1 || true
+            python -c "import PIL;print('Pillow',PIL.__version__)" 2>&1 | tail -1 || true
+            pip list 2>/dev/null | grep -iE "pywebview|pythonnet|clr" || true
+          } > /tmp/diag.txt 2>&1
+          echo "---- 诊断 ----"
+          tail -60 /tmp/diag.txt
+          MSG=$(tr '\n' '|' < /tmp/diag.txt | cut -c1-900)
+          echo "::error title=打包诊断::${MSG}"
 
       - uses: actions/upload-artifact@v4
         with:
