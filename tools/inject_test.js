@@ -75,17 +75,21 @@ if (targetUrl) {
   runBehaviourTests();
 }
 
-function runBehaviourTests() {
+async function runBehaviourTests() {
 
 const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', {
   url: 'http://127.0.0.1:9999' + P + '/chat/',
   runScripts: 'dangerously',
   virtualConsole: vc,
   beforeParse(w) {
-    w.__DLP__ = { prefix: P, label: '账号 #2 测试', real: 'https://www.dola.com/' };
+    w.__DLP__ = { prefix: P, label: '账号 #2 测试', real: 'https://www.dola.com/', desktop: true };
     const reqs = [];
     w.__reqs = reqs;
-    w.fetch = function (u) { reqs.push('fetch:' + u); return Promise.resolve({ status: 200, url: String(u) }); };
+    w.fetch = function (u) {
+      reqs.push('fetch:' + u);
+      return Promise.resolve({ ok: true, status: 200, url: String(u) });
+    };
+    w.open = function (u) { reqs.push('open:' + u); return null; };
     // 用 prototype 形式模拟真实 XHR，否则覆写 XMLHttpRequest.prototype.open 测不到
     function FakeXHR() {}
     FakeXHR.prototype.open = function (mm, u) { reqs.push('xhr:' + u); };
@@ -172,6 +176,32 @@ const logOk = barOk && !!d.getElementById('dlp-log');
 t('提示条已生成', barOk, true);
 t('提示条含「用系统浏览器打开」', btnOk, true);
 t('提示条含错误日志面板（展开能看到白屏原因）', logOk, true);
+
+// 「用系统浏览器打开」：桌面版走本机 HTTP 端点（/api/desktop/open-external），
+// 不再调 window.pywebview.api —— 真机上把 Python 对象暴露给页面会让 pywebview
+// 的注入桥递归遍历对象图，把整个进程搞崩（满屏 Empty. + 递归爆栈）。
+t('代理页脚本不再依赖 window.pywebview（真机崩溃根因）',
+  src.indexOf('window.pywebview') < 0 && src.indexOf('pywebview.api') < 0, true);
+const acts = Array.from(d.querySelectorAll('#dlp-bar .dlp-act'));
+const extBtn = acts.find(el => el.textContent.indexOf('用系统浏览器打开') >= 0);
+t('提示条上有「用系统浏览器打开」按钮', !!extBtn, true);
+if (extBtn) {
+  const before = (w.__reqs || []).length;
+  extBtn.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+  await Promise.resolve();
+  const added = (w.__reqs || []).slice(before);
+  out.push(['桌面版点它 → 请求本机端点 /api/desktop/open-external',
+    added.some(u => String(u).indexOf('fetch:/api/desktop/open-external?url=') === 0),
+    added.join(' | ')]);
+  // Web 版（没有本机端点）→ 老老实实新开标签页
+  w.__DLP__.desktop = false;
+  const before2 = (w.__reqs || []).length;
+  extBtn.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+  const added2 = (w.__reqs || []).slice(before2);
+  out.push(['Web 版点它 → 直接新开标签页（不请求端点）',
+    added2.some(u => String(u).indexOf('open:') === 0) && !added2.some(u => String(u).indexOf('fetch:') === 0),
+    added2.join(' | ')]);
+}
 
 // 前端框架渲染失败往往只写 console.error（页面白屏但没有任何异常抛出），
 // 所以注入脚本必须把它也记进诊断面板，否则白屏时点 ⚠ 什么都看不到

@@ -13,6 +13,7 @@
   5. /api/desktop/reveal 路径映射与越权拦截
   6. 账号窗口：把 Cookie 写进浏览器内核（用假的 WebView2 对象验证，不需要真 GUI）
   7. 内核网络：代理（含账号密码 → 本机中转）、参数生成、真站自检与诊断页
+  8. 窗口里不暴露任何 Python 对象（js_api 必须为空）+「用系统浏览器打开」端点白名单
 """
 from __future__ import annotations
 
@@ -28,6 +29,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -52,7 +54,11 @@ def call(method, path, payload=None, timeout=10):
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.status, json.loads(r.read() or b"null")
+            body = r.read()
+            try:
+                return r.status, json.loads(body or b"null")
+            except Exception:                     # 有的端点回的是 HTML（如「已交给系统浏览器」）
+                return r.status, body[:200].decode("utf-8", "replace")
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read()[:200].decode("utf-8", "replace")
     except Exception as exc:  # noqa: BLE001
@@ -202,9 +208,18 @@ def fake_webview_module():
     mod = types.ModuleType("webview")
     mod.guilib = object()          # 假装 GUI 循环已就绪
     mod.windows = []
+    mod.injected = []              # pywebview 的注入函数被调用的记录
+
+    def inject_pywebview(platform, win):
+        """模拟 pywebview 各平台后端里的注入（真机崩溃现场就是它）。"""
+        mod.injected.append(win)
+
+    inject_pywebview._orig_name = "fake"
+    mod.inject_pywebview = inject_pywebview
 
     def create_window(title, url, **kwargs):
         win = FakePyWindow(title, url)
+        win.kwargs = kwargs          # 测试要检查有没有传 js_api（传了会把进程搞崩）
         mod.windows.append(win)
         return win
 
@@ -701,8 +716,6 @@ def network_checks():
               "真站没能在窗口里显示" in page and "about:blank" in page, "诊断页已显示")
         check("诊断页里带上了内核网络说明（代理还是直连）",
               "127.0.0.1:1234" in page, "ok")
-        check("诊断页里有三个按钮（改看本机代理页 / 重开真站 / 系统浏览器）",
-              page.count("dlp('") >= 3, page.count("dlp('"))
         check("标题栏明说真站打不开", w.title.endswith("真站打不开（窗口里有说明）"), w.title)
 
         # h) 注入成功且真站渲染出来 → 不显示诊断页，标题保持 dola.com
@@ -723,24 +736,42 @@ def network_checks():
               and w2.title.endswith("· dola.com")
               and w2.loaded[:1] == ["https://www.dola.com/chat/"], (w2.title, w2.loaded))
 
-        # i) 诊断页上的三个按钮（js_api）真的能用
-        api = desktop._WebWindowApi()
-        api.attach(w2, "http://127.0.0.1:8099/dola-web/8/", "https://www.dola.com/chat/")
-        r1 = api.show_proxy_page()
-        r2 = api.retry_real()
-        opened = {}
-        real_browser = desktop._open_in_browser
-        desktop._open_in_browser = lambda u: opened.setdefault("url", u)
-        try:
-            r3 = api.open_local()
-        finally:
-            desktop._open_in_browser = real_browser
-        check("诊断页按钮：改看本机代理页 / 重开真站 / 用系统浏览器打开都可用",
-              r1.get("ok") and r2.get("ok") and r3.get("ok")
-              and opened.get("url") == "http://127.0.0.1:8099/dola-web/8/",
-              (r1, r2, r3, opened))
-        check("外部打开仍然只放行本机地址",
-              api.open_external("https://evil.example/").get("ok") is False, "ok")
+        # i) 窗口里不能暴露任何 Python 对象（真机崩溃根因的回归防护）
+        check("账号窗口不传 js_api（暴露对象会被 pywebview 注入桥递归遍历 → 进程崩）",
+              w.kwargs.get("js_api") is None and w2.kwargs.get("js_api") is None,
+              (w.kwargs, w2.kwargs))
+        check("账号窗口不暴露任何叫 api 的 Python 对象（window.pywebview.api 不存在）",
+              not hasattr(desktop, "_WebWindowApi"), "无 _WebWindowApi")
+        # 后端在「页面导航完成」时会调 inject_pywebview —— 这里模拟它：
+        # 账号窗口必须被跳过（真站页面里不留任何我们的东西）
+        mod = sys.modules["webview"]
+        mod.injected.clear()
+        mod.inject_pywebview("fake", w2)                 # 带标记的账号窗口
+        check("账号窗口连注入脚本都跳过（真站页面里不留 window.pywebview）",
+              mod.injected == [] and getattr(w2, "_dlp_no_inject", False),
+              "被注入的窗口：%s" % mod.injected)
+
+        # 没打标记的窗口（主窗口 / 控制台界面）必须照旧注入，别把功能弄没了
+        class _PlainWin:
+            class _Ev:
+                def set(self):
+                    pass
+
+            events = _Ev()
+            _dlp_no_inject = False
+
+        mod.inject_pywebview("fake", _PlainWin())
+        check("没打标记的窗口照常注入（主窗口功能不受影响）",
+              len(mod.injected) == 1 and not getattr(mod.injected[-1], "_dlp_no_inject", False),
+              "被注入的窗口数 %d" % len(mod.injected))
+        page2 = getattr(w2, "html_shown", "") or ""
+        check("诊断页的按钮是普通链接（不依赖注入脚本 / JS 桥）",
+              'href="http://127.0.0.1:8099/dola-web/7/"' in page
+              and 'href="https://www.dola.com/chat/"' in page
+              and "javascript:dlp" not in page and "pywebview" not in page.lower(),
+              "链接写法")
+        check("诊断页的「用系统浏览器打开」指向本机端点（桌面进程去开系统浏览器）",
+              "/api/desktop/open-external?url=" in page, "端点链接")
     finally:
         desktop._inspect_real_site = _REAL_INSPECT
         if real_mod is not None:
@@ -854,6 +885,16 @@ def main():
         status, res = call("POST", "/api/desktop/reveal", {"path": "/output/task_demo.mp4"})
         check("静态 URL 被解析到成片目录（无文件时返回打开失败而非越权）",
               status in (200, 500) and "允许范围" not in str(res), str(res)[:120])
+
+        print("\n== 5b. 用系统浏览器打开的端点（账号窗口按钮走这条路）==")
+        status, res = call("GET", "/api/desktop/open-external?url=" + urllib.parse.quote("https://evil.example/"))
+        check("非白名单地址被拒绝（这个端点不能当打开任意网址的开关）", status == 400, str(res)[:90])
+        status, res = call("GET", "/api/desktop/open-external?url=" + urllib.parse.quote("file:///etc/passwd"))
+        check("file:// 之类被拒绝", status == 400, str(res)[:90])
+        status, res = call("GET", "/api/desktop/open-external?url=" + urllib.parse.quote(BASE + "/dola-web/1/"))
+        check("本机地址被放行（会交给系统浏览器，沙箱里打不开也不报错）", status == 200, str(res)[:60])
+        status, res = call("GET", "/api/desktop/open-external?url=" + urllib.parse.quote("https://www.dola.com/chat/"))
+        check("dola.com 被放行", status == 200, str(res)[:60])
 
         print("\n== 6. 账号窗口的 Cookie 注入（假 WebView2）==")
         cookie_injection_checks()

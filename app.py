@@ -41,7 +41,6 @@ import threading
 import time
 import urllib.error
 import urllib.parse
-import urllib.parse
 import urllib.request
 
 try:  # 反向代理用；requirements.txt 已包含 requests
@@ -54,7 +53,7 @@ from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
                                RedirectResponse, Response)
 from fastapi.staticfiles import StaticFiles
 
-VERSION = "2.0.10"
+VERSION = "2.0.11"
 
 # --------------------------------------------------------------------------
 # 目录与配置
@@ -1758,6 +1757,52 @@ async def api_desktop_mode(request: Request):
             "detail": "已写入配置，下次启动生效"}
 
 
+_EXTERNAL_ALLOW_HOSTS = ("127.0.0.1", "localhost", "::1", "[::1]")
+
+
+def _external_url_allowed(url: str) -> bool:
+    """只允许「本机地址」和 dola.com —— 免得这个端点被当成打开任意网址的开关。"""
+    try:
+        u = urllib.parse.urlsplit(str(url or "").strip())
+    except Exception:  # noqa: BLE001
+        return False
+    if u.scheme not in ("http", "https") or not u.hostname:
+        return False
+    host = u.hostname.lower()
+    if host in _EXTERNAL_ALLOW_HOSTS:
+        return True
+    return host == "dola.com" or host.endswith(".dola.com")
+
+
+@app.get("/api/desktop/open-external")
+def api_desktop_open_external(url: str = ""):
+    """让桌面进程用**系统浏览器**打开一个地址（账号窗口底栏 / 诊断页的按钮走这里）。
+
+    为什么要有这个端点：账号窗口里不再暴露任何 Python 对象（js_api），所以
+    「用系统浏览器打开」改成一次普通的本机 HTTP 请求 —— 页面卡死时它照样能用。
+    """
+    if not DESKTOP_MODE or not _control_hook:
+        return JSONResponse({"error": "非桌面版：请直接用浏览器打开该地址"}, 404)
+    target = (url or "").strip()
+    if not _external_url_allowed(target):
+        return JSONResponse({"error": "只允许打开本机地址或 dola.com"}, 400)
+    try:
+        _control_hook("open_external", {"url": target})
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"error": str(exc)}, 500)
+    audit("desktop.open_external", target[:200])
+    return HTMLResponse(
+        "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
+        "<title>已交给系统浏览器</title><style>html,body{margin:0;height:100%%;background:#0a0f11;"
+        "color:#c9d8d6;font:14px/1.7 -apple-system,'Segoe UI','PingFang SC',sans-serif;"
+        "display:flex;align-items:center;justify-content:center;text-align:center}</style></head>"
+        "<body><div><div>已经用<b>系统浏览器</b>打开了这个地址：</div>"
+        "<div style=\"font-family:ui-monospace,Consolas,monospace;font-size:12.5px;"
+        "opacity:.8;margin-top:8px;word-break:break-all\">%s</div>"
+        "<div style=\"opacity:.6;margin-top:14px\">这个窗口可以直接关掉。</div>"
+        "</div></body></html>" % _html_escape(target))
+
+
 @app.post("/api/desktop/quit")
 def api_desktop_quit():
     if not _control_hook:
@@ -1953,9 +1998,14 @@ _PROXY_JS = r"""/* Dola Pool 本地代理：注入页面的运行时脚本（单
   var P = C.prefix || '';
   var RE = /^(?:https?:)?\/\/(?:[\w-]+\.)*dola\.com(?![\w.-])/i;
 
+  // 本机服务自己的端点（/api/desktop/open-external 等）不能被拉回代理前缀，
+  // 否则请求会打到代理页本身上（底栏按钮就点不动了）
+  var LOCAL_API = /^\/api\/desktop\//;
+
   // 把 dola 绝对地址、协议相对地址、站内绝对路径统一拉回本地代理
   function fix(u) {
     if (typeof u !== 'string' || !u) return u;
+    if (LOCAL_API.test(u)) return u;
     if (u.indexOf(P + '/') === 0 || u === P) return u;
     var m = u.match(RE);
     if (m) return P + u.slice(m[0].length);
@@ -2168,15 +2218,23 @@ _PROXY_JS = r"""/* Dola Pool 本地代理：注入页面的运行时脚本（单
   } catch (e) {}
 
   // ---------------------------------------------------------------- 底部提示条
+  // 桌面版：交给本机服务的一个 HTTP 端点去开系统浏览器（不发 pywebview 调用 ——
+  // 真机上把 Python 对象暴露给页面会让注入桥递归遍历对象图，把进程搞崩）
   function inDesktop() {
-    return !!(window.pywebview && window.pywebview.api && window.pywebview.api.open_external);
+    return !!(C.desktop && window.fetch);
   }
 
   function openExternal() {
     var url = location.href;
     if (inDesktop()) {
-      try { window.pywebview.api.open_external(url); return; } catch (e) {}
+      try {
+        fetch('/api/desktop/open-external?url=' + encodeURIComponent(url))
+          .then(function (r) { if (!r.ok) throw new Error('endpoint ' + r.status); })
+          .catch(function () { try { window.open(url, '_blank'); } catch (e) {} });
+        return;
+      } catch (e) {}
     }
+    // Web 版（或端点不通）：直接新开标签页
     try { window.open(url, '_blank'); } catch (e) {}
   }
   window.__dlpOpenExternal = openExternal;
@@ -2266,6 +2324,7 @@ def _proxy_snippet(account_id: int, account: dict) -> str:
         "prefix": _proxy_prefix(account_id),
         "label": "账号 #%s %s" % (account_id, (account.get("name") or "").strip()),
         "real": DOLA_WEB_BASE + "/",
+        "desktop": bool(DESKTOP_MODE),      # 底栏的「用系统浏览器打开」据此决定走端点还是开标签
     })
     # 注意：_PROXY_JS 是纯 JS（方便 tools/inject_test.js 直接抠出来 eval），
     # 这里必须自己补 <script> 标签 —— 漏了的话浏览器会把整段代码当文本显示出来

@@ -184,50 +184,20 @@ class Backend:
             self.thread.join(timeout=8)
 
 
-class _WebWindowApi:
-    """账号网页窗口能调用的少量能力（诊断页上的按钮就走这里）。
-
-    只做本机地址相关的事，免得页面脚本借这个口子去开任意网址。
-    """
-
-    def __init__(self):
-        self.win = None
-        self.local_url = ""
-        self.real_url = ""
-
-    def attach(self, win, local_url: str, real_url: str) -> None:
-        self.win, self.local_url, self.real_url = win, local_url or "", real_url or ""
-
-    def show_proxy_page(self) -> dict:
-        """真站渲染不出来时，改看本机代理页（服务端带着这个账号的 Cookie 去取）。"""
-        if self.win is None or not self.local_url:
-            return {"ok": False, "detail": "没有可用的本机代理页"}
-        try:
-            self.win.load_url(self.local_url)
-        except Exception as exc:  # noqa: BLE001
-            return {"ok": False, "detail": str(exc)}
-        return {"ok": True, "url": self.local_url}
-
-    def retry_real(self) -> dict:
-        """再打开一次真站（比如刚把代理配上）。"""
-        if self.win is None or not self.real_url:
-            return {"ok": False, "detail": "没有可用的真站地址"}
-        try:
-            self.win.load_url(self.real_url)
-        except Exception as exc:  # noqa: BLE001
-            return {"ok": False, "detail": str(exc)}
-        return {"ok": True, "url": self.real_url}
-
-    def open_local(self) -> dict:
-        """把本机代理页丢到系统浏览器里开（那个浏览器走系统代理，常能看到页面）。"""
-        return self.open_external(self.local_url)
-
-    def open_external(self, url: str = "") -> dict:
-        target = str(url or "").strip()
-        if not target.startswith(("http://127.0.0.1", "http://localhost", "http://[::1]")):
-            return {"ok": False, "detail": "只允许打开本机地址"}
-        _open_in_browser(target)
-        return {"ok": True, "url": target}
+# --------------------------------------------------------------------------
+# 账号窗口不给页面暴露任何 Python 对象（血泪教训）
+#
+# 真机上「随便点一处就未响应 + 控制台满屏 Empty. + maximum recursion depth
+# exceeded + 退出码 -805306369(0xCFFFFFFF，Windows 栈溢出)」的根因：
+# 之前给账号窗口传了 js_api（一个带 .win 属性、指向 pywebview Window 的对象），
+# 而 pywebview 每次页面导航完成都会调 inject_pywebview() → get_functions()
+# **递归 getattr 遍历整个 js_api 对象图**（Window → events → native → WinForms
+# 的 WebView2 控件 → 每个 .NET 属性），在 UI 线程上边走边取属性值，最终把栈走爆，
+# 整个进程直接死掉。点一下页面就可能触发导航 → 于是「随便点一处就崩」。
+#
+# 所以账号窗口现在**不传 js_api**（window.pywebview.api 不存在），诊断页上的
+# 操作全部用普通链接 + 本机的 HTTP 端点（/api/desktop/open-external）实现。
+# --------------------------------------------------------------------------
 
 
 # --------------------------------------------------------------------------
@@ -473,6 +443,50 @@ class _LocalProxyTunnel:
                     pass
 
 
+def _wrap_injection_skip() -> int:
+    """把各 pywebview 模块里的 inject_pywebview 包一层，支持「这个窗口别注入」。
+
+    幂等：重复调用只包装一次。返回包装了几个模块（0 表示没有 pywebview，无所谓）。
+    """
+    done = 0
+    for name, mod in list(sys.modules.items()):
+        if not name.startswith("webview") or mod is None:
+            continue
+        orig = getattr(mod, "inject_pywebview", None)
+        if orig is None or getattr(orig, "_dlp_wrapped", False):
+            continue
+
+        def wrapper(platform, win, _orig=orig):
+            if getattr(win, "_dlp_no_inject", False):
+                try:                     # pywebview 内部在等这个事件，必须补上
+                    win.events.loaded.set()
+                except Exception:  # noqa: BLE001
+                    pass
+                return None
+            return _orig(platform, win)
+
+        wrapper._dlp_wrapped = True
+        try:
+            setattr(mod, "inject_pywebview", wrapper)
+            done += 1
+        except Exception:  # noqa: BLE001
+            pass
+    return done
+
+
+def _skip_injection_for(window) -> bool:
+    """给这个窗口打标记：不要往它的页面里注入 pywebview 脚本。
+
+    账号窗口打开的是**别人家的正式站点**（dola.com），不该往里塞东西；而且注入桥
+    正是真机崩溃的现场（见上面那段注释）。主窗口不带这个标记，一切照旧。
+    """
+    try:
+        window._dlp_no_inject = True
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _prepare_browser_network(config=None, env=None, log=print,
                              allow_env: bool = True) -> dict:
     """把内核的网络也挂到同一个代理上。返回一份说明（给日志和诊断页用）。"""
@@ -639,9 +653,16 @@ def _esc(text) -> str:
 
 
 def _diagnose_html(info: dict, real_url: str, proxy_url: str, title: str,
-                   version: str, net_note: str = "") -> str:
-    """真站没渲染出来时显示这一页：把看到的事实和下一步都写清楚。"""
+                   version: str, net_note: str = "", base_url: str = "") -> str:
+    """真站没渲染出来时显示这一页：把看到的事实和下一步都写清楚。
+
+    页面上的按钮都是**普通链接**：/api/desktop/open-external 是本机服务的一个端点，
+    由桌面进程去开系统浏览器 —— 这样窗口里就不需要暴露任何 Python 对象。
+    """
     rep = info.get("report") or {}
+    base = (base_url or "").rstrip("/")
+    open_endpoint = (base + "/api/desktop/open-external?url="
+                     + urllib.parse.quote(proxy_url or "", safe="")) if base else (proxy_url or "")
     rows = [
         ("结论", info.get("why", "")),
         ("地址", rep.get("href") or "(空)"),
@@ -687,31 +708,20 @@ a.btn.alt{background:#2a3a38}
   <li><b>配一下代理</b>：如果 <code>DOLA_PROXY</code> 只写在环境变量里，浏览器内核读不到 ——
       在程序目录的 <code>config.json</code> 里加一行
       <code>"proxy": "http://用户:密码@主机:6666"</code>，或启动时加 <code>--proxy</code>，重启程序即可。</li>
-  <li><b>做个对照实验</b>：关掉程序，改用 <code>--no-proxy</code> 启动一次（或把
+    <li><b>点了就卡死 / 未响应</b>：那是 v2.0.10 及更早版本的 bug —— 窗口里挂了 JS 桥，真站脚本一碰就递归爆栈（黑窗口里能看到满屏 Empty. + maximum recursion depth exceeded）。v2.0.11 起账号窗口不再暴露任何 Python 对象，也没有 JS 桥。</li>
+<li><b>做个对照实验</b>：关掉程序，改用 <code>--no-proxy</code> 启动一次（或把
       <code>config.json</code> 里的 <code>proxy</code> 删掉）—— 能分辨是「代理配错了」
       还是「内核本身取不回页面」。两种结果都告诉我。</li>
   <li><b>把这一页告诉我</b>：连同黑窗口里 <code>[desktop] v%s 自检</code> 那几行，我按里面的数字继续修。</li>
 </ul>
-<a class="btn" href="javascript:dlp('proxy')">◀ 改看本机代理页</a>
-<a class="btn alt" href="javascript:dlp('retry')">↻ 重新打开真站</a>
-<a class="btn alt" href="javascript:dlp('browser')">🌐 用系统浏览器打开</a>
+<a class="btn" href="%s">◀ 改看本机代理页</a>
+<a class="btn alt" href="%s">↻ 重新打开真站</a>
+<a class="btn alt" href="%s">🌐 用系统浏览器打开</a>
 <div class="note">要打开的真站：%s<br>本机代理页：%s<br>窗口：%s</div>
-<script>
-function dlp(what){
-  try{
-    if(!window.pywebview || !window.pywebview.api){
-      alert('这个窗口暂时连不上主程序：请关掉它，重新点账号池里的「🌐 网页」');
-      return;
-    }
-    var api = pywebview.api, r;
-    if(what==='proxy'){ r = api.show_proxy_page(); }
-    else if(what==='retry'){ r = api.retry_real(); }
-    else { r = api.open_local(); }
-    if(r && r.then){ r.then(function(res){ if(res && res.ok===false){ alert('失败：'+res.detail); } }); }
-  }catch(e){ alert('操作失败：'+e); }
-}
-</script>
-</div></body></html>""" % (version or "?", _esc(real_url), _esc(proxy_url), _esc(title))
+<div class="note">这三个按钮都是普通链接、加上本机的一个 HTTP 端点，不依赖注入脚本 ——
+页面卡住时照样能用。</div>
+</div></body></html>""" % (version or "?", _esc(proxy_url), _esc(real_url), _esc(open_endpoint),
+                      _esc(real_url), _esc(proxy_url), _esc(title))
 
 
 _WAIT_HTML = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
@@ -834,6 +844,13 @@ class Control:
         if action == "open_web":
             self.open_web(payload or {})
             return
+        if action == "open_external":
+            # 账号窗口里的「用系统浏览器打开」：走本机 HTTP 端点进来，不经任何 JS 桥
+            target = str((payload or {}).get("url") or "").strip()
+            print(f"[desktop] 用系统浏览器打开：{target}")
+            if target:
+                _open_in_browser(target)
+            return
         self.action = action
         print(f"[desktop] 收到指令：{action}")
         win = self.window
@@ -886,15 +903,17 @@ class Control:
         if self.demo and real and cookie:
             print("[desktop] 演示模式：账号窗口用本机代理页（演示模式不访问真站）")
         try:
-            api = _WebWindowApi()
+            # 真站窗口连注入脚本也不要有（页面里不留 window.pywebview）
+            _wrap_injection_skip()
+            # 注意：这里**故意不传 js_api** —— 见上面那段注释，暴露 Python 对象会被
+            # pywebview 的注入桥递归遍历、把进程搞崩。诊断页用普通链接就够了。
             win = webview.create_window(
                 title, "about:blank" if try_cookie else url,
                 width=1180, height=860,
                 min_size=(720, 520),
                 text_select=True,
-                js_api=api,
             )
-            api.attach(win, url, real)      # 诊断页上的按钮要用到这两个地址
+            _skip_injection_for(win)     # 标记：这个窗口的页面别再注入 pywebview
             self.web_windows.append(win)
             try:  # 用户自己关掉窗口后从列表里摘掉，免得 accumulate
                 win.events.closed += lambda: self.web_windows.remove(win) if win in self.web_windows else None
@@ -951,7 +970,7 @@ class Control:
               % (version, _format_report(info, proxy_url, version)))
         try:
             win.load_html(_diagnose_html(info, real_url, proxy_url, title, version,
-                                         net_note=self.net_note))
+                                         net_note=self.net_note, base_url=self.base_url))
             self._set_win_title(win, title + " · 真站打不开（窗口里有说明）")
         except Exception as exc:  # noqa: BLE001
             print(f"[desktop] 诊断页也显示不出来（{exc}），退回本机代理页")
