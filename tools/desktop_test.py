@@ -212,6 +212,13 @@ class FakePyWindow:
 _FAKE_INJECT_OK = [True]
 
 
+class _FakeAction:
+    """假装 pythonnet 的 System.Action：Action[Task](fn) 直接返回 fn。"""
+
+    def __class_getitem__(cls, item):        # noqa: N805
+        return lambda fn: fn
+
+
 def fake_webview_module():
     import types
     mod = types.ModuleType("webview")
@@ -252,6 +259,12 @@ def cookie_injection_checks():
     # b) 非 Windows（拿不到 clr）→ 明确失败，不抛异常
     ok, why = desktop._inject_webview2_cookies(FakeWin(FakeCore()), "a=1", timeout=0.2)
     check("非 Windows 环境下注入被明确拒绝（不抛异常）", ok is False and "内核" in why, why)
+
+    # a2) 静态护栏：脚本探针不允许在 UI 线程上同步等任务结果（会死锁 —— 就是 evaluate_js 的坑）
+    src = open(os.path.join(ROOT, "desktop.py"), encoding="utf-8").read()
+    seg = src.split("def _start_js()")[1].split("_page_state(state")[0]
+    check("脚本探针只用 ContinueWith 异步取结果（UI 线程上不出现 task.Result）",
+          "ContinueWith" in seg and "task.Result" not in seg, "在 _start_js 里查 task.Result")
 
     # 后面走接缝：假装 clr 可用 + 直接在「UI 线程」同步执行
     desktop._clr_ready = lambda: (True, "")
@@ -385,6 +398,10 @@ def cookie_injection_checks():
               sys.modules["webview"].created[-1])
         check("后台挂起也把真站准备好了（切换时不用等）",
               "https://www.dola.com/chat/" in (parked.loaded or []), parked.loaded)
+        check("建窗时就把 .NET 导航监听挂上（免得漏掉真站这次导航）",
+              isinstance(ctl._sessions.get(6, {}).get("probe"), dict)
+              and ctl._sessions[6]["probe"].get("hooked") is True,
+              ctl._sessions.get(6, {}).get("probe", {}).get("hooked"))
         check("后台挂起不弹诊断页（看不见的窗口不该换成说明页）",
               "真站没能在窗口里显示" not in (getattr(parked, "html_shown", "") or ""),
               (getattr(parked, "html_shown", "") or "")[:30])
@@ -766,8 +783,16 @@ def network_checks():
 
         def ExecuteScriptAsync(self, js):
             self.script_calls += 1
+            result = self.script_result
+
             class Task:                      # 结果直接可用（不做真异步）
-                Result = self.script_result
+                Result = result
+
+                def ContinueWith(self, cb):
+                    # 模拟 .NET：任务若已完成，回调立刻执行（真机上是线程池线程）
+                    cb(self)
+                    return self
+
             return Task()
 
     class NavWin:
@@ -796,6 +821,13 @@ def network_checks():
               p1["started"].endswith("dola.com/chat/") and p1["nav_done"] is False, p1["started"])
         core.complete(ok=True, http=200)
         core.script_result = '{"href":"https://www.dola.com/chat/","text":"创作","html_len":4200,"status":200}'
+        # 装上假的 pythonnet：ContinueWith(Action[Task](cb)) 这条路才算真的被走到
+        sys_mod = sys.modules.get("System")
+        sys.modules["System"] = sys_mod or types.ModuleType("System")
+        sys.modules["System"].Action = _FakeAction
+        tmod = sys.modules.get("System.Threading.Tasks") or types.ModuleType("System.Threading.Tasks")
+        tmod.Task = type("Task", (), {})
+        sys.modules["System.Threading.Tasks"] = tmod
         state["_start_js"]()                 # 模拟一次 JS 探针
         p2 = desktop._page_state(state)
         check("自检：导航成功后靠自己的脚本探针确认有正文（标题/正文/HTTP 都拿得到）",

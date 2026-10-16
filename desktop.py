@@ -647,7 +647,7 @@ def _hint_for_nav_error(code: str) -> str:
     return _NAV_ERROR_HINTS.get(name, "内核报的错误码：%s" % name)
 
 
-def _install_page_probe(window, log=print) -> dict:
+def _install_page_probe(window, log=print, state: dict = None) -> dict:
     """在 UI 线程上装两样东西：.NET 的导航事件监听 + 一个不依赖 pywebview 的 JS 探针。
 
     为什么要自己写，而不用 pywebview 的 evaluate_js：
@@ -661,9 +661,11 @@ def _install_page_probe(window, log=print) -> dict:
     """
     holder = _webview_holder(window)
     if holder is None:
-        return {}
-    state = {"ready": False, "source": "", "started": "", "done": False, "ok": None,
-             "http": None, "error_code": "", "js": None, "js_error": "", "js_seq": 0, "js_at": 0.0}
+        return {} if state is None else state
+    if state is None:
+        state = {"ready": False, "source": "", "started": "", "done": False, "ok": None,
+                 "http": None, "error_code": "", "js": None, "js_error": "",
+                 "js_seq": 0, "js_at": 0.0}
 
     def _read_core():
         ctrl = getattr(holder, "webview", None)
@@ -744,14 +746,12 @@ def _install_page_probe(window, log=print) -> dict:
                 from System import Action
                 from System.Threading.Tasks import Task
                 task.ContinueWith(Action[Task](_cb))
-            except Exception:  # noqa: BLE001 （pythonnet 不在就退化成轮询）
-                try:
-                    raw = task.Result
-                    state["js"] = json.loads(str(raw)) if raw is not None else None
-                    if raw is None:
-                        state["js_error"] = "内核返回空（脚本没执行）"
-                except Exception as exc:  # noqa: BLE001
-                    state["js_error"] = "等待脚本结果失败：%s" % exc
+            except Exception:  # noqa: BLE001
+                # 没有 pythonnet 就没法异步取结果。**绝不能在 UI 线程上 .Result 等它** ——
+                # ExecuteScriptAsync 的完成要回到 UI 线程的消息循环，等它就会把 UI 线程
+                # 锁死（这正是 pywebview 的 evaluate_js 永久卡死的机制）。
+                # 脚本探针只是加分项，主证据是上面的 .NET 导航事件；这里直接放弃。
+                state["js_error"] = "没有 pythonnet，跳过脚本探针（以导航事件为准）"
             state["js_at"] = time.time()
         except Exception as exc:  # noqa: BLE001
             state["js_error"] = "发起脚本失败：%s" % exc
@@ -759,8 +759,10 @@ def _install_page_probe(window, log=print) -> dict:
     # 先把「怎么再发起一次脚本」和宿主存好（哪怕下面装监听没成功，也还能继续用）
     state["_start_js"] = _start_js
     state["_holder"] = holder
-    if not _ui_invoke_bounded(holder, _setup, timeout=4.0):
-        state["js_error"] = "内核没回话（装导航监听超时）"
+    # 没挂上就再试：窗口刚建好时内核可能还没就绪，等一会儿就能挂上
+    if not state.get("hooked") and not _ui_invoke_bounded(holder, _setup, timeout=4.0):
+        if not state.get("hooked"):
+            state["js_error"] = "内核没回话（装导航监听超时）"
     return state
 
 
@@ -832,7 +834,7 @@ def _judge_page_state(page: dict, host: str = "dola.com") -> tuple:
 
 
 def _inspect_real_site(win, timeout: float = _SITE_TIMEOUT, poll: float = 0.4,
-                       host: str = "dola.com") -> dict:
+                       host: str = "dola.com", probe: dict = None) -> dict:
     """看真站到底渲染出来没有。
 
     不再用 pywebview 的 evaluate_js（它会永久卡死，见 _install_page_probe 的注释）：
@@ -840,13 +842,14 @@ def _inspect_real_site(win, timeout: float = _SITE_TIMEOUT, poll: float = 0.4,
     - 辅助证据：我们自己的 ExecuteScriptAsync 探针（页面的标题 / 正文长度 / 可见文字）。
     两条路都是「发起后不等」，不会把线程卡住。
     """
-    state = _install_page_probe(win)
+    state = _install_page_probe(win, state=probe)
     if not state:
         return {"ok": False, "why": "拿不到浏览器内核（窗口还没建好）", "report": {},
                 "error": "no core", "page": {}}
     start_js = state.get("_start_js")
     deadline = time.time() + max(0.0, timeout)
     last_js = 0.0
+    last_hook = time.time()
     page = _page_state(state)
     while True:
         page = _page_state(state)
@@ -862,6 +865,11 @@ def _inspect_real_site(win, timeout: float = _SITE_TIMEOUT, poll: float = 0.4,
             last_js = now
             if not _ui_invoke_bounded(state["_holder"], start_js, timeout=3.0):
                 state["js_error"] = "内核没回话（发起脚本超时）"
+        # 导航监听还没挂上（窗口刚建、内核未就绪）→ 每隔一会儿再补挂一次，
+        # 免得监听装晚了漏掉这次导航的完成事件
+        if not state.get("hooked") and now - last_hook >= 1.5:
+            last_hook = now
+            _install_page_probe(win, state=state)
         time.sleep(poll)
     page = _page_state(state)
     ok, why = _judge_page_state(page, host)
@@ -1373,6 +1381,12 @@ class Control:
                 print(f"[desktop] 显示等待页失败（不影响后续）：{exc}")
             self._publish(rec, "preparing",
                           note="正在后台准备（登录态 + 真站页面）" if hidden else "正在写入登录态…")
+            # 尽量在导航之前就把 .NET 导航监听挂上：否则监听装晚了，
+            # 真站这次导航的 NavigationCompleted 就漏掉了（自检只剩脚本探针一条证据）
+            try:
+                rec["probe"] = _install_page_probe(win)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[desktop] 提前挂导航监听失败（不影响开窗，自检时会再挂）：{exc}")
             # 把 Cookie 写进内核，再打开真正的 dola.com（放后台线程，
             # 免得等内核就绪把接口调用卡住）
             threading.Thread(
@@ -1434,7 +1448,8 @@ class Control:
             self._publish(rec, "running", note="前台显示中（本机代理页：%s）" % note)
         if not ok or self.demo:
             return
-        info = _inspect_real_site(win, host=_real_host(rec.get("real") or ""))
+        info = _inspect_real_site(win, host=_real_host(rec.get("real") or ""),
+                                  probe=rec.get("probe"))
         if not info.get("ok"):
             print("[desktop] v%s 自检：重连后真站没渲染出来 ——\n%s"
                   % (version, _format_report(info, rec.get("url") or "", version)))
@@ -1469,9 +1484,10 @@ class Control:
                 self._publish(rec, "running", note="前台显示中（真站）" if ok else "前台显示中（本机代理页）")
         if not ok or self.demo:
             return
+        probe = (rec or {}).get("probe")
         if hidden:
             # 后台窗口看不见，别给用户弹诊断页；只用会话备注说明情况
-            info = _inspect_real_site(win, host=_real_host(real_url))
+            info = _inspect_real_site(win, host=_real_host(real_url), probe=probe)
             if info.get("ok"):
                 print(f"[desktop] v{version} 挂起自检：真站已渲染 —— {info['why']}")
                 if rec is not None:
@@ -1483,7 +1499,7 @@ class Control:
                     self._publish(rec, "stale", note="后台挂起，但真站没渲染出来（切换过去看诊断页）")
             return
         # 打开了真站，但要确认它真的渲染出来了 —— 白屏不能再靠人肉发现
-        info = _inspect_real_site(win, host=_real_host(real_url))
+        info = _inspect_real_site(win, host=_real_host(real_url), probe=probe)
         if info["ok"]:
             print(f"[desktop] v{version} 自检：真站已渲染 —— {info['why']}")
             self._set_win_title(win, title + " · dola.com")
