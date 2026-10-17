@@ -71,11 +71,40 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .port.connected{background:#078d78;border-color:#078d78}
 
 /* 连线SVG */
-.connections-svg{position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:5;overflow:visible}
-.connections-svg path{fill:none;stroke:#3a484b;stroke-width:2;pointer-events:stroke;cursor:pointer}
-.connections-svg path:hover{stroke:#ff6b6b}
-.connections-svg path.active{stroke:#078d78;stroke-width:3}
-.connections-svg path.temp{stroke:#f5a623;stroke-dasharray:5,5;pointer-events:none}
+/* 连线层：以前 stroke 是 #3a484b、背景是 #0a0c0d —— 几乎看不见，
+   用户会以为「没连上」。现在改成亮色 + 发光 + 箭头 + 中点标签。 */
+.connections-svg{position:absolute;top:0;left:0;pointer-events:none;z-index:5;overflow:visible}
+.connections-svg path.conn{fill:none;stroke:#5fe3c8;stroke-width:2.4;pointer-events:stroke;cursor:pointer;
+    filter:drop-shadow(0 0 3px rgba(95,227,200,.55))}
+.connections-svg path.conn[data-kind="image"]{stroke:#a78bfa;filter:drop-shadow(0 0 3px rgba(167,139,250,.55))}
+.connections-svg path.conn[data-kind="video"]{stroke:#f5a623;filter:drop-shadow(0 0 3px rgba(245,166,35,.55))}
+.connections-svg path.conn[data-kind="prompt"]{stroke:#7bd1ff;filter:drop-shadow(0 0 3px rgba(123,209,255,.55))}
+.connections-svg path.conn:hover{stroke:#ff8a80;stroke-width:3.4;filter:drop-shadow(0 0 6px rgba(255,107,107,.8))}
+.connections-svg path.conn.active{stroke:#ffd166;stroke-width:3.8;filter:drop-shadow(0 0 8px rgba(255,209,102,.9))}
+.connections-svg path.conn.flash{stroke:#fff;stroke-width:4.5}
+.connections-svg path.conn-hit{fill:none;stroke:transparent;stroke-width:18;pointer-events:stroke;cursor:pointer}
+.connections-svg path.temp{fill:none;stroke:#f5a623;stroke-width:2.6;stroke-dasharray:7,5;pointer-events:none;
+    filter:drop-shadow(0 0 4px rgba(245,166,35,.7))}
+.conn-label{font-size:11px;fill:#bff5e8;pointer-events:none;user-select:none;
+    paint-order:stroke;stroke:#0a0c0d;stroke-width:3px;stroke-linejoin:round}
+.conn-label.active{fill:#ffd166}
+.port.compatible{background:#12403a;border-color:#5fe3c8;box-shadow:0 0 0 4px rgba(95,227,200,.18);
+    animation:portPulse 1.2s infinite}
+@keyframes portPulse{0%,100%{box-shadow:0 0 0 3px rgba(95,227,200,.15)}50%{box-shadow:0 0 0 8px rgba(95,227,200,.05)}}
+
+/* 连线管理面板 */
+.conn-panel{position:fixed;right:16px;bottom:16px;width:320px;max-height:44vh;overflow:auto;z-index:1000;
+    background:rgba(15,20,22,.97);border:1px solid rgba(48,59,62,.7);border-radius:10px;padding:10px 12px;
+    box-shadow:0 10px 30px rgba(0,0,0,.45);display:none}
+.conn-panel.show{display:block}
+.conn-panel h4{font-size:12px;color:#9aabad;margin:0 0 8px;display:flex;align-items:center;gap:8px}
+.conn-item{display:flex;align-items:center;gap:6px;padding:6px 6px;border-radius:6px;font-size:12px;
+    border:1px solid transparent;cursor:pointer}
+.conn-item:hover{background:rgba(95,227,200,.08);border-color:rgba(95,227,200,.35)}
+.conn-item .dot{width:8px;height:8px;border-radius:50%;flex:0 0 auto}
+.conn-item .txt{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.conn-item .txt b{color:#e7eeee;font-weight:600}
+.conn-item button{background:#4a2428;color:#ff9b98;border:0;border-radius:4px;padding:2px 6px;cursor:pointer;font-size:11px}
 
 /* 右侧属性面板 */
 .props-panel{position:fixed;top:48px;right:0;bottom:0;width:260px;background:rgba(15,20,22,0.95);backdrop-filter:blur(10px);border-left:1px solid rgba(48,59,62,0.5);padding:16px;overflow-y:auto;z-index:999;display:none}
@@ -85,8 +114,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .props-panel input,.props-panel select,.props-panel textarea{width:100%;background:#111415;border:1px solid #3a484b;color:#e7eeee;border-radius:4px;padding:8px;font-size:12px}
 
 /* 提示 */
-.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#078d78;color:#fff;padding:10px 20px;border-radius:6px;z-index:2000;opacity:0;transition:opacity .3s;pointer-events:none}
-.toast.show{opacity:1}
+.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);z-index:2000;pointer-events:none;
+    display:flex;flex-direction:column;gap:8px;align-items:center;max-width:min(720px,86vw)}
+.toast .item{background:#078d78;color:#fff;padding:10px 18px;border-radius:6px;font-size:13px;
+    box-shadow:0 8px 24px rgba(0,0,0,.4);opacity:0;transform:translateY(8px);
+    transition:opacity .22s,transform .22s;max-width:100%}
+.toast .item.show{opacity:1;transform:translateY(0)}
+.toast .item.err{background:#7a2b2f}
 
 /* 帮助提示 */
 .help-hint{position:fixed;bottom:16px;left:216px;font-size:11px;color:#5a6a6d;z-index:998;pointer-events:none}
@@ -173,6 +207,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
     <button class="secondary" onclick="saveWorkflow()">💾 保存</button>
     <button class="secondary" onclick="loadWorkflow()">📂 本地</button>
     <button class="secondary" onclick="loadServerWorkflow()">☁ 服务端</button>
+    <button class="secondary" onclick="autoConnect()" title="按端口类型和左右位置，自动把能连的端口都连上">⚡ 自动连线</button>
+    <button class="secondary" onclick="autoLayout()" title="按连线的先后顺序把节点排成从左到右的几列">▤ 自动布局</button>
+    <button class="secondary" onclick="fitView()" title="缩放到能看见全部节点">⛶ 看全图</button>
+    <button class="secondary" onclick="undo()" title="撤销（Ctrl+Z）">↶ 撤销</button>
+    <button class="secondary" onclick="redo()" title="重做（Ctrl+Shift+Z / Ctrl+Y）">↷ 重做</button>
+    <button class="secondary" id="connToggle" onclick="toggleConnPanel()" title="列出所有连线，可定位/删除">◨ 连线 0</button>
     <button class="danger" onclick="clearCanvas()">🗑 清空</button>
     <button onclick="executeWorkflow()" style="background:#078d78">▶ 执行工作流</button>
     <button class="secondary" onclick="zoomReset()">100%</button>
@@ -222,7 +262,27 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 <div class="canvas-container" id="canvasContainer">
     <div class="canvas-grid"></div>
     <div class="canvas-world" id="canvasWorld">
-        <svg class="connections-svg" id="connectionsSvg"></svg>
+        <svg class="connections-svg" id="connectionsSvg" width="12000" height="9000">
+            <defs>
+                <marker id="connArrow" viewBox="0 0 10 10" refX="9" refY="5"
+                        markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                    <path d="M0,0 L10,5 L0,10 z" fill="#5fe3c8"></path>
+                </marker>
+                <marker id="connArrowPrompt" viewBox="0 0 10 10" refX="9" refY="5"
+                        markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                    <path d="M0,0 L10,5 L0,10 z" fill="#7bd1ff"></path>
+                </marker>
+                <marker id="connArrowImage" viewBox="0 0 10 10" refX="9" refY="5"
+                        markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                    <path d="M0,0 L10,5 L0,10 z" fill="#a78bfa"></path>
+                </marker>
+                <marker id="connArrowVideo" viewBox="0 0 10 10" refX="9" refY="5"
+                        markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                    <path d="M0,0 L10,5 L0,10 z" fill="#f5a623"></path>
+                </marker>
+            </defs>
+            <g id="connLayer"></g>
+        </svg>
     </div>
 </div>
 
@@ -230,6 +290,17 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 <div class="props-panel" id="propsPanel">
     <h3 id="propsTitle">节点属性</h3>
     <div id="propsContent"></div>
+</div>
+
+<!-- 连线管理 -->
+<div class="conn-panel" id="connPanel">
+    <h4><span>◨ 连线管理</span><span id="connCount" style="color:#5fe3c8"></span>
+        <span style="flex:1"></span>
+        <button class="danger" style="background:#2a3538;color:#b8c9cc" onclick="disconnectAll()">全部断开</button>
+        <button onclick="document.getElementById('connPanel').classList.remove('show')"
+                style="background:#2a3538;color:#b8c9cc">✕</button></h4>
+    <div id="connList"></div>
+    <div id="connEmpty" class="dim" style="font-size:12px">还没有连线。三种连法：① 按住输出圆点拖到目标 ② 点一下输出圆点再点输入圆点 ③ 双击任意端口自动找最近的可连端口</div>
 </div>
 
 <!-- 提示 -->
@@ -248,6 +319,7 @@ window.fetch = function (url, opts) {
     return _rawFetch(url, opts);
 };
 function applyCanvasWorkflow(wf) {
+    if (!_restoring) pushHistory();
     clearCanvas(false);
     nodes = [];
     connections = [];
@@ -362,6 +434,20 @@ document.addEventListener('keyup', (e) => {
     if (e.code === 'Space') { spacePressed = false; canvasContainer.style.cursor = 'default'; }
 });
 
+// 撤销 / 重做（在输入框里打字时不抢 Ctrl+Z）
+document.addEventListener('keydown', (e) => {
+    const tag = (e.target && e.target.tagName || '').toLowerCase();
+    if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
+    const k = (e.key || '').toLowerCase();
+    if ((e.ctrlKey || e.metaKey) && k === 'z') {
+        e.preventDefault();
+        if (e.shiftKey) redo(); else undo();
+    } else if ((e.ctrlKey || e.metaKey) && k === 'y') {
+        e.preventDefault();
+        redo();
+    }
+});
+
 canvasContainer.addEventListener('mousedown', (e) => {
     if (e.target === canvasContainer || e.target.classList.contains('canvas-grid') || e.target === canvasWorld || spacePressed) {
         isPanning = true;
@@ -382,8 +468,17 @@ document.addEventListener('mousemove', (e) => {
     }
     if (isDraggingNode && dragNode) {
         const rect = canvasContainer.getBoundingClientRect();
-        dragNode.x = (e.clientX - rect.left - panX) / zoom - dragOffsetX;
-        dragNode.y = (e.clientY - rect.top - panY) / zoom - dragOffsetY;
+        let nx = (e.clientX - rect.left - panX) / zoom - dragOffsetX;
+        let ny = (e.clientY - rect.top - panY) / zoom - dragOffsetY;
+        nx = Math.round(nx / 10) * 10;                 // 吸附到 10px 网格
+        ny = Math.round(ny / 10) * 10;
+        nodes.forEach(o => {                            // 和别的节点 8px 内自动对齐
+            if (o.id === dragNode.id) return;
+            if (Math.abs(nx - o.x) <= 8) nx = o.x;
+            if (Math.abs(ny - o.y) <= 8) ny = o.y;
+        });
+        dragNode.x = Math.max(0, nx);
+        dragNode.y = Math.max(0, ny);
         updateNodePosition(dragNode);
         updateConnections();
     }
@@ -407,6 +502,7 @@ document.addEventListener('mouseup', (e) => {
     pendingFrom = null;
     if (tempLine) { tempLine.remove(); tempLine = null; }
     paintArmed();
+    clearCompatible();
     updateHint();
     if (hit) connectPorts(from, hit);
     else toast('没连上：请拖到目标节点的小圆点上（或点一下输出圆点、再点输入圆点）', true);
@@ -437,7 +533,7 @@ function updateHint() {
     if (!el) return;
     el.textContent = pendingFrom
         ? '连线中：点目标端口即可连上（' + (pendingFrom.type === 'output' ? '来自输出端口' : '来自输入端口') + '）· Esc/点空白=取消'
-        : '空格+拖拽=平移画布 | 滚轮=缩放 | Delete=删除选中 | 点两下端口或从端口拖到目标=连线';
+        : '空格+拖拽=平移画布 | 滚轮=缩放 | Delete=删除选中 | 点两下端口或从端口拖到目标=连线 | 双击端口=自动连 | Ctrl+Z=撤销';
 }
 
 function cancelPending(msg) {
@@ -445,6 +541,7 @@ function cancelPending(msg) {
     pendingFrom = null;
     if (tempLine) { tempLine.remove(); tempLine = null; }
     paintArmed();
+    clearCompatible();
     updateHint();
     if (msg) toast(msg);
     return true;
@@ -454,6 +551,7 @@ function cancelPending(msg) {
 function onPortDown(port) {
     const info = portInfo(port);
     if (!info) return;
+    highlightCompatible(info);
     portDownX = lastMouseX; portDownY = lastMouseY;
     portDragged = false;
     if (pendingFrom && pendingFrom.type !== info.type) {   // 两端凑齐，直接连
@@ -549,7 +647,9 @@ function connectPorts(a, b) {
         toast('这两个端口已经连过了', true);
         return false;
     }
+    pushHistory();
     createConnection(from.nodeId, from.port, to.nodeId, to.port);
+    clearCompatible();
     return true;
 }
 
@@ -573,6 +673,7 @@ canvasContainer.addEventListener('drop', (e) => {
 
 // ==================== 节点操作 ====================
 function createNode(type, x, y) {
+    pushHistory();
     const typeDef = NODE_TYPES[type];
     if (!typeDef) return;
     const node = {
@@ -655,6 +756,7 @@ function renderNode(node) {
     // 节点拖拽
     el.querySelector('.node-header').addEventListener('mousedown', (e) => {
         if (e.target.classList.contains('delete')) return;
+        pushHistory();
         isDraggingNode = true;
         dragNode = node;
         const rect = canvasContainer.getBoundingClientRect();
@@ -675,6 +777,12 @@ function renderNode(node) {
         port.addEventListener('click', (e) => {
             e.stopPropagation();
             if (!portDragged) onPortClick(port);
+        });
+        // 双击端口：直接连到离它最近的可连端口（第三种连法）
+        port.addEventListener('dblclick', (e) => {
+            e.stopPropagation();
+            e.preventDefault();
+            autoConnectPort(port);
         });
     });
     
@@ -697,6 +805,7 @@ function updateNodeData(nodeId, key, value) {
 }
 
 function deleteNode(nodeId) {
+    pushHistory();
     nodes = nodes.filter(n => n.id !== nodeId);
     connections = connections.filter(c => c.from_node !== nodeId && c.to_node !== nodeId);
     const el = document.getElementById(nodeId);
@@ -731,16 +840,49 @@ function createConnection(fromNode, fromPort, toNode, toPort) {
     const conn = { id: 'conn_' + Date.now(), from_node: fromNode, from_port: fromPort, to_node: toNode, to_port: toPort };
     connections.push(conn);
     updateConnections();
-    toast('已连接');
+    toast('已连接：' + nodeLabel(fromNode) + '.' + fromPort + ' → ' + nodeLabel(toNode) + '.' + toPort);
 }
 
 function deleteConnection(connId) {
+    pushHistory();
     connections = connections.filter(c => c.id !== connId);
     updateConnections();
     selectedConnection = null;
 }
 
+// 连线颜色/箭头按「目标端口类型」区分，一眼能看出连的是什么
+const PORT_KIND = { text: 'text', prompt: 'prompt', image: 'image', input: 'video', output: 'video', video: 'video' };
+const PORT_COLOR = { text: '#5fe3c8', prompt: '#7bd1ff', image: '#a78bfa', video: '#f5a623' };
+
+// 端口兼容表：目标输入端口 ← 可接受的输出端口类型
+const PORT_COMPAT = {
+    text:   ['text', 'prompt', 'output'],
+    prompt: ['prompt', 'text', 'output'],
+    image:  ['image', 'video'],
+    input:  ['prompt', 'text', 'image', 'video', 'output'],
+};
+
+function portKind(name) { return PORT_KIND[name] || 'text'; }
+
+function portsCompatible(outputName, inputName) {
+    const allow = PORT_COMPAT[inputName] || [];
+    return allow.indexOf(outputName) >= 0;
+}
+
+// 用真实 DOM 几何算端口中心（以前是写死 +180/50，节点一宽就画歪了）
 function getPortPosition(nodeId, portName, portType) {
+    const nodeEl = document.getElementById(nodeId);
+    if (nodeEl) {
+        const portEl = nodeEl.querySelector(
+            '.port[data-node="' + nodeId + '"][data-port="' + portName + '"][data-type="' + portType + '"]');
+        // offsetWidth>0 才算「真浏览器里量到了」；jsdom / 还没布局时退回估算
+        if (portEl && portEl.offsetWidth > 0) {
+            const x = (nodeEl.offsetLeft || 0) + portEl.offsetLeft + portEl.offsetWidth / 2;
+            const y = (nodeEl.offsetTop || 0) + portEl.offsetTop + portEl.offsetHeight / 2;
+            if (isFinite(x) && isFinite(y)) return { x: x, y: y };
+        }
+    }
+    // 兜底：节点数据估算（DOM 还没建好时）
     const node = nodes.find(n => n.id === nodeId);
     if (!node) return { x: 0, y: 0 };
     const typeDef = NODE_TYPES[node.type];
@@ -749,35 +891,322 @@ function getPortPosition(nodeId, portName, portType) {
     return { x: node.x + (portType === 'input' ? 0 : 180), y: node.y + 50 + idx * 30 + 7 };
 }
 
+function connLayer() {
+    let layer = document.getElementById('connLayer');
+    if (!layer) {
+        layer = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+        layer.id = 'connLayer';
+        connectionsSvg.appendChild(layer);
+    }
+    return layer;
+}
+
+function curvePath(from, to) {
+    const dx = Math.max(40, Math.abs(to.x - from.x) * 0.5);
+    return 'M ' + from.x + ' ' + from.y + ' C ' + (from.x + dx) + ' ' + from.y + ', ' +
+           (to.x - dx) + ' ' + to.y + ', ' + to.x + ' ' + to.y;
+}
+
+function nodeLabel(nodeId) {
+    const node = nodes.find(n => n.id === nodeId);
+    if (!node) return nodeId;
+    const def = NODE_TYPES[node.type];
+    return (def ? def.name : node.type);
+}
+
+// 自动存档（防抖 500ms）：不用先点「保存」，刷新也不会丢画布
+let _autosaveTimer = null;
+function saveLocal() {
+    try {
+        localStorage.setItem('dola_node_workflow',
+            JSON.stringify({ nodes: nodes, connections: connections, zoom: zoom, panX: panX, panY: panY }));
+    } catch (e) { /* 隐私模式禁用 localStorage 就算了 */ }
+}
+function scheduleAutosave() {
+    clearTimeout(_autosaveTimer);
+    _autosaveTimer = setTimeout(saveLocal, 500);
+}
+
+// ==================== 撤销 / 重做 ====================
+let _history = [], _future = [], _restoring = false;
+function canvasSnapshot() {
+    return JSON.stringify({ nodes: nodes, connections: connections, zoom: zoom, panX: panX, panY: panY });
+}
+function pushHistory() {
+    if (_restoring) return;
+    _history.push(canvasSnapshot());
+    if (_history.length > 100) _history.shift();
+    _future = [];
+}
+function undo() {
+    if (!_history.length) { toast('没有可撤销的操作'); return; }
+    _future.push(canvasSnapshot());
+    const snap = _history.pop();
+    _restoring = true;
+    try { applyCanvasWorkflow(JSON.parse(snap)); } finally { _restoring = false; }
+    toast('已撤销（还能撤销 ' + _history.length + ' 步 / 可重做 ' + _future.length + ' 步）');
+}
+function redo() {
+    if (!_future.length) { toast('没有可重做的操作'); return; }
+    _history.push(canvasSnapshot());
+    const snap = _future.pop();
+    _restoring = true;
+    try { applyCanvasWorkflow(JSON.parse(snap)); } finally { _restoring = false; }
+    toast('已重做（还能撤销 ' + _history.length + ' 步）');
+}
+
+// ==================== 自动布局 / 看全图 ====================
+// 按连线方向分层：没有上游的放最左，连得越深越靠右；同层纵向排开。
+function autoLayout() {
+    if (!nodes.length) { toast('画布上没有节点'); return; }
+    pushHistory();
+    const depth = {};
+    nodes.forEach(n => depth[n.id] = 0);
+    for (let round = 0; round < nodes.length; round++) {
+        let changed = false;
+        connections.forEach(c => {
+            if (depth[c.from_node] === undefined || depth[c.to_node] === undefined) return;
+            if (depth[c.to_node] < depth[c.from_node] + 1) {
+                depth[c.to_node] = depth[c.from_node] + 1;
+                changed = true;
+            }
+        });
+        if (!changed) break;      // 已经稳定（有环也能停下来）
+    }
+    const layers = {};
+    nodes.forEach(n => { const d = depth[n.id] || 0; (layers[d] = layers[d] || []).push(n); });
+    const COL = 330, ROW = 250;
+    Object.keys(layers).map(Number).sort((a, b) => a - b).forEach(d => {
+        layers[d].sort((a, b) => (a.y - b.y) || String(a.id).localeCompare(String(b.id)));
+        layers[d].forEach((n, i) => {
+            n.x = 60 + d * COL;
+            n.y = 60 + i * ROW;
+            updateNodePosition(n);
+        });
+    });
+    updateTransform();
+    updateConnections();
+    toast('已自动布局：' + Object.keys(layers).length + ' 列 / ' + nodes.length + ' 个节点');
+}
+
+// 缩放到能看见全部节点（相当于缩略图概览）
+function fitView() {
+    if (!nodes.length) { toast('画布上没有节点'); return; }
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    nodes.forEach(n => {
+        const el = document.getElementById(n.id);
+        const w = (el && el.offsetWidth) || 220, h = (el && el.offsetHeight) || 200;
+        minX = Math.min(minX, n.x); minY = Math.min(minY, n.y);
+        maxX = Math.max(maxX, n.x + w); maxY = Math.max(maxY, n.y + h);
+    });
+    const cw = canvasContainer.clientWidth || 1100, ch = canvasContainer.clientHeight || 700;
+    const pad = 60;
+    zoom = Math.max(0.2, Math.min(1.2, Math.min((cw - pad * 2) / Math.max(1, maxX - minX),
+                                               (ch - pad * 2) / Math.max(1, maxY - minY))));
+    panX = pad - minX * zoom;
+    panY = pad - minY * zoom;
+    updateTransform();
+    updateConnections();
+    toast('已缩放到全图（' + Math.round(zoom * 100) + '%）');
+}
+
 function updateConnections() {
-    connectionsSvg.innerHTML = '';
+    const layer = connLayer();
+    layer.innerHTML = '';
     connections.forEach(conn => {
         const from = getPortPosition(conn.from_node, conn.from_port, 'output');
         const to = getPortPosition(conn.to_node, conn.to_port, 'input');
-        const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-        const dx = Math.abs(to.x - from.x) * 0.5;
-        path.setAttribute('d', `M ${from.x} ${from.y} C ${from.x + dx} ${from.y}, ${to.x - dx} ${to.y}, ${to.x} ${to.y}`);
-        path.dataset.id = conn.id;
-        if (selectedConnection === conn.id) path.classList.add('active');
-        path.addEventListener('click', () => {
-            selectedConnection = conn.id;
+        // 线只有 2.4px，直接点很难点中；先铺一条 18px 的透明线专门接鼠标
+        const hit = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+        hit.setAttribute('d', curvePath(from, to));
+        hit.classList.add('conn-hit');
+        hit.dataset.id = conn.id;
+        hit.addEventListener('click', (e) => {
+            e.stopPropagation();
+            selectedConnection = (selectedConnection === conn.id ? null : conn.id);
             updateConnections();
+            toast(selectedConnection ? '已选中连线：按 Delete 删除，或点右下角「连线管理」' : '已取消选中');
         });
-        connectionsSvg.appendChild(path);
+        layer.appendChild(hit);
+
+        const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+        path.setAttribute('d', curvePath(from, to));
+        path.classList.add('conn');
+        path.dataset.id = conn.id;
+        path.dataset.kind = portKind(conn.to_port);
+        // 箭头要和线同色（以前忘了设 marker-end，线画出来了但没箭头）
+        const arrowId = { prompt: 'connArrowPrompt', image: 'connArrowImage', video: 'connArrowVideo' }[path.dataset.kind] || 'connArrow';
+        path.setAttribute('marker-end', 'url(#' + arrowId + ')');
+        if (selectedConnection === conn.id) path.classList.add('active');
+        path.addEventListener('click', (e) => {
+            e.stopPropagation();
+            selectedConnection = (selectedConnection === conn.id ? null : conn.id);
+            updateConnections();
+            toast(selectedConnection ? '已选中连线：按 Delete 删除，或点右下角「连线管理」' : '已取消选中');
+        });
+        layer.appendChild(path);
+
+        // 中点标签：直接写出「谁 → 谁 · 哪个端口」
+        const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+        label.setAttribute('x', (from.x + to.x) / 2);
+        label.setAttribute('y', (from.y + to.y) / 2 - 6);
+        label.setAttribute('text-anchor', 'middle');
+        label.setAttribute('class', 'conn-label' + (selectedConnection === conn.id ? ' active' : ''));
+        label.textContent = conn.from_port + ' → ' + conn.to_port;
+        layer.appendChild(label);
     });
-    
-    // 更新端口连接状态
+
+    // 端口连接状态
     document.querySelectorAll('.port').forEach(port => {
         port.classList.remove('connected');
         const nodeId = port.dataset.node;
         const portName = port.dataset.port;
         const portType = port.dataset.type;
-        const connected = connections.some(c => 
+        const connected = connections.some(c =>
             (portType === 'output' && c.from_node === nodeId && c.from_port === portName) ||
             (portType === 'input' && c.to_node === nodeId && c.to_port === portName)
         );
         if (connected) port.classList.add('connected');
     });
+
+    renderConnList();
+    scheduleAutosave();
+}
+
+function renderConnList() {
+    const list = document.getElementById('connList');
+    const empty = document.getElementById('connEmpty');
+    const count = document.getElementById('connCount');
+    const toggle = document.getElementById('connToggle');
+    if (toggle) toggle.textContent = '◨ 连线 ' + connections.length;
+    if (count) count.textContent = connections.length ? String(connections.length) : '';
+    if (!list) return;
+    if (!connections.length) {
+        list.innerHTML = '';
+        if (empty) empty.style.display = '';
+        return;
+    }
+    if (empty) empty.style.display = 'none';
+    list.innerHTML = connections.map(c => {
+        const color = PORT_COLOR[portKind(c.to_port)] || '#5fe3c8';
+        return '<div class="conn-item" onclick="focusConnection(\'' + c.id + '\')">' +
+            '<span class="dot" style="background:' + color + '"></span>' +
+            '<span class="txt"><b>' + nodeLabel(c.from_node) + '</b>.' + c.from_port +
+            ' → <b>' + nodeLabel(c.to_node) + '</b>.' + c.to_port + '</span>' +
+            '<button onclick="event.stopPropagation();deleteConnection(\'' + c.id + '\')">断开</button></div>';
+    }).join('');
+}
+
+function toggleConnPanel() {
+    const panel = document.getElementById('connPanel');
+    panel.classList.toggle('show');
+    renderConnList();
+}
+
+function focusConnection(connId) {
+    selectedConnection = connId;
+    updateConnections();
+    const path = document.querySelector('.connections-svg path.conn[data-id="' + connId + '"]');
+    if (!path) return;
+    path.classList.add('flash');
+    setTimeout(() => path.classList.remove('flash'), 900);
+    const conn = connections.find(c => c.id === connId);
+    if (conn) toast(nodeLabel(conn.from_node) + '.' + conn.from_port + ' → ' +
+                    nodeLabel(conn.to_node) + '.' + conn.to_port);
+}
+
+function disconnectAll() {
+    if (!connections.length) { toast('现在没有任何连线'); return; }
+    if (!window.confirm('断开全部 ' + connections.length + ' 条连线？')) return;
+    pushHistory();
+    connections = [];
+    updateConnections();
+    toast('已断开全部连线');
+}
+
+// 智能自动连线：按端口类型 + 左右位置，把「该连还没连」的都连上
+function autoConnect() {
+    if (nodes.length < 2) { toast('至少需要两个节点才能连线'); return; }
+    pushHistory();
+    const before = connections.length;
+    let added = 0;
+    const ordered = nodes.slice().sort((a, b) => (a.x - b.x) || (a.y - b.y));
+    ordered.forEach(target => {
+        const def = NODE_TYPES[target.type];
+        (def.inputs || []).forEach(inputName => {
+            const has = connections.some(c => c.to_node === target.id && c.to_port === inputName);
+            if (has) return;
+            // 候选：在目标左边、且端口类型兼容、距离最近的输出端口
+            let best = null, bestDist = Infinity;
+            nodes.forEach(src => {
+                if (src.id === target.id) return;
+                if (src.x + 40 > target.x) return;                  // 只允许左 → 右
+                const srcDef = NODE_TYPES[src.type];
+                (srcDef.outputs || []).forEach(outName => {
+                    if (!portsCompatible(outName, inputName)) return;
+                    const used = connections.some(c =>
+                        c.from_node === src.id && c.from_port === outName && c.to_node === target.id);
+                    if (used) return;
+                    const dist = Math.hypot((target.x - src.x), (target.y - src.y)) +
+                                 (outName === inputName ? 0 : 30);  // 同名端口优先
+                    if (dist < bestDist) { bestDist = dist; best = { node: src.id, port: outName }; }
+                });
+            });
+            if (best) {
+                connections.push({
+                    id: 'conn_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+                    from_node: best.node, from_port: best.port,
+                    to_node: target.id, to_port: inputName,
+                });
+                added++;
+            }
+        });
+    });
+    updateConnections();
+    if (!added) {
+        toast(before ? '没有新可连的端口（' + before + ' 条已是最全）' : '没找到能匹配的端口（要左→右、类型相同）');
+    } else {
+        toast('已自动连上 ' + added + ' 条' + (before ? '（原有 ' + before + ' 条）' : ''));
+    }
+}
+
+// 双击端口：自动找离它最近的可连端口
+function autoConnectPort(port) {
+    const info = portInfo(port);
+    if (!info) return;
+    const self = getPortPosition(info.nodeId, info.port, info.type);
+    let best = null, bestDist = Infinity;
+    document.querySelectorAll('.port[data-type="' + (info.type === 'output' ? 'input' : 'output') + '"]').forEach(pe => {
+        const other = portInfo(pe);
+        if (!other || other.nodeId === info.nodeId) return;
+        const ok = info.type === 'output'
+            ? portsCompatible(info.port, other.port)
+            : portsCompatible(other.port, info.port);
+        if (!ok) return;
+        const pos = getPortPosition(other.nodeId, other.port, other.type);
+        const d = Math.hypot(pos.x - self.x, pos.y - self.y);
+        if (d < bestDist) { bestDist = d; best = other; }
+    });
+    if (!best) { toast('这个端口附近没有可连的端口（类型要匹配、不能连自己）'); return; }
+    if (bestDist > 900) { toast('最近的可连端口也太远了，先把它挪近一点'); return; }
+    connectPorts(info, best);
+}
+
+function highlightCompatible(info) {
+    document.querySelectorAll('.port.compatible').forEach(p => p.classList.remove('compatible'));
+    if (!info) return;
+    document.querySelectorAll('.port').forEach(pe => {
+        const other = portInfo(pe);
+        if (!other || other.nodeId === info.nodeId) return;
+        const ok = info.type === 'output'
+            ? portsCompatible(info.port, other.port)
+            : portsCompatible(other.port, info.port);
+        if (ok) pe.classList.add('compatible');
+    });
+}
+
+function clearCompatible() {
+    document.querySelectorAll('.port.compatible').forEach(p => p.classList.remove('compatible'));
 }
 
 function updateTempLine(x, y) {
@@ -873,7 +1302,28 @@ function selectAsset(nodeId, assetId) {
 // ==================== 工作流执行 ====================
 async function executeWorkflow() {
     if (nodes.length === 0) { toast('请先从左侧拖拽节点到画布'); return; }
-    toast('开始执行工作流... 共 ' + nodes.length + ' 个节点');
+    // 执行前先体检：哪些节点的输入还没接线（没接线就白跑）
+    const missing = [];
+    nodes.forEach(n => {
+        const def = NODE_TYPES[n.type];
+        (def.inputs || []).forEach(inputName => {
+            const ok = connections.some(c => c.to_node === n.id && c.to_port === inputName);
+            if (!ok) missing.push((def.name || n.type) + '.' + inputName);
+        });
+    });
+    if (missing.length) {
+        const ok = confirm('有 ' + missing.length + ' 个输入端口还没接线：\n  ' +
+            missing.slice(0, 8).join('\n  ') + (missing.length > 8 ? '\n  …' : '') +
+            '\n\n点「确定」继续执行（这些节点的输入会是空），点「取消」回去接线。');
+        if (!ok) {
+            toast('先接线：拖拽端口 / 点两下 / 双击任意端口自动连 / 点「⚡ 自动连线」');
+            return;
+        }
+    }
+    if (!connections.length && nodes.length > 1) {
+        toast('提示：当前没有任何连线，工作流会各跑各的');
+    }
+    toast('开始执行工作流... 共 ' + nodes.length + ' 个节点，' + connections.length + ' 条连线');
     
     // 拓扑排序
     const sorted = topoSort();
@@ -1070,6 +1520,7 @@ function loadWorkflow() {
     if (!data) { toast('没有保存的工作流'); return; }
     try {
         const wf = JSON.parse(data);
+        pushHistory();
         clearCanvas(false);
         wf.nodes.forEach(n => {
             nodes.push(n);
@@ -1089,23 +1540,37 @@ function loadWorkflow() {
     } catch (e) { toast('加载失败: ' + e.message); }
 }
 
-function clearCanvas(confirm = true) {
-    if (confirm && !confirm('确定清空画布？')) return;
+function clearCanvas(ask = true) {
+    // 注意：参数不能叫 confirm —— 会把 window.confirm 遮蔽掉，点「清空」直接抛异常
+    if (ask && !_restoring) pushHistory();
+    if (ask && !window.confirm('确定清空画布？')) return;
     nodes = [];
     connections = [];
     document.querySelectorAll('.node').forEach(el => el.remove());
-    connectionsSvg.innerHTML = '';
+    // 只清连线图层；直接清 svg 会连 <defs> 里的箭头 marker 一起清掉，之后连线就没箭头了
+    connLayer().innerHTML = '';
     selectedNode = null;
+    selectedConnection = null;
+    updateConnections();
+    try { localStorage.removeItem('dola_node_workflow'); } catch (e) {}
     hideProps();
-    if (confirm) toast('画布已清空');
+    if (ask) toast('画布已清空（可点 ↶ 撤销）');
 }
 
 // ==================== 工具函数 ====================
-function toast(msg) {
-    const t = document.getElementById('toast');
-    t.textContent = msg;
-    t.classList.add('show');
-    setTimeout(() => t.classList.remove('show'), 2500);
+function toast(msg, isError) {
+    const box = document.getElementById('toast');
+    if (!box) return;
+    const item = document.createElement('div');
+    item.className = 'item' + (isError ? ' err' : '');
+    item.textContent = msg;
+    box.appendChild(item);
+    while (box.children.length > 4) box.removeChild(box.firstChild);
+    requestAnimationFrame(() => item.classList.add('show'));
+    setTimeout(() => {
+        item.classList.remove('show');
+        setTimeout(() => item.remove(), 300);
+    }, isError ? 4200 : 2600);
 }
 
 // 移动端面板切换
@@ -1118,7 +1583,19 @@ function togglePanel() {
 
 // 初始化
 updateTransform();
-toast('从左侧拖拽节点到画布，连接端口后点执行');
+updateConnections();
+(function restoreLastWorkflow() {
+    // 以前刷新就全没了，用户会以为「连线丢了」。现在自动恢复上次保存的画布。
+    try {
+        const raw = localStorage.getItem('dola_node_workflow');
+        if (!raw) return;
+        const wf = JSON.parse(raw);
+        if (!wf || !wf.nodes || !wf.nodes.length) return;
+        applyCanvasWorkflow(wf);
+        toast('已恢复上次的画布：' + wf.nodes.length + ' 个节点、' + (wf.connections || []).length + ' 条连线');
+    } catch (e) { /* 坏数据就当没有 */ }
+})();
+toast('从左侧拖拽节点到画布；连线有三种方式：拖拽 / 点两下 / 双击端口自动连');
 </script>
 </body>
 </html>

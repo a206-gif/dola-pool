@@ -20,21 +20,40 @@ const SHOT = process.env.DOLA_SHOT || '';   // 可选：把渲染后的 HTML 存
   const vc = new VirtualConsole();
   vc.on('jsdomError', e => errors.push('jsdomError: ' + ((e.detail && e.detail.message) || e.message)));
 
-  let queueCalls = 0, uploadCalls = 0;
+  let queueCalls = 0, uploadCalls = 0, taskCalls = 0;
   const fakeQueue = () => ({ queue_depth: ++queueCalls, active: 1, workers: 4 });
-  const fakeTasks = () => ([{ id: 7, status: 'done', prompt: '测试', video_url: '/files/a.mp4', created_at: '' }]);
+  // 第一次 1 条，之后 2 条：验证「新增行是插进去的，旧行不动」
+  const fakeTasks = () => {
+    taskCalls++;
+    const rows = [{ id: 7, status: 'done', prompt: '测试', video_url: '/files/a.mp4', created_at: '' }];
+    if (taskCalls > 2) rows.unshift({ id: 8, status: 'running', progress: 42, prompt: '第二条', video_url: '', created_at: '' });
+    return rows;
+  };
 
   const dom = new JSDOM(html, {
     url: BASE + '/', runScripts: 'dangerously', pretendToBeVisual: true, virtualConsole: vc,
     beforeParse(w) {
       w.fetch = async (u, o) => {
         const url = String(u);
-        const body = url.includes('api/queue') ? fakeQueue()
-          : url.includes('api/tasks') ? fakeTasks()
-          : url.includes('api/upload-image') ? (uploadCalls++, { ok: true, path: '/tmp/ref1.png', url: '/uploads/ref1.png' })
-          : url.includes('api/proxy-status') ? {}
-          : url.includes('api/stats') ? {}
-          : [];
+        let body = [];
+        if (url.includes('api/accounts')) {
+          body = [{ id: 1, name: '主号', cookie: 'sessionid=x' }];
+        } else if (url.includes('api/model-probe')) {
+          body = { ok: false, model: 'seedance_v2.5', duration: 10,
+            steps: [
+              { name: '生成核心', ok: true, detail: '已加载', hint: '' },
+              { name: '联网检查', ok: true, detail: 'DNS 30ms / TCP 80ms / TLS 120ms', hint: '' },
+              { name: '登录态', ok: false, detail: 'HTTP 302 → 登录页', hint: 'Cookie 可能已失效，去账号池重新导入' }],
+            verdict: '登录态失效：先去账号池更新 Cookie' };
+        } else if (url.includes('api/queue')) {
+          body = fakeQueue();
+        } else if (url.includes('api/tasks')) {
+          body = fakeTasks();
+        } else if (url.includes('api/upload-image')) {
+          uploadCalls++; body = { ok: true, path: '/tmp/ref1.png', url: '/uploads/ref1.png' };
+        } else if (url.includes('api/proxy-status') || url.includes('api/stats')) {
+          body = {};
+        }
         return { ok: true, status: 200, text: async () => JSON.stringify(body), json: async () => body };
       };
       w.alert = () => {}; w.confirm = () => true; w.prompt = () => 'x';
@@ -66,6 +85,31 @@ const SHOT = process.env.DOLA_SHOT || '';   // 可选：把渲染后的 HTML 存
   out.push(['上传接口被调用 3 次', uploadCalls === 3, '实际 ' + uploadCalls + ' 次']);
   out.push(['缩略图出现 3 张', d.querySelectorAll('#refThumbs img').length === 3, '实际 ' + d.querySelectorAll('#refThumbs img').length + ' 张']);
 
+  // —— 模型体检：时长联动 + 弹窗 + 结果渲染 ——
+  const modelSel = $('genModel');
+  modelSel.value = 'seedance_v2.5';
+  modelSel.dispatchEvent(new w.Event('change', { bubbles: true }));
+  const d25 = Array.from($('genDuration').options).map(o => o.value).join(',');
+  out.push(['选 v2.5 时时长只剩 10/30 秒（不会被后端悄悄改成别的）', d25 === '10,30', d25]);
+  modelSel.value = 'seedance_v2.0';
+  modelSel.dispatchEvent(new w.Event('change', { bubbles: true }));
+  const d20 = Array.from($('genDuration').options).map(o => o.value).join(',');
+  out.push(['选 v2.0 时时长恢复 5/10/15 秒', d20 === '5,10,15', d20]);
+
+  $('genProbe').dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+  await new Promise(r => setTimeout(r, 300));
+  out.push(['点「模型体检」弹出体检窗（能选账号）',
+            !!$('probeAccount') && $('probeAccount').options.length === 1,
+            $('probeAccount') ? $('probeAccount').options.length + ' 个账号' : '没弹窗']);
+  $('probeRun').dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+  await new Promise(r => setTimeout(r, 600));
+  const probeText = ($('probeResult') || {}).textContent || '';
+  out.push(['体检结果按步骤列出，并给出结论',
+            /生成核心/.test(probeText) && /登录态/.test(probeText) &&
+            /登录态失效/.test(probeText) && /Cookie 可能已失效/.test(probeText),
+            probeText.replace(/\s+/g, ' ').slice(0, 90)]);
+  if ($('probeResult')) { try { w.eval('closeModal()'); } catch (e) {} }
+
   // 等 2 个刷新周期（定时器 4s），确认表单/参考图没被清掉、动态区确实更新了
   const before = queueCalls;
   await new Promise(r => setTimeout(r, 9500));
@@ -76,6 +120,28 @@ const SHOT = process.env.DOLA_SHOT || '';   // 可选：把渲染后的 HTML 存
   out.push(['参考图没被清掉', d.querySelectorAll('#refThumbs img').length === 3, '实际 ' + d.querySelectorAll('#refThumbs img').length + ' 张']);
   out.push(['队列数字有刷新', /[0-9]/.test(($('genQueueBox') || {}).textContent || ''), (($('genQueueBox') || {}).textContent || '').slice(0, 30)]);
   out.push(['页面没有整页重渲染（表单还是同一个 DOM 节点）', $('genPrompt') === d.getElementById('genPrompt') && !!$('genPrompt'), '']);
+
+  // 闪烁的根因是每 4 秒重建 <video> 和整张任务表。这里直接盯住节点身份：
+  // 同一节点还在 = 浏览器不会重新加载视频（不会闪）。
+  const video = $('genLatestVideo');
+  const row7 = d.querySelector('#genTasksBox tr[data-id="7"]');
+  const videoSrc = video && video.getAttribute('src');
+  out.push(['最近成片用的是常驻 <video>，且已设好地址',
+            !!video && videoSrc === '/files/a.mp4' && video.style.display !== 'none',
+            video ? 'src=' + videoSrc : '没有 video']);
+  out.push(['最近任务渲染成了「一行一个 DOM 节点」', !!row7 && d.querySelectorAll('#genTasksBox tr[data-id]').length >= 1,
+            d.querySelectorAll('#genTasksBox tr[data-id]').length + ' 行']);
+
+  // 再等一个刷新周期：应新增 #8，但 #7 那一行和 <video> 必须还是原来的对象
+  await new Promise(r => setTimeout(r, 5200));
+  const video2 = $('genLatestVideo');
+  const row7b = d.querySelector('#genTasksBox tr[data-id="7"]');
+  out.push(['刷新后 <video> 还是同一个节点（不会重新加载 → 不闪）',
+            !!video2 && video2 === video && video2.getAttribute('src') === videoSrc,
+            video2 === video ? '节点未重建' : '节点被重建了']);
+  out.push(['刷新后旧任务行没被重建（只做增量更新）', !!row7b && row7b === row7, row7b === row7 ? '#7 未重建' : '#7 被换了']);
+  out.push(['新任务出现时只插入新行', !!d.querySelector('#genTasksBox tr[data-id="8"]') && d.querySelectorAll('#genTasksBox tr[data-id]').length === 2,
+            d.querySelectorAll('#genTasksBox tr[data-id]').length + ' 行']);
   out.push(['无 JS 错误', errors.length === 0, errors.slice(0, 3).join(' | ')]);
 
   if (SHOT) require('fs').writeFileSync(SHOT, d.body.innerHTML);

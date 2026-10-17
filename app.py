@@ -34,7 +34,9 @@ import queue
 import re
 import secrets
 import shutil
+import socket
 import sqlite3
+import ssl
 import subprocess
 import sys
 import threading
@@ -53,7 +55,7 @@ from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
                                RedirectResponse, Response)
 from fastapi.staticfiles import StaticFiles
 
-VERSION = "2.0.13"
+VERSION = "2.0.14"
 
 # --------------------------------------------------------------------------
 # 目录与配置
@@ -1334,6 +1336,230 @@ async def api_account_usage(account_id: int, request: Request):
     conn.close()
     audit("account.usage", "id=%s usage=%s" % (account_id, usage))
     return {"ok": True, "id": account_id, "today_usage": usage}
+
+
+# ------------------------- 模型体检（seedance 2.0 / 2.5 是否还有效）-------------------------
+MODEL_DURATIONS = {"seedance_v2.0": (5, 10, 15), "seedance_v2.5": (10, 30)}
+
+
+def _probe_tcp_tls(host: str, port: int = 443, timeout: float = 8.0) -> tuple:
+    """DNS + TCP + TLS 三段，分别报耗时 —— 能直接区分「解析不了 / 连不上 / TLS 被重置」。"""
+    t0 = time.time()
+    try:
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+        ip = infos[0][4][0] if infos else ""
+    except Exception as exc:  # noqa: BLE001
+        return False, "DNS 解析失败：%s" % exc
+    t_dns = (time.time() - t0) * 1000
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout)
+    except Exception as exc:  # noqa: BLE001
+        return False, "TCP 连不上 %s:%s（%s）——检查代理 / 防火墙" % (host, port, exc)
+    t_tcp = (time.time() - t0) * 1000
+    try:
+        ctx = ssl.create_default_context()
+        with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+            proto = ssock.version()
+    except Exception as exc:  # noqa: BLE001
+        try:
+            sock.close()
+        except Exception:
+            pass
+        return False, "TLS 握手失败（%s）——常见于链路被重置：该走代理却直连" % exc
+    return True, "DNS %dms · TCP %dms · TLS %s（%s）" % (t_dns, t_tcp, proto, ip)
+
+
+def _probe_model(account_id, model: str, duration: int, ratio: str, real: bool) -> dict:
+    """体检一个账号 + 一个模型。
+
+    分四步，任何一步失败都能看出是「网络 / 登录态 / 接口 / 模型权限」哪一层的问题：
+      1. 生成核心可导入，并且能按该模型算出提交 URL（纯本地，不联网）
+      2. 网络：DNS / TCP / TLS 到 www.dola.com
+      3. 站点：带该账号 Cookie 打开 /chat/，看是否被踢到登录页
+      4. 接口：GET 提交端点，只看「端点还在不在」（404=路径变了，401/403=Cookie 失效）
+    可选 real=True：真的提交一次生成（会消耗一次额度、在账号里留一条会话），
+    成功就把 conversation_id 报出来 —— 这是唯一能 100% 确认模型可用的办法。
+    """
+    steps = []
+
+    def add(name, ok, detail, hint=""):
+        steps.append({"name": name, "ok": bool(ok), "detail": detail, "hint": hint})
+
+    model = (model or "seedance_v2.5").strip()
+    if model not in MODEL_DURATIONS:
+        model = "seedance_v2.5"
+    duration = int(duration or MODEL_DURATIONS[model][0])
+    allowed = MODEL_DURATIONS[model]
+    coerced = None
+    if duration not in allowed:
+        coerced = duration
+        duration = allowed[0]
+    ratio = ratio if ratio in RATIOS else "9:16"
+
+    conn = db()
+    row = conn.execute("select id,name,cookie from accounts where id=?", (account_id,)).fetchone()
+    conn.close()
+    if row is None:
+        return {"ok": False, "error": "账号不存在", "steps": steps}
+    account = dict(row)
+    cookie, problem = sanitize_cookie(account.get("cookie") or "")
+    if problem or not cookie:
+        add("账号 Cookie", False, problem or "这个账号没有 Cookie", "先去账号池补 Cookie")
+        return {"ok": False, "model": model, "duration": duration, "steps": steps,
+                "verdict": "账号没有可用 Cookie，没法体检"}
+
+    # 1) 生成核心 + 提交 URL（纯本地）
+    dgc, err = load_generator()
+    if dgc is None:
+        add("生成核心", False, "加载失败：%s" % err, "确认 gen/dola_gen_clean.py 在程序目录里")
+        return {"ok": False, "model": model, "duration": duration, "steps": steps,
+                "verdict": "生成核心都加载不了，先修这个"}
+    host = getattr(dgc, "DOLA_HOST", "www.dola.com")
+    try:
+        submit_url = dgc.build_pc_submit_url(30, cookie)
+    except Exception as exc:  # noqa: BLE001
+        add("提交 URL", False, "生成失败：%s" % exc)
+        submit_url = ""
+    else:
+        add("生成核心", True, "已加载；模型 %s，时长 %ss（提交走 pc_client 风格）" % (model, duration),
+            ("你选的 %ss 该模型不支持，已按 %ss 计算" % (coerced, duration)) if coerced else "")
+
+    if DEMO_MODE:
+        add("联网检查", False, "当前是演示模式（不访问外网），体检只能在生产模式做",
+            "设置 → 桌面应用 → 切换到生产模式")
+        return {"ok": False, "demo": True, "model": model, "duration": duration, "steps": steps,
+                "verdict": "演示模式下不联网，切到生产模式再体检"}
+
+    # 2) 网络
+    net_ok, net_detail = _probe_tcp_tls(host)
+    add("网络（DNS/TCP/TLS）", net_ok, net_detail,
+        "" if net_ok else "内核/程序都要走同一条路：要么都能直连，要么都配同一个代理")
+    if not net_ok:
+        return {"ok": False, "model": model, "duration": duration, "steps": steps,
+                "verdict": "网络这一层就断了，跟模型无关；先把代理/网络修好"}
+
+    if _requests is None:
+        add("HTTP 客户端", False, "没装 requests", "pip install -r requirements.txt")
+        return {"ok": False, "model": model, "duration": duration, "steps": steps,
+                "verdict": "缺少 requests，装完再体检"}
+
+    session = _requests.Session()
+    session.trust_env = True                      # 有 HTTPS_PROXY 就跟着走，和别的请求保持一致
+    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    headers = {"User-Agent": ua, "Cookie": cookie, "Accept": "text/html,application/json,*/*"}
+
+    # 3) 站点 + 登录态
+    try:
+        t0 = time.time()
+        r = session.get("https://%s/chat/" % host, headers=headers, timeout=20, allow_redirects=True)
+        ms = int((time.time() - t0) * 1000)
+        body = (r.text or "")[:200000]
+        landed_login = ("/login" in str(r.url)) or ("登录" in body[:4000] and "sessionid" not in body[:4000])
+        add("站点访问", r.status_code < 500, "GET /chat/ → HTTP %d（%dms，最终地址 %s）" % (
+            r.status_code, ms, str(r.url)[:80]),
+            "" if r.status_code < 500 else "站点本身打不开，先看网络")
+        if r.status_code in (401, 403):
+            add("账号登录态", False, "HTTP %d：这个 Cookie 被拒了" % r.status_code,
+                "去账号池【验活】并重新导入 Cookie")
+        elif landed_login:
+            add("账号登录态", False, "页面跳到了登录页 —— Cookie 已失效",
+                "重新从浏览器 F12 复制 Cookie")
+        else:
+            add("账号登录态", True, "带 Cookie 访问没有被踢到登录页（HTTP %d）" % r.status_code)
+    except Exception as exc:  # noqa: BLE001
+        add("站点访问", False, "请求失败：%s" % exc, "网络层刚才是通的，这里失败多半是代理/超时")
+
+    # 4) 提交端点还在不在
+    endpoint_ok = None
+    if submit_url:
+        try:
+            r2 = session.get(submit_url, headers={
+                "User-Agent": ua, "Cookie": cookie, "Accept": "*/*",
+                "Origin": "https://www.dola.com", "Referer": "https://www.dola.com/chat/",
+            }, timeout=20, allow_redirects=False)
+            code = r2.status_code
+            if code == 404:
+                endpoint_ok = False
+                add("提交端点", False, "HTTP 404：提交地址可能变了（接口改版）",
+                    "把这一条发我，我按新接口改")
+            elif code in (401, 403):
+                endpoint_ok = False
+                add("提交端点", False, "HTTP %d：登录态被拒" % code, "重新导入 Cookie")
+            elif code in (200, 204, 301, 302, 400, 405, 415, 422, 429):
+                endpoint_ok = True
+                add("提交端点", True, "HTTP %d：端点存在（GET 不能真正提交，这里只验证路由）" % code)
+            elif code >= 500:
+                endpoint_ok = None
+                add("提交端点", False, "HTTP %d：服务端错误（可能是风控/维护）" % code)
+            else:
+                endpoint_ok = True
+                add("提交端点", True, "HTTP %d" % code)
+        except Exception as exc:  # noqa: BLE001
+            add("提交端点", False, "请求失败：%s" % exc)
+
+    # 4b) 可选：真提交一次
+    real_info = {}
+    if real:
+        try:
+            prompt = "体检：一只橘猫在窗台上打哈欠，阳光，10秒"
+            conv = dgc.submit_video(prompt, ratio, duration, model, cookie)
+            real_info = {"conversation_id": conv}
+            add("真实提交", True, "提交成功，conversation_id=%s（这个号里会多一条会话）" % conv,
+                "已消耗一次生成额度；想看成片就去任务队列点重试/生成")
+        except BaseException as exc:  # noqa: BLE001 （生成器里可能有 sys.exit，也不能把服务带崩）
+            add("真实提交", False, "提交失败：%s" % exc, "这基本就能确认模型/接口这次不可用")
+    else:
+        add("真实提交", None, "没做（会消耗一次额度）。要 100% 确认能不能生成，勾选「真实提交一次」再体检",
+            "")
+
+    # 结论
+    if real_info:
+        verdict = "✅ 真实提交成功：%s 现在可以用（conversation_id=%s）" % (
+            model, real_info.get("conversation_id"))
+        ok = True
+    elif endpoint_ok and not any(s["ok"] is False for s in steps):
+        verdict = ("✅ 四层都通过了（网络 / 登录态 / 端点都在），%s 看起来可用；"
+                   "想 100%% 确认就勾选「真实提交一次」" % model)
+        ok = True
+    else:
+        bad = [s["name"] for s in steps if s["ok"] is False]
+        verdict = "❌ 有问题的是：%s —— 不是模型本身的问题，先按上面每条的提示处理" % "、".join(bad)
+        ok = False
+    return {"ok": ok, "demo": False, "model": model, "duration": duration, "ratio": ratio,
+            "coerced_from": coerced, "steps": steps, "verdict": verdict,
+            "account": {"id": account_id, "name": account.get("name") or ""}}
+
+
+@app.post("/api/model-probe")
+async def api_model_probe(request: Request):
+    """模型体检：network / 登录态 / 提交端点 / （可选）真实提交 一条龙。"""
+    try:
+        x = await request.json()
+    except Exception:  # noqa: BLE001
+        x = {}
+    account_id = x.get("account_id")
+    if not account_id:
+        conn = db()
+        row = conn.execute("select id from accounts order by id limit 1").fetchone()
+        conn.close()
+        account_id = row["id"] if row else None
+    if not account_id:
+        return JSONResponse({"error": "账号池里还没有账号"}, 400)
+    try:
+        account_id = int(account_id)
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "account_id 要填数字"}, 400)
+    from starlette.concurrency import run_in_threadpool
+    result = await run_in_threadpool(
+        _probe_model, account_id,
+        str(x.get("model") or "seedance_v2.5"),
+        int(x.get("duration") or 0),
+        str(x.get("ratio") or "9:16"),
+        bool(x.get("real")),
+    )
+    audit("model.probe", "id=%s model=%s ok=%s real=%s" % (
+        account_id, result.get("model"), result.get("ok"), bool(x.get("real"))))
+    return result
 
 
 @app.post("/api/accounts/{account_id}/check")

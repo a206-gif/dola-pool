@@ -490,10 +490,17 @@ async function pageGenerate(){
         '<div class="dim" id="refHint" style="font-size:12px;margin-top:6px"></div></div>' +
       '<div class="row" style="margin-top:16px"><button class="btn primary" id="genSubmit">✧ 提交任务</button>' +
         '<button class="btn" onclick="openAiAssist()">✦ AI 帮我写提示词</button>' +
+        '<button class="btn" id="genProbe" title="检查网络 / 登录态 / 提交端点，确认所选模型能不能用">🩺 模型体检</button>' +
         '<span class="dim" id="genHint"></span></div>' +
     '</div>' +
-    '<div><div class="panel"><h2>☷ 队列状态</h2><div id="genQueueBox"></div></div>' +
-      '<div class="panel"><h2>▶ 最近成片</h2><div class="video-box" id="genLatestBox">加载中…</div></div>' +
+    '<div><div class="panel"><h2>☷ 队列状态</h2><div id="genQueueBox">' +
+      '<div class="grid g2">' +
+        '<div class="card"><div class="k muted">排队中</div><div id="genQueueDepth" style="font-size:22px;font-weight:700">0</div></div>' +
+        '<div class="card"><div class="k muted">执行中</div><div id="genActiveText" style="font-size:22px;font-weight:700;color:#7bc8e2">0/0</div></div>' +
+      '</div></div></div>' +
+      '<div class="panel"><h2>▶ 最近成片</h2><div class="video-box" id="genLatestBox">' +
+        '<video id="genLatestVideo" controls style="display:none"></video>' +
+        '<div id="genLatestEmpty" class="dim">暂无成片</div></div></div>' +
     '</div>' +
   '</div>' +
   '<div class="panel"><h2>最近任务</h2><div id="genTasksBox"><span class="dim">加载中…</span></div></div>';
@@ -505,6 +512,23 @@ async function pageGenerate(){
     $('refHint').textContent = state.genRefs.length ? ('已上传 ' + state.genRefs.length + ' 张：' + state.genRefs.map(r => r.path.split(/[\\/]/).pop()).join('、')) : '还没有参考图';
   };
   paintRefs();
+  // 2.5 只支持 10/30 秒，2.0 支持 5/10/15 —— 选错会被后端悄悄改掉，这里直接限制，别让人猜
+  const syncDurations = () => {
+    const model = $('genModel').value;
+    const allowed = model === 'seedance_v2.5' ? ['10', '30'] : ['5', '10', '15'];
+    const sel = $('genDuration');
+    const keep = sel.value;
+    sel.innerHTML = allowed.map(v => '<option>' + v + '</option>').join('');
+    sel.value = allowed.indexOf(keep) >= 0 ? keep : allowed[0];
+    const hint = $('genHint');
+    if (hint) hint.textContent = model === 'seedance_v2.5'
+      ? 'v2.5 只支持 10 / 30 秒' : 'v2.0 支持 5 / 10 / 15 秒';
+  };
+  $('genModel').onchange = syncDurations;
+  syncDurations();
+
+  $('genProbe').onclick = () => probeModel();
+
   $('genRefs').onchange = async (e) => {
     const files = Array.from(e.target.files || []);
     e.target.value = '';                       // 允许再次选同一张
@@ -550,18 +574,155 @@ async function pageGenerate(){
 
 async function refreshGenDynamic(){
   const [queue, tasks] = await Promise.all([api('api/queue'), api('api/tasks?limit=6')]);
-  const qb = $('genQueueBox'); if (!qb) return;      // 已经切走了就别动
+  if (!$('genQueueBox')) return;                    // 已经切走了就别动
+
+  // 队列数字：只改文本（以前是整块 innerHTML 重建，会闪）
+  const qd = $('genQueueDepth'); if (qd) qd.textContent = String(queue.queue_depth);
+  const at = $('genActiveText'); if (at) at.textContent = queue.active + '/' + queue.workers;
+
+  // 最近成片：video 元素始终是同一个，只换 src —— 以前每 4 秒重建一次 <video>，
+  // 浏览器就把视频重新加载一遍，看着就是「一直在闪」。
+  const v = $('genLatestVideo'), empty = $('genLatestEmpty');
   const latest = tasks.find(t => t.video_url);
-  qb.innerHTML =
-    '<div class="grid g2">' +
-      '<div class="card"><div class="k muted">排队中</div><div style="font-size:22px;font-weight:700">' + queue.queue_depth + '</div></div>' +
-      '<div class="card"><div class="k muted">执行中</div><div style="font-size:22px;font-weight:700;color:#7bc8e2">' + queue.active + '/' + queue.workers + '</div></div>' +
-    '</div>';
-  const lb = $('genLatestBox');
-  if (lb) lb.innerHTML = latest ? '<video src="' + esc(latest.video_url) + '" controls></video>' : '暂无成片';
+  const wantSrc = latest ? latest.video_url : '';
+  if (v) {
+    const nowSrc = v.getAttribute('src') || '';
+    if (wantSrc && nowSrc !== wantSrc) {
+      const keepTime = nowSrc ? v.currentTime : 0;
+      v.setAttribute('src', wantSrc);
+      v.style.display = '';
+      if (keepTime) { try { v.currentTime = keepTime; } catch (e) {} }
+    } else if (!wantSrc && nowSrc) {
+      v.removeAttribute('src');
+      try { v.load(); } catch (e) {}
+      v.style.display = 'none';
+    }
+    if (wantSrc) v.style.display = '';
+  }
+  if (empty) empty.style.display = latest ? 'none' : '';
+
+  // 最近任务：按任务 id 增量更新，只有内容真变了才碰 DOM
   const tb = $('genTasksBox');
-  if (tb) tb.innerHTML = taskTable(tasks, true);
+  if (tb) updateTaskRows(tb, tasks);
 }
+
+/* 最近任务表：同一行始终是同一个 DOM 节点，只更新变化的单元格。
+   （以前每次刷新都 innerHTML 重建整张表，任务在跑时每 4 秒闪一下。） */
+function updateTaskRows(box, tasks){
+  if (!tasks.length) {
+    if (!box.querySelector('.empty')) box.innerHTML = '<div class="empty">暂无任务</div>';
+    return;
+  }
+  let tbody = box.querySelector('tbody');
+  if (!tbody) {
+    box.innerHTML = '<div class="scroll-x"><table><thead><tr><th>ID</th><th>提示词</th>' +
+      '<th>账号</th><th>状态</th><th>操作</th></tr></thead><tbody></tbody></table></div>';
+    tbody = box.querySelector('tbody');
+  }
+  const seen = new Set();
+  tasks.forEach((t, idx) => {
+    seen.add(String(t.id));   // dataset 里是字符串，这里必须同样用字符串，否则刚插入的行会被当成「已消失」删掉
+    let row = tbody.querySelector('tr[data-id="' + t.id + '"]');
+    if (!row) { row = buildTaskRow(t); row.dataset.id = t.id; }
+    if (tbody.children[idx] !== row) tbody.insertBefore(row, tbody.children[idx] || null);
+    updateTaskRow(row, t);
+  });
+  Array.from(tbody.children).forEach(r => { if (!seen.has(String(r.dataset.id))) r.remove(); });
+}
+
+function buildTaskRow(t){
+  const tr = document.createElement('tr');
+  tr.innerHTML =
+    '<td class="mono"></td>' +
+    '<td style="max-width:340px"><div class="prompt-cell" style="display:-webkit-box;-webkit-line-clamp:2;' +
+      '-webkit-box-orient:vertical;overflow:hidden"></div></td>' +
+    '<td class="dim account-cell"></td>' +
+    '<td><div class="status-cell"></div></td>' +
+    '<td style="white-space:nowrap"><div class="act-cell"></div></td>';
+  return tr;
+}
+
+function updateTaskRow(tr, t){
+  const set = (sel, text) => {
+    const el = tr.querySelector(sel);
+    if (el && el.textContent !== text) el.textContent = text;
+  };
+  set('td.mono', t.id);
+  set('.prompt-cell', (t.prompt || '').slice(0, 160));
+  set('.account-cell', t.account_id ? '#' + t.account_id : '自动');
+  const statusCell = tr.querySelector('.status-cell');
+  const progress = (t.status === 'running' || t.status === 'queued')
+    ? '<div class="bar" style="margin-top:6px"><i style="width:' + (t.progress || 0) + '%"></i></div>' +
+      '<div class="dim" style="font-size:11px;margin-top:3px">' + esc((t.result || '').slice(0, 40)) + '</div>'
+    : (t.status === 'failed'
+        ? '<div class="dim" style="font-size:11px;margin-top:4px;max-width:220px">' +
+          esc((t.error || t.result || '').slice(0, 80)) + '</div>' : '');
+  const sig = [t.status, t.progress, t.result, t.error].join('|');
+  if (statusCell && statusCell.dataset.sig !== sig) {
+    statusCell.dataset.sig = sig;
+    statusCell.innerHTML = statusBadge(t.status) + progress;
+  }
+  const actCell = tr.querySelector('.act-cell');
+  const actSig = [t.video_url || '', t.status].join('|');
+  if (actCell && actCell.dataset.sig !== actSig) {
+    actCell.dataset.sig = actSig;
+    actCell.innerHTML =
+      (t.video_url ? '<button class="btn sm" onclick="playVideo(\'' + t.video_url + '\',\'' + esc(t.id) + '\')">▶ 播放</button> ' : '') +
+      (t.status === 'failed' ? '<button class="btn sm" onclick="retryTask(\'' + t.id + '\')">↻ 重试</button> ' : '');
+  }
+}
+async function probeModel(){
+  const accounts = await api('api/accounts').catch(() => []);
+  const withCookie = accounts.filter(a => a.cookie);
+  if (!withCookie.length) {
+    toast('账号池里还没有可用账号，先去【账号池】导入 Cookie', true);
+    return;
+  }
+  const opts = withCookie.map(a => '<option value="' + a.id + '">#' + a.id + ' ' + esc(a.name) + '</option>').join('');
+  const model = ($('genModel') || {}).value || 'seedance_v2.5';
+  openModal('🩺 模型体检', 
+    '<div class="grid g2">' +
+      '<div><label class="f">账号</label><select id="probeAccount">' + opts + '</select></div>' +
+      '<div><label class="f">模型</label><select id="probeModel">' +
+        '<option value="seedance_v2.5"' + (model === 'seedance_v2.5' ? ' selected' : '') + '>seedance_v2.5</option>' +
+        '<option value="seedance_v2.0"' + (model === 'seedance_v2.0' ? ' selected' : '') + '>seedance_v2.0</option>' +
+      '</select></div>' +
+    '</div>' +
+    '<p class="muted" style="font-size:12.5px;margin-top:10px">依次检查：生成核心 → 网络(DNS/TCP/TLS) → 站点与登录态 → 提交端点。' +
+      '这些都不消耗额度。<br>勾选「真实提交一次」会真的提交一个 10 秒任务（消耗一次额度、账号里多一条会话），' +
+      '那是唯一能 100% 确认模型可用的办法。</p>' +
+    '<label class="row" style="gap:8px;font-size:13px;margin-top:6px">' +
+      '<input type="checkbox" id="probeReal" style="width:auto"> 真实提交一次（消耗一次额度）</label>' +
+    '<div id="probeResult" style="margin-top:12px"></div>' +
+    '<div class="foot"><button class="btn" onclick="closeModal()">关闭</button>' +
+      '<button class="btn primary" id="probeRun">开始体检</button></div>');
+  $('probeRun').onclick = async () => {
+    const btn = $('probeRun');
+    btn.disabled = true; btn.textContent = '体检中…';
+    $('probeResult').innerHTML = '<div class="dim" style="font-size:13px">正在检查，最长约 30 秒…</div>';
+    try {
+      const r = await api('api/model-probe', {method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({account_id: Number($('probeAccount').value),
+          model: $('probeModel').value, real: $('probeReal').checked})});
+      const rows = (r.steps || []).map(s => {
+        const mark = s.ok === true ? '✅' : s.ok === false ? '❌' : '◻';
+        return '<tr><td style="white-space:nowrap">' + mark + ' ' + esc(s.name) + '</td>' +
+          '<td class="dim" style="font-size:12.5px">' + esc(s.detail || '') +
+          (s.hint ? '<div style="color:#f5c76b;font-size:11.5px">↳ ' + esc(s.hint) + '</div>' : '') +
+          '</td></tr>';
+      }).join('');
+      $('probeResult').innerHTML =
+        '<div class="panel" style="margin:0;padding:12px"><div style="font-size:13.5px;font-weight:600;margin-bottom:8px">' +
+          esc(r.verdict || '') + '</div>' +
+        '<div class="scroll-x"><table style="font-size:13px"><tbody>' + rows + '</tbody></table></div></div>';
+    } catch(e){
+      $('probeResult').innerHTML = '<div class="badge bad">体检失败：' + esc(e.message) + '</div>';
+    } finally {
+      btn.disabled = false; btn.textContent = '再体检一次';
+    }
+  };
+}
+
 function openAiAssist(){
   formModal('AI 生成提示词', [
     {key:'script', label:'内容梗概 / 脚本', type:'textarea', placeholder:'例：女孩在便利店门口等雨停，男生递伞…'},
