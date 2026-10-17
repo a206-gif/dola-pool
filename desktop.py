@@ -1371,9 +1371,16 @@ class Control:
         """用带扩展的真实 Edge/Chrome 打开某个账号的 Dola 页面（CK 由扩展写进去）。"""
         out = payload.get("out")
         account_id = int(payload.get("account_id") or 0)
-        if str(payload.get("op") or "launch") == "manager":
+        op = str(payload.get("op") or "launch")
+        fingerprint = bool(payload.get("fingerprint"))
+        if op == "manager":
             # 这个账号的 profile 里手动装扩展（Chrome 137+ 才需要）
             result = open_extension_manager(profile=account_browser_profile(account_id))
+        elif op == "read_cookies":
+            # 手动登录之后，把这个窗口里的 CK 读回来存进账号池
+            sess = self._browser_sessions.get(account_id)
+            port = int((sess or {}).get("port") or 0) or account_debug_port(account_id)
+            result = cdp_read_cookies(port)
         else:
             cookie = str(payload.get("cookie") or "")
             target = str(payload.get("url") or "https://www.dola.com/chat/")
@@ -1407,7 +1414,8 @@ class Control:
                 proxy_arg = str((getattr(self, "net_info", {}) or {}).get("proxy_arg") or "")
                 result = launch_account_browser(
                     account_id, target, proxy_arg=proxy_arg,
-                    cookie=cookie, fallback_url=bridge_url)
+                    cookie=cookie, fallback_url=bridge_url,
+                    fingerprint=fingerprint)
                 if result.get("ok"):
                     self._browser_sessions[account_id] = {
                         "port": result.get("debug_port"), "pid": result.get("pid"),
@@ -1509,7 +1517,8 @@ class Control:
                         launched = launch_account_browser(account_id, "about:blank",
                                                           proxy_arg=proxy_arg,
                                                           debug_port=port,
-                                                          cookie=str(payload.get("cookie") or ""))
+                                                          cookie=str(payload.get("cookie") or ""),
+                                                          fingerprint=bool(payload.get("fingerprint")))
                         if not launched.get("ok"):
                             result["error"] = launched.get("error") or "启动带扩展的浏览器失败"
                             if isinstance(out, dict):
@@ -2893,8 +2902,136 @@ def account_browser_profile(account_id: int) -> str:
     return os.path.join(DATA_DIR, "account-browsers", safe)
 
 
+# ---------------------------------------------------------------- 浏览器指纹
+# 每个账号固定一套自洽的「设备身份」：UA / client hints / 语言 / 时区 / CPU / 内存。
+# 用账号 id 取模，所以同一个账号每次都是同一套；不同账号之间尽量不一样。
+# 注意：这只覆盖最容易关联的几项，Canvas / WebGL / 字体仍然是本机的真实值 ——
+# 不承诺「不可检测」，也挡不住 Dola 自己的风控；默认关闭，需要时在账号上单独开。
+_FP_PROFILES = [
+    ("139.0.0.0", "zh-CN", "Asia/Shanghai", "Win32", 8, 8),
+    ("140.0.0.0", "zh-CN", "Asia/Singapore", "Win32", 12, 8),
+    ("141.0.0.0", "zh-TW", "Asia/Taipei", "Win32", 8, 16),
+    ("142.0.0.0", "en-US", "Asia/Singapore", "Win32", 16, 8),
+    ("143.0.0.0", "zh-CN", "Asia/Shanghai", "Win32", 4, 4),
+    ("140.0.0.0", "en-US", "Asia/Tokyo", "Win32", 20, 16),
+]
+_FP_LANGS = {
+    "zh-CN": ("zh-CN,zh;q=0.9,en;q=0.8", ["zh-CN", "zh", "en"]),
+    "zh-TW": ("zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7", ["zh-TW", "zh", "en-US", "en"]),
+    "en-US": ("en-US,en;q=0.9", ["en-US", "en"]),
+}
+
+
+def fingerprint_profile(account_id: int) -> dict:
+    """按账号 id 生成一套固定的浏览器指纹（同一账号永远同一套）。"""
+    version, lang, tz, platform_name, cores, memory = \
+        _FP_PROFILES[abs(int(account_id or 0)) % len(_FP_PROFILES)]
+    major = version.split(".")[0]
+    accept_language, languages = _FP_LANGS.get(lang, ("zh-CN,zh;q=0.9", ["zh-CN", "zh"]))
+    ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/%s Safari/537.36" % version)
+    script = (
+        "(function(){try{"
+        "var def=function(k,v){try{Object.defineProperty(Navigator.prototype,k,"
+        "{get:function(){return v},configurable:true})}catch(e){}};"
+        "def('platform',%r);def('hardwareConcurrency',%d);def('deviceMemory',%d);"
+        "def('language',%r);def('languages',%r);"
+        "}catch(e){}})();" % (platform_name, cores, memory, lang, languages)
+    )
+    return {
+        "account_id": int(account_id or 0),
+        "ua": ua,
+        "lang": lang,
+        "accept_language": accept_language,
+        "timezone": tz,
+        "platform": platform_name,
+        "cores": cores,
+        "memory": memory,
+        "languages": languages,
+        "metadata": {
+            "brands": [{"brand": "Google Chrome", "version": major},
+                       {"brand": "Chromium", "version": major},
+                       {"brand": "Not_A Brand", "version": "24"}],
+            "fullVersion": version,
+            "platform": "Windows",
+            "platformVersion": "15.0.0",
+            "architecture": "x86",
+            "model": "",
+            "mobile": False,
+        },
+        "script": script,
+    }
+
+
+def apply_fingerprint(port: int, profile: dict) -> dict:
+    """把指纹套到浏览器当前标签页上（要在导航到 dola 之前调用）。"""
+    out = {"ok": False, "error": ""}
+    if not profile:
+        out["error"] = "没有指纹配置"
+        return out
+    page = choose_page_target(port, create=False)
+    if not page:
+        out["error"] = "这个浏览器没有可用的标签页"
+        return out
+    try:
+        with _CdpPage(page["webSocketDebuggerUrl"], timeout=15) as cdp:
+            cdp.call("Page.enable", timeout=6)
+            cdp.call("Emulation.setUserAgentOverride", {
+                "userAgent": profile["ua"],
+                "acceptLanguage": profile["accept_language"],
+                "platform": profile["platform"],
+                "userAgentMetadata": profile["metadata"],
+            }, timeout=8)
+            try:
+                cdp.call("Emulation.setLocaleOverride", {"locale": profile["lang"]}, timeout=5)
+            except Exception:  # noqa: BLE001 - 个别内核不支持，不影响主要项
+                pass
+            try:
+                cdp.call("Emulation.setTimezoneOverride",
+                         {"timezoneId": profile["timezone"]}, timeout=5)
+            except Exception:  # noqa: BLE001
+                pass
+            cdp.call("Page.addScriptToEvaluateOnNewDocument",
+                     {"source": profile["script"]}, timeout=6)
+        out["ok"] = True
+    except Exception as exc:  # noqa: BLE001
+        out["error"] = str(exc)
+    return out
+
+
+def cdp_read_cookies(port: int, host: str = "dola.com") -> dict:
+    """从已经打开的账号窗口里读回 dola 的 Cookie（手动登录后存回账号池用）。"""
+    out = {"ok": False, "cookie": "", "count": 0, "error": ""}
+    page = choose_page_target(port, create=False)
+    if not page:
+        out["error"] = "这个浏览器没有可用的标签页：先在账号池点【🌐 网页】把它打开"
+        return out
+    try:
+        with _CdpPage(page["webSocketDebuggerUrl"], timeout=15) as cdp:
+            try:
+                cdp.call("Network.enable", timeout=6)
+            except Exception:  # noqa: BLE001
+                pass
+            data = cdp.call("Network.getCookies",
+                            {"urls": ["https://www.dola.com/chat/"]}, timeout=12)
+            seen, parts = set(), []
+            for item in data.get("cookies") or []:
+                if host not in str(item.get("domain") or ""):
+                    continue
+                name = str(item.get("name") or "").strip()
+                if not name or name in seen:
+                    continue
+                seen.add(name)
+                parts.append("%s=%s" % (name, item.get("value") or ""))
+        out.update(ok=True, cookie="; ".join(parts), count=len(parts))
+    except Exception as exc:  # noqa: BLE001
+        out["error"] = str(exc)
+    return out
+
+
 def build_account_browser_command(browser: str, profile_dir: str, ext_dirs: list,
-                                  url: str, proxy_arg: str = "", debug_port: int = 0) -> list:
+                                  url: str, proxy_arg: str = "", debug_port: int = 0,
+                                  fingerprint: dict = None) -> list:
     """带扩展 + 代理 + 调试端口的账号窗口启动参数（抽出来便于不开浏览器自检）。"""
     joined = ",".join(ext_dirs)
     cmd = [
@@ -2912,6 +3049,10 @@ def build_account_browser_command(browser: str, profile_dir: str, ext_dirs: list
                 "--remote-debugging-port=%d" % int(debug_port)]
     if proxy_arg:
         cmd += ["--proxy-server=" + proxy_arg, _PROXY_BYPASS]
+    if fingerprint:
+        # 从第一个请求开始就用这套 UA（之后再让 CDP 把 client hints 也对齐）
+        cmd += ["--user-agent=" + fingerprint["ua"],
+                "--lang=" + fingerprint["lang"]]
     cmd.append(url)
     return cmd
 
@@ -2919,7 +3060,7 @@ def build_account_browser_command(browser: str, profile_dir: str, ext_dirs: list
 def launch_account_browser(account_id: int, url: str, ext_roots: list = None,
                            browser: str = "", proxy_arg: str = "",
                            debug_port: int = 0, cookie: str = "",
-                           fallback_url: str = "") -> dict:
+                           fallback_url: str = "", fingerprint: bool = False) -> dict:
     """用带扩展的 Edge/Chrome 打开「这个账号」的 Dola 页面。
 
     登录态：优先用 CDP 直接把 CK 写进浏览器（稳、不等扩展）；写不进去时
@@ -2927,10 +3068,11 @@ def launch_account_browser(account_id: int, url: str, ext_roots: list = None,
     """
     info_extra = {"login": "url", "cookie_count": 0, "url_used": url}
     exts = discover_extensions(ext_roots)
+    fp = fingerprint_profile(account_id) if fingerprint else None
     info = {"ok": False, "browser": "", "account_id": int(account_id or 0),
             "extensions": [e["name"] for e in exts], "command": "", "error": "",
             "profile": account_browser_profile(account_id), "warning": "",
-            "load_extension_supported": True}
+            "load_extension_supported": True, "fingerprint": bool(fp)}
     info.update(info_extra)
     if not exts:
         info["error"] = ("没找到扩展：把扩展放到程序目录的 extensions/ 下，"
@@ -2962,7 +3104,8 @@ def launch_account_browser(account_id: int, url: str, ext_roots: list = None,
     # 扩展没醒也不影响登录，扩展醒了就是两条路写同一份 CK。
     open_url = (fallback_url or url) if cookie else url
     cmd = build_account_browser_command(exe, profile, [e["path"] for e in exts],
-                                        open_url, proxy_arg=proxy_arg, debug_port=debug_port)
+                                        open_url, proxy_arg=proxy_arg, debug_port=debug_port,
+                                        fingerprint=fp)
     info["browser"] = exe
     info["browser_version"] = browser_version(exe)
     info["debug_port"] = debug_port
@@ -2979,6 +3122,13 @@ def launch_account_browser(account_id: int, url: str, ext_roots: list = None,
     except ValueError:
         boot_wait = 15.0
     info["cdp"] = wait_cdp(debug_port, boot_wait)
+    if fp and info["cdp"]:
+        # 先套指纹、再写 CK 并导航：这样 dola 第一次看到的就是伪装后的身份
+        fp_result = apply_fingerprint(debug_port, fp)
+        info["fingerprint_applied"] = bool(fp_result.get("ok"))
+        if not fp_result.get("ok"):
+            info["warning"] = (info["warning"] + " 指纹没套上（%s），这个窗口按真实身份运行"
+                               % (fp_result.get("error") or "未知原因")).strip()
     if cookie:
         if info["cdp"]:
             login = cdp_login(debug_port, cookie, url=url, navigate=True)

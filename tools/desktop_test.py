@@ -1164,7 +1164,14 @@ def main():
         status, res = call("POST", "/api/accounts/999999/web")
         check("不存在的账号 → 404", status == 404, str(res)[:80])
         status, res = call("POST", "/api/accounts", {"name": "空号", "cookie": ""})
-        check("空 Cookie 建号被拒（不会再存进坏数据）", status == 400 and "Cookie" in str(res), str(res)[:110])
+        check("空 Cookie 可以建「未登录实例」（v2.2.0）",
+              status == 200 and res.get("has_cookie") is False, str(res)[:110])
+        if status == 200:
+            empty_id = res.get("id")
+            status, res2 = call("POST", "/api/accounts", {"name": "坏号", "cookie": "这不是 cookie"})
+            check("但乱填的内容还是会被拒（不会存进坏数据）",
+                  status == 400 and "Cookie" in str(res2), str(res2)[:110])
+            call("DELETE", "/api/accounts/%s" % empty_id)
         check("代理入口可访问（沙箱无外网时给出「连不上 Dola」说明页，而不是 500）",
               live_proxy_check(acc_id), "GET /dola-web/%s/" % acc_id)
 

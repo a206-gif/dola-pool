@@ -39,8 +39,10 @@ import sqlite3
 import ssl
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import zipfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -54,8 +56,9 @@ from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
                                RedirectResponse, Response)
 from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
 
-VERSION = "2.1.4"
+VERSION = "2.2.0"
 
 # --------------------------------------------------------------------------
 # 目录与配置
@@ -175,6 +178,7 @@ def init_db() -> None:
         "alter table accounts add column daily_limit integer default 0",       # 0 = 用全局默认
         "alter table accounts add column usage_manual integer default 0",      # 手动设置的今日用量
         "alter table accounts add column usage_manual_date text default ''",   # 上面那个值是哪天的
+        "alter table accounts add column fingerprint integer default 0",       # 1 = 这个账号的窗口启用指纹伪装
         "alter table proxies add column region text default ''",
         "alter table proxies add column created_at text",
     ):
@@ -526,6 +530,17 @@ def local_account_check(account_id: int, deep: bool = True) -> dict:
         return {"ok": False, "id": account_id, "state": "missing", "detail": "账号不存在"}
 
     stored = row["cookie"] or ""
+    if not stored.strip():
+        # 实例还没登录：不是「坏 CK」，别把它标成 invalid（导入 CK 后要能直接用）
+        checked = utcnow()
+        conn.execute("update accounts set check_state='no_cookie', check_detail=?, "
+                     "last_checked=?, text_ok=0, image_ok=0 where id=?",
+                     ("还没有 CK（未登录）：可以当实例打开浏览器，导入 CK 后就能生成",
+                      checked, account_id))
+        conn.commit()
+        conn.close()
+        return {"ok": False, "id": account_id, "name": row["name"], "state": "no_cookie",
+                "detail": "还没有 CK（未登录）", "text_ok": False, "last_checked": checked}
     cookie, problem = sanitize_cookie(stored)
     note = ""
     if not problem and cookie != stored.strip():
@@ -798,6 +813,12 @@ def _submit_via_browser_kernel(task: dict, cookie: str) -> str:
     """让带扩展的账号浏览器提交，返回 conversation_id。"""
     out = {}
     account_id = task.get("account_id")
+    fp = False
+    if account_id:
+        conn = db()
+        row = conn.execute("select fingerprint from accounts where id=?", (account_id,)).fetchone()
+        conn.close()
+        fp = bool(row and row["fingerprint"])
     _update_task(task["id"], progress=18,
                  result="正在用扩展内核提交（会自己操作带扩展的浏览器窗口）…")
     _control_hook("browser_generate", {
@@ -807,6 +828,7 @@ def _submit_via_browser_kernel(task: dict, cookie: str) -> str:
         "duration": int(task.get("duration") or 30),
         "ratio": task.get("ratio") or "9:16",
         "cookie": cookie,
+        "fingerprint": fp,
         "out": out,
     })
     if not out.get("ok"):
@@ -1348,27 +1370,52 @@ def api_accounts() -> list:
     for acc in out:                      # usage_manual 是内部字段，不进界面
         acc.pop("usage_manual", None)
         acc.pop("usage_manual_date", None)
+        # 没有 CK 也能先建一个「实例」：界面据此显示「未登录」并引导补 CK
+        acc["has_cookie"] = bool((acc.get("cookie") or "").strip())
+        acc["fingerprint"] = bool(acc.get("fingerprint"))
     return out
 
 
 @app.post("/api/accounts")
 async def api_add_account(request: Request):
+    """新增账号。
+
+    CK 可以留空 —— 这时它只是一个「实例」：能开浏览器窗口、能挂代理，
+    只是还没登录。界面会标成「未登录」，补上 CK 之后立刻能用来生成。
+    """
     x = await request.json()
     name = (x.get("name") or "").strip() or f"账号 {utcnow()[:16]}"
-    cookie, problem = sanitize_cookie(x.get("cookie"))
-    if problem:
-        return JSONResponse({"error": problem}, 400)
+    raw_cookie = x.get("cookie")
+    cookie = ""
+    if isinstance(raw_cookie, str) and raw_cookie.strip():
+        cookie, problem = sanitize_cookie(raw_cookie)
+        if problem:
+            return JSONResponse({"error": problem}, 400)
+    elif raw_cookie not in (None, "") and not isinstance(raw_cookie, str):
+        cookie, problem = sanitize_cookie(raw_cookie)
+        if problem:
+            return JSONResponse({"error": problem}, 400)
+    fingerprint = 1 if x.get("fingerprint") in (True, 1, "1", "true", "yes", "on", "是") else 0
     conn = db()
     cur = conn.execute(
-        "insert into accounts(name,cookie,points,created_at,note) values(?,?,?,?,?)",
-        (name, cookie, int(x.get("points") or 0), utcnow(), x.get("note") or ""),
+        "insert into accounts(name,cookie,points,created_at,note,fingerprint) values(?,?,?,?,?,?)",
+        (name, cookie, int(x.get("points") or 0), utcnow(), x.get("note") or "", fingerprint),
     )
     account_id = cur.lastrowid
+    if cookie:
+        conn.execute("update accounts set check_state='unchecked', check_detail='' where id=?", (account_id,))
+    else:
+        conn.execute("update accounts set check_state='no_cookie', check_detail=? where id=?",
+                     ("还没有 CK（未登录）：可以当实例打开浏览器，导入 CK 后就能生成", account_id))
     conn.commit()
     conn.close()
-    audit("account.create", name)
+    audit("account.create", "%s%s%s" % (name, "（未登录）" if not cookie else "", " 指纹=开" if fingerprint else ""))
+    if not cookie:
+        return {"ok": True, "id": account_id, "has_cookie": False,
+                "check": {"ok": False, "state": "no_cookie",
+                          "detail": "已作为实例添加（未登录）；导入 CK 后就能用来生成"}}
     result = local_account_check(account_id, deep=bool(x.get("verify")))
-    return {"ok": True, "id": account_id, "check": result}
+    return {"ok": True, "id": account_id, "has_cookie": True, "check": result}
 
 
 @app.get("/api/accounts/export")
@@ -1412,6 +1459,63 @@ def api_export_accounts(format: str = "json") -> Response:
     return Response(content=body, media_type=media,
                     headers={"Content-Disposition": "attachment; filename=\"%s\"" % filename,
                              "Cache-Control": "no-store"})
+
+
+@app.post("/api/accounts/{account_id}/cookie")
+async def api_set_account_cookie(account_id: int, request: Request):
+    """给单个账号导入 / 替换 / 清空 CK（不影响别的账号）。"""
+    x = await request.json()
+    conn = db()
+    row = conn.execute("select * from accounts where id=?", (account_id,)).fetchone()
+    if row is None:
+        conn.close()
+        return JSONResponse({"error": "账号不存在"}, 404)
+    if x.get("clear"):
+        conn.execute("update accounts set cookie='', check_state='no_cookie', check_detail=?, "
+                     "last_checked='' where id=?",
+                     ("还没有 CK（未登录）", account_id))
+        conn.commit()
+        conn.close()
+        audit("account.cookie.clear", "id=%s" % account_id)
+        return {"ok": True, "id": account_id, "has_cookie": False, "cleared": True}
+    raw = x.get("cookie")
+    if not isinstance(raw, str) or not raw.strip():
+        conn.close()
+        return JSONResponse({"error": "要导入的 CK 是空的"}, 400)
+    cookie, problem = sanitize_cookie(raw)
+    if problem:
+        conn.close()
+        return JSONResponse({"error": problem}, 400)
+    # 之前是 invalid 的，导入新 CK 后恢复成 active（paused 是用户手动停的，不动它）
+    conn.execute("update accounts set cookie=?, check_state='unchecked', check_detail='', "
+                 "last_checked='', status=case when status='invalid' then 'active' else status end "
+                 "where id=?", (cookie, account_id))
+    conn.commit()
+    conn.close()
+    audit("account.cookie.import", "id=%s" % account_id)
+    out = {"ok": True, "id": account_id, "has_cookie": True,
+           "count": len(bridge_cookie_list(cookie))}
+    if x.get("verify"):
+        out["check"] = local_account_check(account_id, deep=True)
+    return out
+
+
+@app.get("/api/accounts/{account_id}/ck")
+def api_get_account_cookie(account_id: int):
+    """单独导出某个账号的完整 CK（本地使用；响应不缓存）。"""
+    conn = db()
+    row = conn.execute("select id,name,cookie from accounts where id=?", (account_id,)).fetchone()
+    conn.close()
+    if row is None:
+        return JSONResponse({"error": "账号不存在"}, 404,
+                            headers={"Cache-Control": "no-store"})
+    cookie, _why = sanitize_cookie(row["cookie"] or "")
+    if not cookie:
+        return JSONResponse({"error": "这个账号还没有 CK（未登录）"}, 404,
+                            headers={"Cache-Control": "no-store"})
+    return JSONResponse({"ok": True, "id": account_id, "name": row["name"] or "",
+                         "cookie": cookie, "count": len(bridge_cookie_list(cookie))},
+                        headers={"Cache-Control": "no-store"})
 
 
 @app.post("/api/accounts/{account_id}/update")
@@ -1464,6 +1568,9 @@ async def api_update_account(account_id: int, request: Request):
             conn.close()
             return JSONResponse({"error": "状态只支持 active/ready/invalid/paused"}, 400)
         sets.append("status=?"); args.append(status); changed.append("状态")
+    if "fingerprint" in x:
+        flag = 1 if x.get("fingerprint") in (True, 1, "1", "true", "yes", "on", "是") else 0
+        sets.append("fingerprint=?"); args.append(flag); changed.append("指纹" + ("开" if flag else "关"))
     if not sets:
         conn.close()
         return JSONResponse({"error": "没有要修改的字段"}, 400)
@@ -1477,6 +1584,8 @@ async def api_update_account(account_id: int, request: Request):
     audit("account.update", "id=%s %s" % (account_id, "/".join(changed)))
     result = _mask(acc)
     result["usage_manual_today"] = (acc.get("usage_manual_date") or "") == _today()
+    result["has_cookie"] = bool((acc.get("cookie") or "").strip())
+    result["fingerprint"] = bool(acc.get("fingerprint"))
     result.pop("usage_manual", None)
     result.pop("usage_manual_date", None)
     return {"ok": True, "account": result}
@@ -1903,6 +2012,74 @@ def _task_video_url(task: dict) -> str:
     return ""
 
 
+def _bulk_task_ids(raw, limit: int = 500) -> list:
+    """把 ids 参数（逗号分隔字符串 / 数组 / 两者混合）整理成去重列表。"""
+    if isinstance(raw, str):
+        parts = [raw]
+    elif isinstance(raw, (list, tuple, set)):
+        parts = list(raw)
+    else:
+        parts = []
+    out = []
+    for part in parts:
+        for piece in str(part or "").split(","):
+            value = piece.strip()
+            if value and value not in out:
+                out.append(value)
+    return out[:limit]
+
+
+def _safe_unlink(path: str) -> None:
+    try:
+        if path and os.path.isfile(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+@app.get("/api/tasks/bulk-download")
+def api_bulk_download(ids: str = ""):
+    """把选中的任务里已经生成好的视频打成一个 zip 下载（没有的跳过）。"""
+    wanted = _bulk_task_ids(ids)
+    if not wanted:
+        return JSONResponse({"error": "没有选中任务"}, 400)
+    conn = db()
+    rows = []
+    for task_id in wanted:
+        row = conn.execute("select id,prompt,result from tasks where id=?",
+                           (task_id,)).fetchone()
+        if row is not None:
+            rows.append(dict(row))
+    conn.close()
+    files, missing = [], 0
+    for row in rows:
+        path = (row.get("result") or "").split("|")[0]
+        if (path and os.path.isfile(path)
+                and os.path.abspath(path).startswith(os.path.abspath(OUTPUT_DIR))):
+            files.append((row["id"], row.get("prompt") or "", path))
+        else:
+            missing += 1
+    if not files:
+        return JSONResponse({"error": "选中的任务里还没有已生成好的视频",
+                             "missing": missing}, 404)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    tmp = tempfile.NamedTemporaryFile(prefix="dola-videos-", suffix=".zip", delete=False)
+    tmp.close()
+    manifest = ["任务ID\t文件名\t提示词"]
+    with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_STORED) as zf:
+        for task_id, prompt, path in files:
+            name = os.path.basename(path) or ("task_%s.mp4" % task_id)
+            zf.write(path, arcname=name)
+            first_line = (prompt.strip().splitlines() or [""])[0][:80]
+            manifest.append("%s\t%s\t%s" % (task_id, name, first_line))
+        zf.writestr("任务清单.txt", "\n".join(manifest) + "\n")
+    audit("task.bulk_download", "count=%d missing=%d" % (len(files), missing))
+    return FileResponse(
+        tmp.name, media_type="application/zip",
+        filename="dola-videos-%d-%s.zip" % (len(files), stamp),
+        background=BackgroundTask(_safe_unlink, tmp.name))
+
+
 @app.get("/api/tasks/{task_id}")
 def api_task(task_id: str):
     conn = db()
@@ -1932,6 +2109,21 @@ async def api_create_tasks(request: Request):
         prompt = (item.get("prompt") or "").strip()
         if not prompt:
             continue
+        want_account = item.get("account_id") or x.get("account_id")
+        if want_account:
+            try:
+                want_id = int(want_account)
+            except (TypeError, ValueError):
+                conn.close()
+                return JSONResponse({"error": "account_id 要填数字"}, 400)
+            acc = conn.execute("select id,name,cookie from accounts where id=?", (want_id,)).fetchone()
+            if acc is None:
+                conn.close()
+                return JSONResponse({"error": "账号 #%s 不存在" % want_id}, 400)
+            if not (acc["cookie"] or "").strip():
+                conn.close()
+                return JSONResponse({"error": "账号 #%s 还没导入 CK（未登录）：先在账号池给它导入 CK，"
+                                             "或者把「指定账号」改成自动选择" % want_id}, 400)
         duration = int(item.get("duration") or x.get("duration") or 30)
         if duration not in DURATIONS:
             duration = min(DURATIONS, key=lambda d: abs(d - duration))
@@ -2063,6 +2255,44 @@ def api_delete_task(task_id: str):
             pass
     audit("task.delete", task_id)
     return {"ok": True}
+
+
+@app.post("/api/tasks/bulk-delete")
+async def api_bulk_delete(request: Request):
+    """批量清除任务记录（正在跑的会先停掉，成片文件一并删除）。"""
+    x = await request.json()
+    ids = _bulk_task_ids(x.get("ids"))
+    if not ids:
+        return JSONResponse({"error": "没有选中任务"}, 400)
+    conn = db()
+    status = {r["id"]: r["status"] for r in conn.execute(
+        "select id,status from tasks where id in (%s)"
+        % ",".join(["?"] * len(ids)), ids)}
+    conn.close()
+    cancelled = 0
+    for task_id, state in status.items():
+        if state in ("queued", "running") and _cancel_one(task_id, state) != "noop":
+            cancelled += 1
+    deleted = files = 0
+    conn = db()
+    for task_id in ids:
+        row = conn.execute("select result from tasks where id=?", (task_id,)).fetchone()
+        if row is None:
+            continue
+        conn.execute("delete from tasks where id=?", (task_id,))
+        deleted += 1
+        path = (row["result"] or "").split("|")[0]
+        if (path and os.path.isfile(path)
+                and os.path.abspath(path).startswith(os.path.abspath(OUTPUT_DIR))):
+            try:
+                os.remove(path)
+                files += 1
+            except OSError:
+                pass
+    conn.commit()
+    conn.close()
+    audit("task.bulk_delete", "count=%d files=%d" % (deleted, files))
+    return {"ok": True, "deleted": deleted, "cancelled": cancelled, "files_removed": files}
 
 
 # ---------------------------------- 资产 ----------------------------------
@@ -3458,39 +3688,82 @@ def api_account_browser(account_id: int):
     if not (DESKTOP_MODE and _control_hook):
         return JSONResponse({"error": "网页版不能启动本机浏览器；请用桌面版"}, 400)
     conn = db()
-    row = conn.execute("select id,name,cookie from accounts where id=?",
+    row = conn.execute("select id,name,cookie,fingerprint from accounts where id=?",
                        (account_id,)).fetchone()
     conn.close()
     if row is None:
         return JSONResponse({"error": "账号不存在"}, 404)
     cookie, _note = sanitize_cookie(row["cookie"] or "")
-    if not cookie:
-        return JSONResponse({"error": "该账号没有可用的 Cookie，先补上再打开网页"}, 400)
-    token = bridge_issue(account_id)
+    fingerprint = bool(row["fingerprint"])
+    token = bridge_issue(account_id) if cookie else ""
     # 桥接页只做兜底（CDP 写不进去时才用）：扩展在那里读 token、写 CK，再跳 dola.com。
     # 正常情况下桌面版直接用调试端口把 CK 写进浏览器 —— 不依赖扩展有没有醒过来，
     # 所以不用再「每次先删掉扩展重新加载」。
     bridge_url = ("http://127.0.0.1:%d/desktop/bridge?token=%s"
-                  % (PORT, urllib.parse.quote(token, safe="")))
+                  % (PORT, urllib.parse.quote(token, safe=""))) if cookie else ""
     home = "https://www.dola.com/chat/"
     out = {}
     try:
         _control_hook("account_browser", {"account_id": account_id, "url": home,
                                           "bridge_url": bridge_url, "cookie": cookie,
-                                          "out": out})
+                                          "fingerprint": fingerprint, "out": out})
     except Exception as exc:  # noqa: BLE001
         return JSONResponse({"error": "启动带扩展的浏览器失败：%s" % exc}, 500)
     if not out.get("ok"):
         return JSONResponse({"error": out.get("error") or "启动带扩展的浏览器失败"}, 400)
-    audit("account.browser", "id=%s login=%s" % (account_id, out.get("login") or ""))
+    login = out.get("login") or ("bridge" if cookie else "none")
+    warning = out.get("warning") or ""
+    if not cookie:
+        warning = ("这个账号还没有 CK（未登录）：窗口已经打开，在窗口里登录后，"
+                   "回账号池点这个账号的【CK】→【从窗口读取 CK】就能存进账号池。"
+                   + ((" " + warning) if warning else ""))
+    audit("account.browser", "id=%s login=%s fp=%s" % (account_id, login, int(fingerprint)))
     return {"ok": True, "mode": "desktop", "account_id": account_id, "token": token,
-            "url": out.get("url_used") or bridge_url, "bridge_url": bridge_url,
-            "login": out.get("login") or "bridge",
+            "url": out.get("url_used") or (bridge_url or home), "bridge_url": bridge_url,
+            "login": login,
             "cookie_count": int(out.get("cookie_count") or 0),
+            "fingerprint": fingerprint,
             "browser": out.get("browser") or "",
             "browser_version": out.get("browser_version") or "",
             "extensions": out.get("extensions") or [],
-            "warning": out.get("warning") or ""}
+            "warning": warning}
+
+
+@app.post("/api/accounts/{account_id}/browser/cookies")
+def api_read_browser_cookies(account_id: int, save: bool = True):
+    """从该账号已经打开的浏览器窗口里读回 CK（手动登录后使用）。
+
+    读到的 Cookie 默认直接存进账号池（save=false 只读不存）。
+    """
+    if not (DESKTOP_MODE and _control_hook):
+        return JSONResponse({"error": "网页版没有本机浏览器窗口；请用桌面版"}, 400)
+    conn = db()
+    row = conn.execute("select id,name from accounts where id=?", (account_id,)).fetchone()
+    conn.close()
+    if row is None:
+        return JSONResponse({"error": "账号不存在"}, 404)
+    out = {}
+    try:
+        _control_hook("account_browser", {"op": "read_cookies", "account_id": account_id,
+                                          "out": out})
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"error": "读取窗口 CK 失败：%s" % exc}, 500)
+    if not out.get("ok"):
+        return JSONResponse({"error": out.get("error") or "读取窗口 CK 失败"}, 400)
+    cookie, problem = sanitize_cookie(out.get("cookie") or "")
+    if problem or not cookie:
+        return JSONResponse({"error": "窗口里没有读到达标的 dola Cookie：先在这个窗口里登录一次",
+                             "count": int(out.get("count") or 0)}, 400)
+    if save:
+        conn = db()
+        conn.execute("update accounts set cookie=?, check_state='unchecked', check_detail='', "
+                     "last_checked='', status=case when status='invalid' then 'active' else status end "
+                     "where id=?", (cookie, account_id))
+        conn.commit()
+        conn.close()
+        audit("account.cookie.read", "id=%s count=%s" % (account_id, out.get("count") or 0))
+    return {"ok": True, "id": account_id, "name": row["name"] or "",
+            "saved": bool(save), "count": len(bridge_cookie_list(cookie))}
 
 
 @app.post("/api/accounts/{account_id}/browser/manager")

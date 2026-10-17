@@ -400,13 +400,19 @@ async function refreshProxyIp(){
 }
 
 /* ==================== 任务表 ==================== */
-function taskTable(tasks, compact){
+function taskTable(tasks, compact, selectable){
   if (!tasks.length) return '<div class="empty">暂无任务</div>';
+  const sel = selectable ? (state.taskSel || new Set()) : new Set();
+  const allOn = selectable && tasks.length > 0 && tasks.every(t => sel.has(t.id));
   return '<div class="scroll-x"><table><thead><tr>' +
+    (selectable ? '<th style="width:26px"><input type="checkbox" id="taskSelAll" title="全选当前筛选结果"' +
+      (allOn ? ' checked' : '') + ' onchange="toggleTaskSelAll(this)"></th>' : '') +
     '<th>ID</th><th>提示词</th>' + (compact ? '' : '<th>参数</th>') +
     '<th>账号</th><th>状态</th>' + (compact ? '' : '<th>创建时间</th>') + '<th>操作</th>' +
     '</tr></thead><tbody>' + tasks.map(t =>
-      '<tr><td class="mono">' + esc(t.id) + '</td>' +
+      '<tr>' + (selectable ? '<td><input type="checkbox" class="task-sel" data-id="' + esc(t.id) + '"' +
+        (sel.has(t.id) ? ' checked' : '') + ' onchange="toggleTaskSel(this)"></td>' : '') +
+      '<td class="mono">' + esc(t.id) + '</td>' +
       '<td style="max-width:340px"><div style="display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden">' +
         esc((t.prompt || '').slice(0, 160)) + '</div></td>' +
       (compact ? '' : '<td class="dim mono">' + esc(t.model || '') + ' · ' + (t.duration || 0) + 's · ' + esc(t.ratio || '') + '</td>') +
@@ -672,10 +678,13 @@ async function pageGenerate(){
     sel.innerHTML = '<option value="">自动选择（按队列挑可用账号）</option>' + list.map(a => {
       const st = String(a.status || '');
       const bad = st && !['ready','ok','local_ready'].includes(st);
-      const label = '#' + a.id + ' ' + (a.name || '') + (bad ? '（' + st + '）' : '');
-      return '<option value="' + a.id + '">' + esc(label) + '</option>';
+      const noCk = a.has_cookie === false;          // 没 CK 的实例不能用来自动生成
+      const label = '#' + a.id + ' ' + (a.name || '') +
+        (noCk ? '（未登录，先导入 CK）' : (bad ? '（' + st + '）' : ''));
+      return '<option value="' + a.id + '"' + (noCk ? ' disabled' : '') + '>' + esc(label) + '</option>';
     }).join('');
-    sel.value = Array.from(sel.options).some(o => o.value === keep) ? keep : '';
+    const keepOk = Array.from(sel.options).some(o => o.value === keep && !o.disabled);
+    sel.value = keepOk ? keep : '';
     genFormSave({ account: sel.value });
   };
   fillAccounts();
@@ -1170,14 +1179,91 @@ async function pageTasks(){
       '<button class="btn" onclick="render()">↻ 刷新</button>' +
       '<button class="btn danger" id="stopAllBtn" onclick="cancelAllTasks()" title="停止所有排队中 / 生成中的任务">■ 停止全部</button>' +
       '<button class="btn" onclick="retryAllFailed()">↻ 一键重试失败</button></div>' +
-      '<div id="taskTable">' + taskTable(tasks, false) + '</div></div>';
+      '<div class="row" id="taskBulkBar" style="display:none;gap:8px;align-items:center;margin:0 0 12px;flex-wrap:wrap">' +
+        '<span class="chip" id="taskSelCount">已选 0 条</span>' +
+        '<button class="btn" id="bulkDl" onclick="bulkDownloadSelected()" title="把选中任务里已经生成好的视频打成一个 zip 下载">⇩ 下载选中成片</button>' +
+        '<button class="btn danger" onclick="bulkDeleteSelected()" title="删除选中的任务记录和已经生成的视频文件">🗑 清除选中</button>' +
+        '<button class="btn" onclick="clearTaskSel()">取消选择</button>' +
+      '</div>' +
+      '<div id="taskTable">' + taskTable(tasks, false, true) + '</div></div>';
   setTimers([silentRefreshTasks]);
+  updateBulkBar();
 }
 function drawTaskTable(){
   const q = ($('tq').value || '').toLowerCase(), s = $('ts').value;
   const filtered = state.tasks.filter(t =>
     (!s || t.status === s) && (!q || (t.id + ' ' + (t.prompt || '')).toLowerCase().includes(q)));
-  $('taskTable').innerHTML = taskTable(filtered, false);
+  state.taskView = filtered;
+  $('taskTable').innerHTML = taskTable(filtered, false, true);
+  updateBulkBar();
+}
+
+/* ===== 批量选择：勾几条 → 一起下载成片 / 一起清除 ===== */
+function ensureTaskSel(){
+  if (!(state.taskSel instanceof Set)) state.taskSel = new Set();
+  const alive = new Set((state.tasks || []).map(t => t.id));
+  Array.from(state.taskSel).forEach(id => { if (!alive.has(id)) state.taskSel.delete(id); });
+  return state.taskSel;
+}
+function toggleTaskSel(el){
+  const sel = ensureTaskSel();
+  const id = el && el.getAttribute('data-id');
+  if (!id) return;
+  if (el.checked) sel.add(id); else sel.delete(id);
+  updateBulkBar();
+}
+function toggleTaskSelAll(el){
+  const sel = ensureTaskSel();
+  (state.taskView || state.tasks || []).forEach(t => {
+    if (el.checked) sel.add(t.id); else sel.delete(t.id);
+  });
+  drawTaskTable();
+}
+function clearTaskSel(){
+  state.taskSel = new Set();
+  drawTaskTable();
+}
+function updateBulkBar(){
+  const bar = $('taskBulkBar');
+  if (!bar) return;
+  const sel = ensureTaskSel();
+  bar.style.display = sel.size ? 'flex' : 'none';
+  const withVideo = Array.from(sel).filter(id => {
+    const t = (state.tasks || []).find(x => x.id === id);
+    return !!(t && t.video_url);
+  });
+  const chip = $('taskSelCount');
+  if (chip) chip.textContent = '已选 ' + sel.size + ' 条' + (withVideo.length ? '（其中 ' + withVideo.length + ' 条有成片）' : '');
+  const dl = $('bulkDl');
+  if (dl) dl.disabled = !withVideo.length;
+}
+function bulkDownloadUrl(ids){
+  return 'api/tasks/bulk-download?ids=' + encodeURIComponent((ids || []).join(','));
+}
+function bulkDownloadSelected(){
+  const sel = ensureTaskSel();
+  const withVideo = Array.from(sel).filter(id => {
+    const t = (state.tasks || []).find(x => x.id === id);
+    return !!(t && t.video_url);
+  });
+  if (!withVideo.length) return toast('选中的任务里还没有成片：等生成完再下载', true);
+  const url = bulkDownloadUrl(withVideo);
+  const a = document.createElement('a');
+  a.href = url; a.download = '';
+  document.body.appendChild(a); a.click(); a.remove();
+  toast('正在打包 ' + withVideo.length + ' 条成片…');
+}
+function bulkDeleteSelected(){
+  const sel = ensureTaskSel();
+  const ids = Array.from(sel);
+  if (!ids.length) return;
+  confirmAction('清除选中的 ' + ids.length + ' 条任务？排队中/生成中的会先停止，已生成的视频文件也会一起删掉（不可恢复）。', async () => {
+    const r = await api('api/tasks/bulk-delete', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ids})});
+    state.taskSel = new Set();
+    toast('已清除 ' + r.deleted + ' 条任务' + (r.files_removed ? '，删除 ' + r.files_removed + ' 个视频' : ''));
+    render();
+  });
 }
 async function silentRefreshTasks(){
   if (state.page !== 'tasks') return;
@@ -1272,7 +1358,9 @@ async function pageAccounts(){
         '<button class="btn" id="exportCk" title="把账号池里的完整 Cookie 导出成文件（只有你自己能拿到）">⤓ 导出 CK</button>' +
         '<button class="btn" id="checkAll">✓ 一键验活</button>' +
         '<button class="btn" onclick="render()">↻ 刷新</button>' +
-        '<span class="chip">共 ' + accounts.length + ' 个</span>' +
+        '<span class="chip">共 ' + accounts.length + ' 个' +
+          (accounts.filter(a => a.has_cookie === false).length
+            ? '（' + accounts.filter(a => a.has_cookie === false).length + ' 个未登录）' : '') + '</span>' +
         '<span class="dim" style="font-size:12px">窗口：' + (state.canManageWindows
           ? '桌面版可「前台打开 / 后台挂起 / 切换」多个账号，挂起的窗口不占屏幕，切换秒开'
           : '网页版没有原生窗口，点「网页」在新标签页打开') +
@@ -1283,16 +1371,21 @@ async function pageAccounts(){
       '<th>ID</th><th>名称</th><th>状态</th><th>今日用量</th><th>验活</th><th>窗口</th><th>操作</th>' +
       '</tr></thead><tbody>' + accounts.map(a =>
         '<tr><td class="mono">#' + a.id + '</td>' +
-        '<td>' + esc(a.name) + (a.note ? '<div class="dim" style="font-size:11px">' + esc(a.note) + '</div>' : '') + '</td>' +
+        '<td>' + esc(a.name) +
+          (a.has_cookie === false ? ' <span class="badge" title="还没有 CK：可以当实例开窗口，导入 CK 后才能生成">未登录</span>' : '') +
+          (a.fingerprint ? ' <span class="badge dim" title="这个账号的窗口会固定一套 UA/语言/时区/CPU/内存">指纹</span>' : '') +
+          (a.note ? '<div class="dim" style="font-size:11px">' + esc(a.note) + '</div>' : '') + '</td>' +
         '<td><span class="badge ' + (a.status === 'ready' ? 'ok' : a.status === 'invalid' ? 'bad' : a.status === 'paused' ? 'dim' : 'dim') + '">' + esc(a.status) + '</span></td>' +
         '<td style="min-width:150px"><div class="row"><span class="mono" title="' + (a.usage_manual_today ? '手动手动设置的今日用量' : '按任务统计的今日用量') + '">' + (a.today_usage || 0) + '/' + (a.quota || 0) + '</span>' +
           '<div class="bar" style="flex:1"><i style="width:' + Math.min(100, Math.round(100 * (a.today_usage||0) / (a.quota||1))) + '%"></i></div>' +
           (a.usage_manual_today ? '<span class="badge dim">手动</span>' : '') + '</div></td>' +
-        '<td><span class="badge ' + (a.check_state === 'ready' || a.check_state === 'local_ready' ? 'ok' : a.check_state === 'invalid' ? 'bad' : 'dim') + '">' +
-          esc(a.check_state || 'unchecked') + '</span><div class="dim" style="font-size:11px">' + esc((a.check_detail || '').slice(0, 40)) + '</div></td>' +
+        '<td><span class="badge ' + (a.check_state === 'ready' || a.check_state === 'local_ready' ? 'ok' : (a.check_state === 'invalid' ? 'bad' : 'dim')) + '">' +
+          esc(a.check_state === 'no_cookie' ? '未登录' : (a.check_state || 'unchecked')) + '</span>' +
+          '<div class="dim" style="font-size:11px;max-width:190px">' + esc((a.check_detail || '').slice(0, 40)) + '</div></td>' +
         '<td id="sess-' + a.id + '" style="min-width:210px">' + sessionCell(a) + '</td>' +
-        '<td style="white-space:nowrap"><button class="btn sm" onclick="editAccount(' + a.id + ')" title="改 ID 名称 / 备注 / 每日上限 / 今日用量">✎ 编辑</button> ' +
+        '<td style="white-space:normal;min-width:300px"><button class="btn sm" onclick="editAccount(' + a.id + ')" title="改 ID 名称 / 备注 / 每日上限 / 今日用量">✎ 编辑</button> ' +
         '<button class="btn sm" onclick="checkAccount(' + a.id + ')" title="联网校验这个账号的 Cookie">验活</button> ' +
+        '<button class="btn sm" onclick="accountCk(' + a.id + ')" title="单独导入 / 导出这个账号的 CK（也能从已打开的窗口里读回来）">CK</button> ' +
         (state.canManageWindows
           ? '<button class="btn sm" onclick="openAccountBrowser(' + a.id + ')" title="用带扩展的 Edge/Chrome 打开这个账号的 Dola 页面：CK 自动写入，30 秒/无水印扩展可用">🌐 网页</button> ' +
             '<button class="btn sm" onclick="openAccountWeb(' + a.id + ')" title="老的原生窗口（WebView2 内核，装不了扩展），支持挂起/切换">🪟 原生</button> ' +
@@ -1439,8 +1532,11 @@ function editAccount(id){
      value: a.usage_manual_today ? String(a.today_usage || 0) : '', placeholder:'例：0（等于今天不再用它）'},
     {key:'status', label:'状态', type:'select', value: a.status || 'active',
      options:['active','ready','paused','invalid']},
+    {key:'fingerprint', label:'浏览器指纹伪装（关掉后，关掉窗口再开就恢复真实身份）',
+     type:'select', value: a.fingerprint ? '是' : '否', options:['否','是']},
   ], async (d) => {
     const body = {name: d.name, note: d.note, status: d.status,
+                  fingerprint: d.fingerprint === '是',
                   daily_limit: Number(d.daily_limit) || 0};
     body.today_usage = String(d.today_usage || '').trim() === '' ? null : Number(d.today_usage);
     await api('api/accounts/' + id + '/update', {method:'POST',
@@ -1451,17 +1547,86 @@ function editAccount(id){
 }
 
 function addAccount(){
-  formModal('新增 Dola 账号', [
+  formModal('新增 Dola 账号 / 实例', [
     {key:'name', label:'名称', placeholder:'例：账号 A'},
-    {key:'cookie', label:'Cookie', type:'textarea', placeholder:'sessionid=...; sid_guard=...',
-     hint:'浏览器 F12 → Network → 点任一 dola.com 请求 → Request Headers 里 Cookie: 那一整行（形如 sessionid=xxx; sid_guard=yyy）；粘成 JSON 也会自动提取'},
+    {key:'cookie', label:'Cookie（可以留空）', type:'textarea', placeholder:'sessionid=...; sid_guard=...',
+     hint:'留空 = 先加一个「实例」（未登录）：能开浏览器窗口、挂代理；登录后点这行的【CK】导入，或直接从窗口读取'},
+    {key:'fingerprint', label:'浏览器指纹伪装', type:'select', options:['否','是'], value:'否',
+     hint:'给这个账号固定一套 UA / 语言 / 时区 / CPU / 内存；建议只对新号开启（老号开可能被要求重新登录）'},
     {key:'verify', label:'立即联网验活', type:'select', options:['否','是'], value:'否'},
   ], async (d) => {
-    await api('api/accounts', {method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({name: d.name, cookie: d.cookie, verify: d.verify === '是'})});
-    toast('账号已添加'); render();
+    const r = await api('api/accounts', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({name: d.name, cookie: d.cookie, verify: d.verify === '是',
+                            fingerprint: d.fingerprint === '是'})});
+    toast(r && r.has_cookie === false
+      ? '实例已添加（未登录）：打开它的窗口登录后，点【CK】导入或从窗口读取'
+      : '账号已添加'); render();
   });
 }
+/* 单个账号的 CK：导入 / 导出 / 从窗口读取 / 清空。
+   用户要的是「不用整池一起导，哪个号要换 CK 就换哪个」。 */
+function accountCk(id){
+  const a = (state.accounts || []).find(x => x.id === id) || {id: id};
+  const has = !!a.has_cookie;
+  openModal('账号 #' + id + ' 的 CK',
+    '<p class="muted" style="margin-top:0">' +
+      (has ? '这个账号已经有 CK（默认不回显）。可以替换、导出，或从已经打开的窗口重新读取。'
+           : '这个账号还没有 CK（未登录）。把 CK 粘进来，或先在窗口里登录，再从窗口读回来。') +
+    '</p>' +
+    '<textarea id="ckBox" style="min-height:150px" placeholder="sessionid=...; sid_guard=...（粘整段 JSON / 多行也会自动提取）"></textarea>' +
+    '<div class="row" style="margin-top:10px;flex-wrap:wrap;gap:8px">' +
+      '<button class="btn primary" id="ckSave">⇧ 导入 / 保存</button>' +
+      (has ? '<button class="btn" id="ckShow">⤓ 导出（显示完整 CK）</button>' : '') +
+      '<button class="btn" id="ckRead" title="从已经打开的这个账号的窗口里读回 Cookie（要先在窗口里登录）">⬇ 从窗口读取</button>' +
+      (has ? '<button class="btn danger" id="ckClear">清空 CK</button>' : '') +
+    '</div>' +
+    '<div class="dim" id="ckHint" style="font-size:12px;margin-top:8px;line-height:1.7">' +
+      '导出的 CK 是完整值：拿到它就等于拿到这个账号，别发给别人。' +
+    '</div>' +
+    '<div class="foot"><button class="btn" onclick="closeModal()">关闭</button></div>');
+  const hint = (text, bad) => {
+    const el = $('ckHint');
+    if (el) { el.textContent = text; el.style.color = bad ? '#ff8b87' : ''; }
+  };
+  $('ckSave').onclick = async () => {
+    const cookie = ($('ckBox').value || '').trim();
+    if (!cookie) return hint('先把 CK 粘进上面的框，或者点【从窗口读取】。', true);
+    try {
+      const r = await api('api/accounts/' + id + '/cookie', {method:'POST',
+        headers:{'Content-Type':'application/json'}, body: JSON.stringify({cookie: cookie})});
+      toast('已保存：识别到 ' + (r.count || 0) + ' 个 Cookie 字段');
+      closeModal(); render();
+    } catch(e){ hint(e.message, true); }
+  };
+  if ($('ckShow')) $('ckShow').onclick = async () => {
+    try {
+      const r = await api('api/accounts/' + id + '/ck');
+      $('ckBox').value = r.cookie;
+      $('ckBox').focus(); $('ckBox').select();
+      let copied = false;
+      try { await navigator.clipboard.writeText(r.cookie); copied = true; } catch(e){}
+      hint('已显示完整 CK（' + r.count + ' 个字段）' +
+           (copied ? '，并已复制到剪贴板。' : '，按 Ctrl+C 复制。'));
+    } catch(e){ hint(e.message, true); }
+  };
+  $('ckRead').onclick = async () => {
+    try {
+      const r = await api('api/accounts/' + id + '/browser/cookies', {method:'POST'});
+      toast('已从窗口读取 ' + r.count + ' 个 Cookie 并保存到这个账号');
+      closeModal(); render();
+    } catch(e){ hint(e.message, true); }
+  };
+  if ($('ckClear')) $('ckClear').onclick = () => {
+    confirmAction('清空账号 #' + id + ' 的 CK？清空后它会变成「未登录」实例（窗口还能开，但不能生成）。', async () => {
+      try {
+        await api('api/accounts/' + id + '/cookie', {method:'POST',
+          headers:{'Content-Type':'application/json'}, body: JSON.stringify({clear: true})});
+        toast('已清空 CK'); closeModal(); render();
+      } catch(e){ hint(e.message, true); }
+    });
+  };
+}
+
 function importAccounts(){
   openModal('批量导入账号', '<p class="muted">粘贴 Cookie（每行一个），或选择 .txt / .csv / .json 文件。' +
     'Cookie 拿法：浏览器 F12 → Network → 点任一 dola.com 请求 → Request Headers 里 Cookie: 那一整行。<br>' +
@@ -1508,6 +1673,12 @@ function openAccountBrowser(id){
       toast('✅ ' + exe + ' 已打开 #' + id + '，并写入 ' + (r.cookie_count || 0) + ' 个 Cookie（已登录）');
       if (r.warning) toast(r.warning, true);
       if (typeof refreshSessions === 'function') refreshSessions();
+      return;
+    }
+    if (r.login === 'none') {
+      // 没 CK 的实例：窗口照开，等你在里面登录
+      toast(exe + ' 已打开 #' + id + '（未登录）：在这个窗口里登录后，回账号池点【CK】→【从窗口读取 CK】');
+      if (typeof refreshSessions === 'function') { refreshSessions(); }
       return;
     }
     if (r.warning) toast(r.warning, true);

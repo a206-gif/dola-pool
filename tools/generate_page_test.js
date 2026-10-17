@@ -23,6 +23,7 @@ const SHOT = process.env.DOLA_SHOT || '';   // 可选：把渲染后的 HTML 存
   let queueCalls = 0, uploadCalls = 0, taskCalls = 0;
   const posted = [];        // 提交任务时的请求体（验证单条/批量到底拆没拆）
   const cancelCalls = [];   // 点「停止」打到的接口
+  const bulkDeletes = [];   // 批量清除打到的接口
   const fakeQueue = () => ({ queue_depth: ++queueCalls, active: 1, workers: 4 });
   // 第一次 1 条，之后 2 条：验证「新增行是插进去的，旧行不动」
   const fakeTasks = () => {
@@ -39,7 +40,8 @@ const SHOT = process.env.DOLA_SHOT || '';   // 可选：把渲染后的 HTML 存
         const url = String(u);
         let body = [];
         if (url.includes('api/accounts')) {
-          body = [{ id: 1, name: '主号', cookie: 'sessionid=x' }];
+          body = [{ id: 1, name: '主号', cookie: 'sessionid=x', has_cookie: true },
+                  { id: 2, name: '空实例', cookie: '', has_cookie: false }];
         } else if (url.includes('api/model-probe')) {
           body = { ok: false, model: 'seedance_v2.5', duration: 10,
             steps: [
@@ -49,6 +51,10 @@ const SHOT = process.env.DOLA_SHOT || '';   // 可选：把渲染后的 HTML 存
             verdict: '登录态失效：先去账号池更新 Cookie' };
         } else if (url.includes('api/queue')) {
           body = fakeQueue();
+        } else if (url.includes('api/tasks/bulk-delete')) {
+          const payload = JSON.parse((o || {}).body || '{}');
+          bulkDeletes.push(payload);
+          body = { ok: true, deleted: (payload.ids || []).length, cancelled: 0, files_removed: 1 };
         } else if (url.includes('/cancel')) {
           cancelCalls.push(url);
           body = { ok: true, action: 'cancelling', status: 'cancelling' };
@@ -111,6 +117,10 @@ const SHOT = process.env.DOLA_SHOT || '';   // 可选：把渲染后的 HTML 存
   out.push(['下拉里能选到账号池里的账号',
             !!accSel && Array.from(accSel.options).some(o => o.value === '1' && /主号/.test(o.textContent)),
             accSel ? Array.from(accSel.options).map(o => o.value + ':' + o.textContent).join(' | ') : '']);
+  const emptyOpt = Array.from(accSel.options).find(o => o.value === '2');
+  out.push(['没 CK 的实例在下拉里标明「未登录」且不能选',
+            !!emptyOpt && emptyOpt.disabled && /未登录/.test(emptyOpt.textContent),
+            emptyOpt ? emptyOpt.textContent : '没有这一项']);
   accSel.value = '1';
   accSel.dispatchEvent(new w.Event('change', { bubbles: true }));
 
@@ -273,6 +283,47 @@ const SHOT = process.env.DOLA_SHOT || '';   // 可选：把渲染后的 HTML 存
     await new Promise(r => setTimeout(r, 400));
   }
   out.push(['点「停止」会调用取消接口', cancelCalls.length === 1, JSON.stringify(cancelCalls)]);
+
+  // —— 批量选择任务记录：一起下载成片 / 一起清除 ——
+  w.eval("state.tasks = [{id:'t1',status:'completed',prompt:'甲',video_url:'/output/a.mp4'}," +
+         "{id:'t2',status:'failed',prompt:'乙',video_url:''}," +
+         "{id:'t3',status:'running',prompt:'丙',video_url:''}]; drawTaskTable();");
+  await new Promise(r => setTimeout(r, 300));
+  const boxes = d.querySelectorAll('#taskTable input.task-sel');
+  out.push(['任务列表每行有勾选框（可批量选）', boxes.length === 3, '勾选框 ' + boxes.length + ' 个']);
+  out.push(['没选时批量操作栏是收起的',
+            !!$('taskBulkBar') && $('taskBulkBar').style.display === 'none', '']);
+  boxes[0].click(); boxes[1].click();
+  await new Promise(r => setTimeout(r, 200));
+  out.push(['勾两条后出现批量操作栏，并提示其中有几条有成片',
+            $('taskBulkBar').style.display !== 'none' && /已选 2 条/.test($('taskSelCount').textContent)
+            && /1 条有成片/.test($('taskSelCount').textContent),
+            $('taskSelCount').textContent]);
+  out.push(['下载地址只带选中的任务 id',
+            w.eval("bulkDownloadUrl(['t1','t2'])") === 'api/tasks/bulk-download?ids=t1%2Ct2',
+            w.eval("bulkDownloadUrl(['t1','t2'])")]);
+
+  // 全选
+  const selAll = $('taskSelAll');
+  if (selAll) { selAll.checked = true; selAll.dispatchEvent(new w.Event('change', { bubbles: true })); }
+  await new Promise(r => setTimeout(r, 200));
+  out.push(['表头勾选框能全选当前列表',
+            /已选 3 条/.test($('taskSelCount').textContent), $('taskSelCount') ? $('taskSelCount').textContent : '']);
+
+  // 清除选中（确认后）
+  const clearBtn = Array.from(d.querySelectorAll('#taskBulkBar button')).find(b => /清除选中/.test(b.textContent));
+  out.push(['批量操作栏有「清除选中」和「下载选中成片」',
+            !!clearBtn && !!$('bulkDl'), clearBtn ? clearBtn.textContent.trim() : '没有']);
+  if (clearBtn) {
+    clearBtn.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+    await new Promise(r => setTimeout(r, 300));
+    const ok = $('okBtn');
+    if (ok) ok.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+    await new Promise(r => setTimeout(r, 500));
+  }
+  out.push(['确认后把选中的 3 条一起清除（调批量接口）',
+            bulkDeletes.length === 1 && (bulkDeletes[0].ids || []).length === 3,
+            JSON.stringify(bulkDeletes)]);
 
   // 「一键任务」：从任务队列直接回到单条任务的生成页
   const quick = Array.from(d.querySelectorAll('button')).find(b => /单条任务/.test(b.textContent));

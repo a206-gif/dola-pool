@@ -26,7 +26,14 @@ const BASE = process.env.DOLA_BASE || 'http://127.0.0.1:8000';
       last_checked: '', cookie: '••••••' },
     { id: 2, name: '小号 B', note: '', status: 'ready', today_usage: 0, quota: 15,
       daily_limit: 0, usage_manual_today: false, check_state: 'ready', check_detail: '', last_checked: '', cookie: '••••••' },
+    { id: 3, name: '实例 C', note: '', status: 'active', today_usage: 0, quota: 15,
+      daily_limit: 0, usage_manual_today: false, check_state: 'no_cookie',
+      check_detail: '还没有 CK（未登录）', last_checked: '', cookie: '',
+      has_cookie: false, fingerprint: true },
   ];
+  accounts[0].has_cookie = true;
+  accounts[0].fingerprint = false;
+  accounts[1].has_cookie = true;
   let sessions = { mode: 'web', can_manage: false, sessions: [] };
   // 桌面版 + 扩展：账号页应该出现「🧩 浏览器扩展」卡片
   const extInfo = { mode: 'desktop', browser: 'C:/Program Files/Microsoft/Edge/Application/msedge.exe',
@@ -36,6 +43,8 @@ const BASE = process.env.DOLA_BASE || 'http://127.0.0.1:8000';
                  { name: 'Cookie-Editor', version: '1.13.0', path: 'C:/DolaPool/extensions/cookie-editor' }] };
   let openedWithExtension = 0, openedManager = 0, revealedDir = 0;
   let accountBrowserCalls = 0, accountNativeCalls = 0;
+  let ckImports = 0, ckExports = 0, ckReads = 0;
+  const createdAccounts = [];
 
   const dom = new JSDOM(html, {
     url: BASE + '/', runScripts: 'dangerously', pretendToBeVisual: true, virtualConsole: vc,
@@ -45,6 +54,10 @@ const BASE = process.env.DOLA_BASE || 'http://127.0.0.1:8000';
         calls.push((o && o.method ? o.method + ' ' : 'GET ') + url);
         const body = url.includes('api/desktop/extensions/open') ? (openedWithExtension++, { ok: true, browser: extInfo.browser })
           : /api\/accounts\/\d+\/browser\/manager/.test(url) ? (openedManager++, { ok: true, browser: extInfo.browser, url: 'edge://extensions' })
+          : /api\/accounts\/\d+\/browser\/cookies/.test(url) ? (ckReads++, { ok: true, id: 3, count: 5, saved: true })
+          : /api\/accounts\/\d+\/ck/.test(url) ? (ckExports++, { ok: true, id: 1, name: '主号 A',
+              cookie: 'sessionid=abc; sid_guard=def', count: 2 })
+          : /api\/accounts\/\d+\/cookie/.test(url) ? (ckImports++, { ok: true, id: 3, has_cookie: true, count: 3 })
           : /api\/accounts\/\d+\/browser/.test(url) ? (accountBrowserCalls++, { ok: true, mode: 'desktop', token: 'tok-1',
               browser: extInfo.browser, url: 'https://www.dola.com/chat/#dp-login=tok-1:8000', warning: '' })
           : url.includes('api/desktop/bridge/status') ? { ok: true, known: true, used: true, count: 3 }
@@ -54,6 +67,8 @@ const BASE = process.env.DOLA_BASE || 'http://127.0.0.1:8000';
           : url.includes('api/desktop/extensions') ? extInfo
           : url.includes('api/desktop/sessions') ? sessions
           : url.includes('api/accounts/export') ? 'sessionid=abc\nsessionid=def\n'
+          : (o && String(o.method || '').toUpperCase() === 'POST' && /\/api\/accounts$/.test(url))
+              ? (createdAccounts.push(JSON.parse(o.body || '{}')), { ok: true, id: 9, has_cookie: false })
           : /api\/accounts\/\d+\/update/.test(url) ? { ok: true, account: accounts[0] }
           : url.includes('api/accounts') ? accounts
           : url.includes('api/queue') ? { queue_depth: 0, active: 0, workers: 4 }
@@ -85,7 +100,7 @@ const BASE = process.env.DOLA_BASE || 'http://127.0.0.1:8000';
   out.push(['账号池渲染出表格', !!d.querySelector('table'), '']);
   out.push(['有「导出 CK」按钮', !!$('exportCk'), '']);
   out.push(['每行都有「编辑」按钮（改名称/用量）',
-            d.querySelectorAll('button[onclick^="editAccount("]').length === 2,
+            d.querySelectorAll('button[onclick^="editAccount("]').length === accounts.length,
             d.querySelectorAll('button[onclick^="editAccount("]').length + ' 个']);
   out.push(['有「窗口」列（挂起/运行中/已关闭）',
             /窗口/.test(d.querySelector('thead').textContent), '']);
@@ -199,6 +214,78 @@ const BASE = process.env.DOLA_BASE || 'http://127.0.0.1:8000';
   out.push(['带扩展的窗口在「窗口」列有 🧩 标记和「切换过去」',
             /🧩/.test($('sess-1').textContent) && /切换过去/.test($('sess-1').textContent),
             $('sess-1').textContent.slice(0, 60)]);
+
+  // ⑦ 新增账号：CK 可以留空；可选指纹
+  await w.eval('render()');
+  await new Promise(r => setTimeout(r, 500));
+  await w.eval('addAccount()');
+  await new Promise(r => setTimeout(r, 200));
+  const addForm = $('mform');
+  const labels = addForm ? addForm.textContent : '';
+  out.push(['新增账号：CK 输入框注明「可以留空」',
+            /Cookie（可以留空）/.test(labels), labels.replace(/\s+/g, ' ').slice(0, 70)]);
+  out.push(['新增账号：有「浏览器指纹伪装」选项',
+            !!addForm && !!addForm.querySelector('select[name="fingerprint"]'), '']);
+  if (addForm) {
+    addForm.querySelector('input[name="name"]').value = '新实例';
+    addForm.querySelector('select[name="fingerprint"]').value = '是';
+    addForm.dispatchEvent(new w.Event('submit', { bubbles: true, cancelable: true }));
+    await new Promise(r => setTimeout(r, 500));
+  }
+  const created = createdAccounts[createdAccounts.length - 1] || {};
+  out.push(['提交新增：不带 CK 也能创建，且把指纹开关带上',
+            created.cookie === '' && created.fingerprint === true && created.name === '新实例',
+            JSON.stringify(created)]);
+  if (d.querySelector('.modal')) w.eval('closeModal()');
+
+  // ⑧ 无 CK 的账号：特殊显示 + 单独导入 / 导出 CK
+  await w.eval('render()');
+  await new Promise(r => setTimeout(r, 600));
+  const row3 = Array.from(d.querySelectorAll('tbody tr')).find(tr => /实例 C/.test(tr.textContent));
+  out.push(['没有 CK 的账号在列表里标成「未登录」',
+            !!row3 && /未登录/.test(row3.textContent), row3 ? row3.textContent.replace(/\s+/g, ' ').slice(0, 80) : '没有这一行']);
+  out.push(['开了指纹的账号带「指纹」标记', !!row3 && /指纹/.test(row3.textContent), '']);
+  out.push(['每个账号都有单独的「CK」按钮',
+            !!row3 && Array.from(row3.querySelectorAll('button')).some(b => b.textContent.trim() === 'CK'), '']);
+  if (row3) {
+    const ckBtn = Array.from(row3.querySelectorAll('button')).find(b => b.textContent.trim() === 'CK');
+    ckBtn.click();
+    await new Promise(r => setTimeout(r, 300));
+  }
+  const ckModal = d.querySelector('.modal');
+  const modalTxt = ckModal ? ckModal.textContent : '';
+  out.push(['CK 弹窗：能导入、能从窗口读取（没有 CK 时不显示「导出」）',
+            /导入 \/ 保存/.test(modalTxt) && /从窗口读取/.test(modalTxt)
+            && !/显示完整 CK/.test(modalTxt),
+            [!!/导入 \/ 保存/.test(modalTxt), !!/从窗口读取/.test(modalTxt),
+             !!/显示完整 CK/.test(modalTxt)].join(',') + ' | ' + modalTxt.replace(/\s+/g, ' ').slice(-90)]);
+  $('ckBox').value = 'sessionid=new; sid_guard=g; ttwid=t';
+  $('ckSave').click();
+  await new Promise(r => setTimeout(r, 500));
+  out.push(['在弹窗里粘贴 CK → 调用单个账号的导入接口',
+            ckImports === 1, '调用 ' + ckImports + ' 次']);
+  if (d.querySelector('.modal')) w.eval('closeModal()');
+
+  // 已有 CK 的账号：能单独导出 + 从窗口读取
+  await w.eval('render()');
+  await new Promise(r => setTimeout(r, 600));
+  const row1 = Array.from(d.querySelectorAll('tbody tr')).find(tr => /主号 A/.test(tr.textContent));
+  if (row1) {
+    Array.from(row1.querySelectorAll('button')).find(b => b.textContent.trim() === 'CK').click();
+    await new Promise(r => setTimeout(r, 300));
+  }
+  const showBtn = d.querySelector('#ckShow');
+  out.push(['已有 CK 的账号，弹窗里有「导出」按钮', !!showBtn, '']);
+  if (showBtn) {
+    showBtn.click();
+    await new Promise(r => setTimeout(r, 400));
+  }
+  out.push(['点导出 → 调用单个账号的 CK 接口，并把完整 CK 填进文本框',
+            ckExports === 1 && /sessionid=abc/.test($('ckBox').value), $('ckBox').value.slice(0, 40)]);
+  const readBtn = d.querySelector('#ckRead');
+  if (readBtn) { readBtn.click(); await new Promise(r => setTimeout(r, 500)); }
+  out.push(['点「从窗口读取」→ 调用读取接口并保存',
+            ckReads === 1, '调用 ' + ckReads + ' 次']);
 
   out.push(['无 JS 错误', errors.length === 0, errors.slice(0, 2).join(' | ')]);
 

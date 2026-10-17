@@ -131,6 +131,33 @@ def main():
           and isinstance(row.get("session"), dict), (row.get("daily_limit"), row.get("session")))
     check("列表里不下发 cookie 明文（仍然是打码的）",
           row.get("cookie") in ("••••••", ""), row.get("cookie"))
+
+    print("\n== 无 CK 实例 / 单号 CK / 指纹（v2.2.0）==")
+    status, inst = call("POST", "/api/accounts", {"name": "自检实例（无 CK）"})
+    check("没有 CK 也能新增一个「实例」（未登录）",
+          status == 200 and inst.get("has_cookie") is False
+          and (inst.get("check") or {}).get("state") == "no_cookie", inst)
+    inst_id = inst.get("id") if isinstance(inst, dict) else None
+    status, listed = call("GET", "/api/accounts")
+    row_inst = next((a for a in listed if a["id"] == inst_id), {})
+    check("未登录实例在列表里标成 has_cookie=False / no_cookie",
+          row_inst.get("has_cookie") is False and row_inst.get("check_state") == "no_cookie",
+          row_inst.get("check_state"))
+    status, bad_task = call("POST", "/api/tasks", {"prompt": "x", "account_id": inst_id})
+    check("指定未登录账号提交任务 → 明确报错（不会偷偷换号）",
+          status == 400 and "CK" in str(bad_task), bad_task)
+    status, imported = call("POST", "/api/accounts/%s/cookie" % inst_id,
+                            {"cookie": "sessionid=inst; sid_guard=z"})
+    check("给这个号单独导入 CK", status == 200 and imported.get("count") == 2, imported)
+    status, one = call("GET", "/api/accounts/%s/ck" % inst_id)
+    check("单独导出这个号的 CK（完整值，不连累别人）",
+          status == 200 and "sessionid=inst" in one.get("cookie", ""), one.get("count"))
+    status, fp_on = call("POST", "/api/accounts/%s/update" % inst_id, {"fingerprint": True})
+    check("给账号开指纹",
+          status == 200 and fp_on.get("account", {}).get("fingerprint") is True,
+          fp_on.get("account", {}).get("fingerprint"))
+    status, cleared = call("POST", "/api/accounts/%s/cookie" % inst_id, {"clear": True})
+    check("清空 CK 后回到未登录实例", status == 200 and cleared.get("has_cookie") is False, cleared)
     status, plain = call("POST", "/api/accounts", {"name": "", "cookie": "sessionid=empty"})
     check("新增账号时空名称会被自动命名", status == 200 and plain.get("ok"), plain)
     if status == 200:
@@ -168,6 +195,34 @@ def main():
         check("成片可下载（%d 字节）" % len(body), status == 200 and len(body) > 10000)
     status, tasks = call("GET", "/api/tasks")
     check("任务列表 / 进度字段完整", status == 200 and any(t.get("video_url") for t in tasks))
+
+    print("\n== 批量下载 / 批量清除 / 停止（v2.2.0）==")
+    status, blob = call("GET", "/api/tasks/bulk-download?ids=" + task_id, raw=True)
+    check("批量下载：选中已完成的任务 → 打包成 zip",
+          status == 200 and blob[:2] == b"PK" and len(blob) > 10000, len(blob))
+    status, mk = call("POST", "/api/tasks",
+                      {"tasks": [{"prompt": "停止测试 1"}, {"prompt": "停止测试 2"}]})
+    stop_ids = mk.get("ids") or []
+    status, stopped = call("POST", "/api/tasks/cancel-active")
+    check("一键停止所有排队 / 运行中的任务",
+          status == 200 and stopped.get("total", 0) >= 1, stopped)
+    time.sleep(1.5)
+    states = []
+    for tid in stop_ids:
+        _, row = call("GET", "/api/tasks/" + tid)
+        states.append(row.get("status"))
+    check("被停止的任务落到 cancelled，不会继续跑",
+          bool(states) and all(s == "cancelled" for s in states), states)
+    status, dl = call("GET", "/api/tasks/bulk-download?ids=" + ",".join(stop_ids))
+    check("选中的任务都没有成片 → 明确 404 提示",
+          status == 404 and "视频" in str(dl), dl)
+    status, deleted = call("POST", "/api/tasks/bulk-delete",
+                           {"ids": [task_id] + stop_ids})
+    check("批量清除：记录和成片文件一起删",
+          status == 200 and deleted.get("deleted") == 3
+          and deleted.get("files_removed", 0) >= 1, deleted)
+    status, gone = call("GET", "/api/tasks/" + task_id)
+    check("清除后任务确实不存在了", status == 404, status)
 
     print("\n== Cookie 规范化（防止把 JSON 当成 Cookie）==")
     json_paste = json.dumps([{"name": "账号A", "cookie": "sessionid=REAL_COOKIE; sid_guard=abc"}],

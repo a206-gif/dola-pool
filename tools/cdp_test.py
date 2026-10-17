@@ -121,6 +121,11 @@ def handle(conn, port):
                     STATE["window_state"] = (msg.get("params") or {}).get("bounds", {}).get("windowState")
                 elif method == "Browser.close":
                     result = {}
+                elif method == "Network.getCookies":
+                    result = {"cookies": [
+                        {"name": "sessionid", "value": "abc", "domain": ".dola.com"},
+                        {"name": "sid_guard", "value": "x%3D", "domain": ".dola.com"},
+                        {"name": "other", "value": "1", "domain": ".example.com"}]}
                 conn.sendall(_ws_frame(json.dumps({"id": msg.get("id"), "result": result})))
         else:
             if path == "/json/version":
@@ -232,6 +237,52 @@ def main():
           and "Network.setCookies" in [m for m, _ in COMMANDS],
           {"login": out.get("login"), "count": out.get("cookie_count"),
            "methods": [m for m, _ in COMMANDS]})
+
+    # —— 指纹：同一账号固定一套、不同账号不一样 ——
+    fp = desktop.fingerprint_profile(2)
+    check("同一个账号的指纹是固定的（不会每次开窗都变）",
+          desktop.fingerprint_profile(2) == fp, fp.get("ua"))
+    check("不同账号的指纹不一样", desktop.fingerprint_profile(2)["ua"] != desktop.fingerprint_profile(3)["ua"],
+          desktop.fingerprint_profile(3)["ua"][-30:])
+    major = fp["metadata"]["fullVersion"].split(".")[0]
+    check("UA 和 client hints 的主版本一致（不会自相矛盾）",
+          ("Chrome/" + fp["metadata"]["fullVersion"]) in fp["ua"]
+          and any(b["version"] == major for b in fp["metadata"]["brands"]), fp["metadata"]["brands"])
+    cmd_fp = desktop.build_account_browser_command("/x/msedge", "/tmp/p", ["/e/a"], "http://x/",
+                                                   debug_port=9333, fingerprint=fp)
+    check("开了指纹：启动参数里带 UA 与语言",
+          any(c.startswith("--user-agent=") and fp["ua"] in c for c in cmd_fp)
+          and ("--lang=" + fp["lang"]) in cmd_fp, [c for c in cmd_fp if c.startswith("--lang")])
+    check("没开指纹：启动参数不带 UA（保持真实身份）",
+          not any(c.startswith("--user-agent") for c in
+                  desktop.build_account_browser_command("/x/msedge", "/tmp/p", ["/e/a"], "http://x/")), "")
+
+    COMMANDS.clear()
+    res = desktop.apply_fingerprint(port, fp)
+    methods = [m for m, _ in COMMANDS]
+    check("指纹真的套到了页面上（UA / 时区 / 初始化脚本）",
+          res.get("ok") and "Emulation.setUserAgentOverride" in methods
+          and "Emulation.setTimezoneOverride" in methods
+          and "Page.addScriptToEvaluateOnNewDocument" in methods, methods)
+    sent_ua = [p for m, p in COMMANDS if m == "Emulation.setUserAgentOverride"]
+    check("UA 覆盖带完整 client hints（不让 sec-ch-ua 露馅）",
+          bool(sent_ua) and sent_ua[0].get("userAgent") == fp["ua"]
+          and sent_ua[0].get("userAgentMetadata", {}).get("fullVersion") == fp["metadata"]["fullVersion"]
+          and sent_ua[0].get("acceptLanguage") == fp["accept_language"], sent_ua[:1])
+    scripts = [p.get("source") for m, p in COMMANDS if m == "Page.addScriptToEvaluateOnNewDocument"]
+    check("初始化脚本里把 CPU / 内存 / 平台也固定住",
+          bool(scripts) and "hardwareConcurrency" in scripts[0] and str(fp["cores"]) in scripts[0], scripts[:1])
+
+    # —— 从窗口读回 CK（手动登录后用）——
+    read = desktop.cdp_read_cookies(port)
+    check("能从窗口读回 dola 的 CK",
+          read.get("ok") and read.get("count") == 2 and "sessionid=abc" in read.get("cookie", ""),
+          read)
+    check("别的域的 Cookie 不会被混进来", "other=1" not in read.get("cookie", ""), read.get("cookie"))
+    out = {}
+    hook("account_browser", {"op": "read_cookies", "account_id": 5})
+    check("账号页的「从窗口读取 CK」走的就是这个接口",
+          out.get("ok") and out.get("count") == 2, out)
 
     ctl.session({"account_id": 5, "action": "suspend"})
     check("挂起扩展窗口后，后端记成 parked + kind=browser",

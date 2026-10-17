@@ -193,7 +193,12 @@ curl -X POST http://127.0.0.1:8000/api/tasks -H "Content-Type: application/json"
 | GET | `/api/tasks/{id}` | 任务详情（含 `video_url`） |
 | POST | `/api/tasks/{id}/retry` · `/api/tasks/retry-failed` | 重试单个 / 全部失败任务 |
 | DELETE | `/api/tasks/{id}` | 删除任务（连同成片文件） |
-| GET/POST/DELETE | `/api/accounts` · `/api/accounts/{id}/check` · `/api/accounts/check-all` · `/api/import` | 账号池 |
+| POST | `/api/tasks/{id}/cancel` · `/api/tasks/cancel-active` | 停止单条 / 停止所有排队中、生成中的任务 |
+| GET | `/api/tasks/bulk-download?ids=a,b,c` | 把选中任务里已生成好的视频打成一个 zip（含任务清单） |
+| POST | `/api/tasks/bulk-delete` | 批量清除任务记录与成片文件（`{ids:[…]}`，运行中的会先停止） |
+| GET/POST/DELETE | `/api/accounts` · `/api/accounts/{id}/check` · `/api/accounts/check-all` · `/api/import` | 账号池（新增账号时 `cookie` 可留空 = 未登录实例） |
+| POST/GET | `/api/accounts/{id}/cookie` · `/api/accounts/{id}/ck` | 单个账号导入 / 清空 CK、导出完整 CK |
+| POST | `/api/accounts/{id}/browser` · `/api/accounts/{id}/browser/cookies` | 用带扩展的浏览器打开该账号（没有 CK 也能开）；从窗口读回 CK 并保存 |
 | POST | `/api/accounts/{id}/web` | 打开该账号登录态下的 Dola 页面（桌面版交给启动器开窗口，Web 版返回 `/dola-web/{id}/`） |
 | GET/POST/… | `/dola-web/{id}/…` | 「🌐 网页」的本机代理兜底入口：注入该账号 Cookie 后转发到 Dola，并改写页面内的地址与 CSP（桌面版默认不走这里，而是把 Cookie 写进浏览器内核后直开 dola.com） |
 | GET/POST/… | `/{任意路径}` | 兜底：页面里没被改写的站内绝对路径（如 JS 里 `location.href='/chat/x'`），只要 Referer 指向某个账号的代理页面就按同一账号转发；否则 404 |
