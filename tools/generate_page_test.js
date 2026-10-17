@@ -63,6 +63,10 @@ const SHOT = process.env.DOLA_SHOT || '';   // 可选：把渲染后的 HTML 存
           uploadCalls++;
           body = { ok: true, path: '/tmp/ref' + uploadCalls + '.png',
                    url: '/uploads/ref' + uploadCalls + '.png' };
+        } else if (url.includes('api/ai-reason')) {
+          body = { ok: true, count: 3, engine: 'local',
+                   scenes: [{ prompt: '镜头一：雨夜街口' }, { prompt: '镜头二：清晨窗边' },
+                            { prompt: '镜头三：黄昏天台' }] };
         } else if (url.includes('api/proxy-status') || url.includes('api/stats')) {
           body = {};
         }
@@ -278,6 +282,26 @@ const SHOT = process.env.DOLA_SHOT || '';   // 可选：把渲染后的 HTML 存
   out.push(['点它回到生成页，且是「单条任务」模式',
             !!$('genPrompt') && !!$('genSplitSingle') && $('genSplitSingle').checked,
             $('genPrompt') ? '已回到生成页' : '没回去']);
+
+  // —— AI 帮我写提示词：拆出多条镜头时要自动切到「批量」，否则会被当成一段 ——
+  w.eval("openAiAssist()");
+  await new Promise(r => setTimeout(r, 300));
+  const scriptBox = d.querySelector('#mform textarea[name="script"]');
+  if (scriptBox) scriptBox.value = '女孩在便利店门口等雨停';
+  const mform = d.querySelector('#mform');
+  if (mform) mform.dispatchEvent(new w.Event('submit', { bubbles: true, cancelable: true }));
+  await new Promise(r => setTimeout(r, 700));
+  out.push(['AI 拆出 3 条镜头后，自动切到「批量任务（每行一条）」',
+            !!$('genSplitBatch') && $('genSplitBatch').checked && !!$('genPrompt') &&
+            $('genPrompt').value.split('\n').filter(Boolean).length === 3,
+            $('genPrompt') ? JSON.stringify($('genPrompt').value) : '没回到生成页']);
+  out.push(['切到批量后提示「3 行 → 3 条任务」',
+            /3\s*行/.test(($('genSplitHint') || {}).textContent || ''),
+            (($('genSplitHint') || {}).textContent || '').slice(0, 60)]);
+  if ($('genSplitSingle')) {
+    $('genSplitSingle').checked = true;
+    $('genSplitSingle').dispatchEvent(new w.Event('change', { bubbles: true }));
+  }
 
   out.push(['无 JS 错误', errors.length === 0, errors.slice(0, 3).join(' | ')]);
 

@@ -938,8 +938,14 @@ function openAiAssist(){
   ], async (d) => {
     const r = await api('api/ai-reason', {method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({script: d.script, style: d.style, duration: Number(d.duration)})});
+    const multi = Number(r.count) > 1;
     $('genPrompt').value = r.scenes.map(s => s.prompt).join('\n');
-    toast('已生成 ' + r.count + ' 条提示词（' + (r.engine === 'agnes' ? 'AI' : '本地规则') + '）');
+    $('genPrompt').dispatchEvent(new Event('input', { bubbles: true }));
+    // AI 拆出来的是多条镜头提示词 → 自动切到「批量（按行拆分）」；只生成 1 条就保持单条
+    if (multi && $('genSplitBatch')) { $('genSplitBatch').checked = true; $('genSplitBatch').dispatchEvent(new Event('change', { bubbles: true })); }
+    if (!multi && $('genSplitSingle')) { $('genSplitSingle').checked = true; $('genSplitSingle').dispatchEvent(new Event('change', { bubbles: true })); }
+    toast('已生成 ' + r.count + ' 条提示词（' + (r.engine === 'agnes' ? 'AI' : '本地规则') + '）' +
+          (multi ? '，已自动切到「批量任务（每行一条）」' : '，保持单条任务'));
   });
 }
 
