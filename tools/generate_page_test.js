@@ -303,6 +303,37 @@ const SHOT = process.env.DOLA_SHOT || '';   // 可选：把渲染后的 HTML 存
     $('genSplitSingle').dispatchEvent(new w.Event('change', { bubbles: true }));
   }
 
+  // —— 任务队列的「⚡ 一键任务」：不离开队列，直接把草稿当 1 条提交 ——
+  await w.eval("go('generate')");
+  await new Promise(r => setTimeout(r, 400));
+  $('genPrompt').value = '雨夜街口，女孩回头\n霓虹倒影，慢动作水花';
+  $('genPrompt').dispatchEvent(new w.Event('input', { bubbles: true }));
+  await w.eval("go('tasks')");
+  await new Promise(r => setTimeout(r, 400));
+  const quickBtn = $('quickTaskBtn');
+  out.push(['任务队列页有「⚡ 一键任务」按钮', !!quickBtn && /一键任务/.test(quickBtn.textContent),
+            quickBtn ? quickBtn.textContent.trim() : '没有']);
+  const quickBefore = posted.length;
+  if (quickBtn) quickBtn.click();
+  await new Promise(r => setTimeout(r, 600));
+  const quickPost = posted[posted.length - 1];
+  out.push(['一键任务只提交 1 条', posted.length === quickBefore + 1 && quickPost && quickPost.tasks.length === 1,
+            '新增 ' + (posted.length - quickBefore) + ' 次提交']);
+  out.push(['一键任务的提示词是整段（换行没被拆开）',
+            !!quickPost && quickPost.tasks[0].prompt.includes('\n霓虹倒影'),
+            quickPost ? JSON.stringify(quickPost.tasks[0].prompt) : '']);
+
+  // 没有草稿时不能提交空任务：把人带到生成页
+  await w.eval("localStorage.setItem('dola.genForm.v1', JSON.stringify({prompt:''}))");
+  await w.eval("go('tasks')");
+  await new Promise(r => setTimeout(r, 300));
+  const beforeEmpty = posted.length;
+  if ($('quickTaskBtn')) $('quickTaskBtn').click();
+  await new Promise(r => setTimeout(r, 400));
+  out.push(['没有提示词时「一键任务」不会提交空任务，并跳到生成页',
+            posted.length === beforeEmpty && w.eval('state.page') === 'generate',
+            'state.page=' + w.eval('state.page')]);
+
   // 已取消的任务要能一键重试（不然「停止」之后只能删掉重来）
   const cancelRow = w.eval("taskTable([{id:'c1',status:'cancelled',prompt:'雨夜'}], false)");
   out.push(['已取消的任务有「↻ 重试」按钮', /重试/.test(cancelRow) && /已取消/.test(cancelRow),

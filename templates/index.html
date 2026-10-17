@@ -460,7 +460,7 @@ async function retryTask(id){
   toast('任务已重新排队'); render();
 }
 function quickSingleTask(){
-  // 「一键任务」：不用先解释批量/单条 —— 回到生成页，默认就是单条（整段一条）
+  // 「＋ 单条任务」：回到生成页，并锁定单条（整段一条），方便先改提示词再提交
   genFormSave({ split: 'single' });
   state.page = 'generate';
   render().then(() => {
@@ -468,6 +468,35 @@ function quickSingleTask(){
     if (el) { el.focus(); try { el.setSelectionRange(el.value.length, el.value.length); } catch (e) {} }
   });
 }
+
+/* 「⚡ 一键任务」：不离开任务队列，直接用生成页存下的提示词提交 1 条。
+   整段（含换行）算一条，绝不按行拆 —— 想批量请去生成页手动切「批量任务」。
+   没有提示词时把人带到生成页，不弹空任务。 */
+window.quickSubmitDraft = async function(){
+  const f = genFormLoad();
+  const raw = String(f.prompt || '').trim();
+  if (!raw) {
+    quickSingleTask();
+    toast('生成页还没有提示词，先写一句要生成什么', true);
+    return;
+  }
+  const btn = $('quickTaskBtn');
+  if (btn) btn.disabled = true;
+  try {
+    const draftRefs = Array.isArray(f.refs) ? f.refs : [];
+    const r = await api('api/tasks', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({tasks: [{prompt: raw}],
+        model: f.model || 'seedance_v2.0', duration: Number(f.duration) || 10,
+        ratio: f.ratio || '9:16', quality: f.quality || '720p',
+        account_id: Number(f.account) || null,
+        ref_images: draftRefs.map(x => x.path).join(',')})});
+    const lines = raw.split('\n').length;
+    toast('已提交 1 条任务（整段一条' + (lines > 1 ? '，' + lines + ' 行没拆开' : '') +
+          '），队列 ' + r.queue_depth);
+    render();
+  } catch(e){ toast(e.message, true); }
+  finally { const b = $('quickTaskBtn'); if (b) b.disabled = false; }
+};
 async function cancelTask(id){
   try {
     const r = await api('api/tasks/' + id + '/cancel', {method:'POST'});
@@ -1131,7 +1160,8 @@ async function pageTasks(){
       '<div class="stat"><div class="k">成片占用</div><div class="v">' + fmtBytes(stats.output_bytes) + '</div><div class="s">output 目录</div></div>' +
     '</div>' +
     '<div class="panel"><div class="row" style="margin-bottom:12px">' +
-      '<button class="btn primary" onclick="quickSingleTask()" title="回到生成页，默认整段算一条">＋ 单条任务</button>' +
+      '<button class="btn primary" id="quickTaskBtn" onclick="quickSubmitDraft()" title="用生成页里存着的提示词，立刻提交 1 条（整段算一条，不拆分）">⚡ 一键任务</button>' +
+      '<button class="btn" onclick="quickSingleTask()" title="回到生成页先改提示词；那边默认整段算一条">＋ 单条任务</button>' +
       '<input id="tq" placeholder="搜索任务 ID 或提示词" style="flex:1;min-width:180px" oninput="drawTaskTable()">' +
       '<select id="ts" style="width:140px" onchange="drawTaskTable()">' +
         '<option value="">全部状态</option><option value="running">生成中</option><option value="queued">排队中</option>' +
