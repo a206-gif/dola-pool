@@ -1372,7 +1372,7 @@ async function pageAccounts(){
       '</tr></thead><tbody>' + accounts.map(a =>
         '<tr><td class="mono">#' + a.id + '</td>' +
         '<td>' + esc(a.name) +
-          (a.has_cookie === false ? ' <span class="badge" title="还没有 CK：可以当实例开窗口，导入 CK 后才能生成">未登录</span>' : '') +
+          (a.has_cookie === false ? ' <span class="badge" title="还没有 CK：可以当实例开窗口（在窗口里登录后，用【CK】→【从窗口读取】存回来）；导入 CK 后才能用来生成">未登录</span>' : '') +
           (a.fingerprint ? ' <span class="badge dim" title="这个账号的窗口会固定一套 UA/语言/时区/CPU/内存">指纹</span>' : '') +
           (a.note ? '<div class="dim" style="font-size:11px">' + esc(a.note) + '</div>' : '') + '</td>' +
         '<td><span class="badge ' + (a.status === 'ready' ? 'ok' : a.status === 'invalid' ? 'bad' : a.status === 'paused' ? 'dim' : 'dim') + '">' + esc(a.status) + '</span></td>' +
@@ -1387,14 +1387,17 @@ async function pageAccounts(){
         '<button class="btn sm" onclick="checkAccount(' + a.id + ')" title="联网校验这个账号的 Cookie">验活</button> ' +
         '<button class="btn sm" onclick="accountCk(' + a.id + ')" title="单独导入 / 导出这个账号的 CK（也能从已打开的窗口里读回来）">CK</button> ' +
         (state.canManageWindows
-          ? '<button class="btn sm" onclick="openAccountBrowser(' + a.id + ')" title="用带扩展的 Edge/Chrome 打开这个账号的 Dola 页面：CK 自动写入，30 秒/无水印扩展可用">🌐 网页</button> ' +
+          ? '<button class="btn sm" onclick="openAccountBrowser(' + a.id + ')" title="' +
+              (a.has_cookie === false
+                ? '还没 CK：打开带扩展的 Edge/Chrome，你在窗口里登录后，回这行点【CK】→【从窗口读取】就能存进账号池'
+                : '用带扩展的 Edge/Chrome 打开这个账号的 Dola 页面：CK 自动写入，30 秒/无水印扩展可用') + '">🌐 网页</button> ' +
             '<button class="btn sm" onclick="openAccountWeb(' + a.id + ')" title="老的原生窗口（WebView2 内核，装不了扩展），支持挂起/切换">🪟 原生</button> ' +
             (needsManualExt
               ? '<button class="btn sm" onclick="installExtForAccount(' + a.id + ')" title="Chrome 137+ 不认 --load-extension：在这个账号的浏览器里手动装一次扩展">⚙ 装扩展</button> '
               : '')
           : '<button class="btn sm" onclick="openAccountWeb(' + a.id + ')" title="打开这个账号的 Dola 页面（登录态已带好）">🌐 网页</button> ') +
         '<button class="btn sm danger" onclick="delAccount(' + a.id + ')" title="从账号池里删掉">删除</button></td></tr>').join('') +
-      '</tbody></table></div>' : '<div class="empty">还没有账号。点击「批量导入」粘贴 Dola Cookie（每行一个）</div>') + '</div>' +
+      '</tbody></table></div>' : '<div class="empty">还没有账号。点【+ 新增账号】可以只建一个「实例」（CK 留空也能建，之后再导入）；<br>已经有 CK 文本的话点【⇧ 批量导入】直接粘贴（每行一个）。</div>') + '</div>' +
     '<div class="panel"><h2>窗口会话 <small>「后台挂起」= 窗口建好但不显示，登录态与页面先在后台准备好，切换时不用等</small></h2>' +
       '<div id="sessionBox">' + sessionList() + '</div></div>';
   $('checkAll').onclick = async () => {

@@ -2963,8 +2963,12 @@ def fingerprint_profile(account_id: int) -> dict:
     }
 
 
-def apply_fingerprint(port: int, profile: dict) -> dict:
-    """把指纹套到浏览器当前标签页上（要在导航到 dola 之前调用）。"""
+def apply_fingerprint(port: int, profile: dict, reload: bool = False) -> dict:
+    """把指纹套到浏览器当前标签页上（要在导航到 dola 之前调用）。
+
+    reload=True：套完立刻重载当前页 —— 没 CK 的实例只打开了页面、不会再导航，
+    重载一次才能让 client hints 也变成伪装后的值。
+    """
     out = {"ok": False, "error": ""}
     if not profile:
         out["error"] = "没有指纹配置"
@@ -2993,6 +2997,8 @@ def apply_fingerprint(port: int, profile: dict) -> dict:
                 pass
             cdp.call("Page.addScriptToEvaluateOnNewDocument",
                      {"source": profile["script"]}, timeout=6)
+            if reload:
+                cdp.call("Page.reload", {"ignoreCache": True}, timeout=10)
         out["ok"] = True
     except Exception as exc:  # noqa: BLE001
         out["error"] = str(exc)
@@ -3066,7 +3072,8 @@ def launch_account_browser(account_id: int, url: str, ext_roots: list = None,
     登录态：优先用 CDP 直接把 CK 写进浏览器（稳、不等扩展）；写不进去时
     才退回本机桥接页 + extensions/dola-login 那条老路。
     """
-    info_extra = {"login": "url", "cookie_count": 0, "url_used": url}
+    # 没 CK 的实例：窗口直接开 dola，登录交给人在窗口里做；login=none 让前端给对应引导
+    info_extra = {"login": "url" if cookie else "none", "cookie_count": 0, "url_used": url}
     exts = discover_extensions(ext_roots)
     fp = fingerprint_profile(account_id) if fingerprint else None
     info = {"ok": False, "browser": "", "account_id": int(account_id or 0),
@@ -3124,7 +3131,7 @@ def launch_account_browser(account_id: int, url: str, ext_roots: list = None,
     info["cdp"] = wait_cdp(debug_port, boot_wait)
     if fp and info["cdp"]:
         # 先套指纹、再写 CK 并导航：这样 dola 第一次看到的就是伪装后的身份
-        fp_result = apply_fingerprint(debug_port, fp)
+        fp_result = apply_fingerprint(debug_port, fp, reload=not cookie)
         info["fingerprint_applied"] = bool(fp_result.get("ok"))
         if not fp_result.get("ok"):
             info["warning"] = (info["warning"] + " 指纹没套上（%s），这个窗口按真实身份运行"

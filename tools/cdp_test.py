@@ -269,6 +269,12 @@ def main():
           bool(sent_ua) and sent_ua[0].get("userAgent") == fp["ua"]
           and sent_ua[0].get("userAgentMetadata", {}).get("fullVersion") == fp["metadata"]["fullVersion"]
           and sent_ua[0].get("acceptLanguage") == fp["accept_language"], sent_ua[:1])
+    check("套指纹默认不刷新页面（有 CK 的窗口马上要被导航到 dola，不用多刷一次）",
+          "Page.reload" not in methods, methods)
+    COMMANDS.clear()
+    desktop.apply_fingerprint(port, fp, reload=True)
+    check("没 CK 的实例：套完指纹立刻重载一次（client hints 也要变）",
+          "Page.reload" in [m for m, _ in COMMANDS], [m for m, _ in COMMANDS])
     scripts = [p.get("source") for m, p in COMMANDS if m == "Page.addScriptToEvaluateOnNewDocument"]
     check("初始化脚本里把 CPU / 内存 / 平台也固定住",
           bool(scripts) and "hardwareConcurrency" in scripts[0] and str(fp["cores"]) in scripts[0], scripts[:1])

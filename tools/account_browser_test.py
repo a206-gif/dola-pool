@@ -176,11 +176,35 @@ def main():
         check("返回里写明浏览器和提示",
               isinstance(body, dict) and body.get("browser") and "warning" in body, body)
         check("返回里写明这次靠什么登录（CDP / 桥接页兜底）",
-              isinstance(body, dict) and body.get("login") in ("cdp", "bridge", "no-cdp")
+              isinstance(body, dict) and body.get("login") in ("cdp", "bridge", "no-cdp", "none")
               and "cookie_count" in body, body)
         check("假浏览器开不出调试端口 → 退回桥接页，而不是失败",
               isinstance(body, dict) and body.get("login") == "bridge"
               and body.get("bridge_url") == body.get("url"), body)
+
+        # —— 没有 CK 的实例：窗口照开，直接进 dola.com，前端给「登录后读回 CK」的引导 ——
+        try:
+            os.unlink(argfile)
+        except OSError:
+            pass
+        status, body = call("POST", "/api/accounts", {"name": "未登录实例"})
+        anon_id = (body or {}).get("id") if isinstance(body, dict) else None
+        check("CK 留空也能建成实例（has_cookie=False）",
+              bool(anon_id) and body.get("has_cookie") is False, body)
+        status, body = call("POST", "/api/accounts/%s/browser" % anon_id)
+        check("没有 CK 的实例也能开浏览器窗口（login=none、不发一次性 token）",
+              status == 200 and body.get("login") == "none" and body.get("token") == ""
+              and not body.get("bridge_url"), body)
+        check("没 CK 时提示「在窗口里登录后点 CK → 从窗口读取」",
+              "从窗口读取" in (body.get("warning") or ""), body.get("warning"))
+        for _ in range(50):
+            if os.path.exists(argfile):
+                break
+            time.sleep(0.1)
+        anon_args = open(argfile, encoding="utf-8").read().splitlines() if os.path.exists(argfile) else []
+        check("没 CK 的实例打开的地址就是 dola.com 真站（不走桥接页）",
+              bool(anon_args) and anon_args[-1] == "https://www.dola.com/chat/",
+              anon_args[-1] if anon_args else anon_args)
 
         # 桥接页：扩展没回话时，这张页面要能把「怎么装扩展」写清楚
         status, page = call_raw("GET", "/desktop/bridge?token=" + urllib.parse.quote(token, safe=""))

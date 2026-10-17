@@ -58,7 +58,7 @@ from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 
-VERSION = "2.2.0"
+VERSION = "2.2.1"
 
 # --------------------------------------------------------------------------
 # 目录与配置
