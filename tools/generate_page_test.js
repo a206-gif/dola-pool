@@ -303,6 +303,17 @@ const SHOT = process.env.DOLA_SHOT || '';   // 可选：把渲染后的 HTML 存
     $('genSplitSingle').dispatchEvent(new w.Event('change', { bubbles: true }));
   }
 
+  // 已取消的任务要能一键重试（不然「停止」之后只能删掉重来）
+  const cancelRow = w.eval("taskTable([{id:'c1',status:'cancelled',prompt:'雨夜'}], false)");
+  out.push(['已取消的任务有「↻ 重试」按钮', /重试/.test(cancelRow) && /已取消/.test(cancelRow),
+            String(cancelRow).replace(/\s+/g, ' ').slice(0, 90)]);
+  const cancelledRow = w.eval("(function(){var tr=document.createElement('tr');" +
+    "tr.innerHTML='<td></td><td><div class=\"prompt-cell\"></div></td><td class=\"account-cell\"></td>" +
+    "<td><div class=\"status-cell\"></div></td><td><div class=\"act-cell\"></div></td>';" +
+    "updateTaskRow(tr,{id:'c2',status:'cancelled',prompt:'雨夜',result:'已按你的要求停止'});" +
+    "return tr.querySelector('.act-cell').innerHTML;})()");
+  out.push(['生成页最近任务里的已取消任务也有「重试」', /重试/.test(cancelledRow), String(cancelledRow).slice(0, 80)]);
+
   out.push(['无 JS 错误', errors.length === 0, errors.slice(0, 3).join(' | ')]);
 
   if (SHOT) require('fs').writeFileSync(SHOT, d.body.innerHTML);

@@ -420,7 +420,8 @@ function taskTable(tasks, compact){
       (compact ? '' : '<td class="dim" style="white-space:nowrap">' + fmtTime(t.created_at) + '</td>') +
       '<td style="white-space:nowrap">' +
         (t.video_url ? '<button class="btn sm" onclick="playVideo(\'' + t.video_url + '\',\'' + esc(t.id) + '\')">▶ 播放</button> ' : '') +
-        (t.status === 'failed' ? '<button class="btn sm" onclick="retryTask(\'' + t.id + '\')">↻ 重试</button> ' : '') +
+        ((t.status === 'failed' || t.status === 'cancelled')
+          ? '<button class="btn sm" onclick="retryTask(\'' + t.id + '\')">↻ 重试</button> ' : '') +
         ((t.status === 'running' || t.status === 'queued')
           ? '<button class="btn sm danger" onclick="cancelTask(\'' + t.id + '\')" title="停止这条任务">■ 停止</button> ' : '') +
         (compact ? '' : '<button class="btn sm danger" onclick="deleteTask(\'' + t.id + '\')">✕</button>') +
@@ -832,7 +833,7 @@ function updateTaskRow(tr, t){
   const progress = (t.status === 'running' || t.status === 'queued')
     ? '<div class="bar" style="margin-top:6px"><i style="width:' + (t.progress || 0) + '%"></i></div>' +
       '<div class="dim" style="font-size:11px;margin-top:3px">' + esc((t.result || '').slice(0, 40)) + '</div>'
-    : (t.status === 'failed'
+    : ((t.status === 'failed' || t.status === 'cancelled')
         ? '<div class="dim" style="font-size:11px;margin-top:4px;max-width:220px">' +
           esc((t.error || t.result || '').slice(0, 80)) + '</div>' : '');
   const sig = [t.status, t.progress, t.result, t.error].join('|');
@@ -846,7 +847,8 @@ function updateTaskRow(tr, t){
     actCell.dataset.sig = actSig;
     actCell.innerHTML =
       (t.video_url ? '<button class="btn sm" onclick="playVideo(\'' + t.video_url + '\',\'' + esc(t.id) + '\')">▶ 播放</button> ' : '') +
-      (t.status === 'failed' ? '<button class="btn sm" onclick="retryTask(\'' + t.id + '\')">↻ 重试</button> ' : '') +
+      ((t.status === 'failed' || t.status === 'cancelled')
+        ? '<button class="btn sm" onclick="retryTask(\'' + t.id + '\')">↻ 重试</button> ' : '') +
       ((t.status === 'running' || t.status === 'queued')
         ? '<button class="btn sm danger" onclick="cancelTask(\'' + t.id + '\')" title="停止这条任务">■ 停止</button> ' : '');
   }
