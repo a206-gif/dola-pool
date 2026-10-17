@@ -729,6 +729,7 @@ def _prepare_browser_network(config=None, env=None, log=print,
         proxy_arg, note = shown, "直接交给内核：%s" % shown
     env["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = "--proxy-server=%s %s" % (proxy_arg, _PROXY_BYPASS)
     info.update(applied=True, source=source, proxy=shown, note=note,
+                proxy_arg=proxy_arg,
                 args=env["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"])
     log("[desktop] 浏览器内核网络：%s（来自 %s；本机地址直连）" % (note, source))
     return info
@@ -1300,6 +1301,7 @@ class Control:
         self._sessions = {}         # account_id → 会话记录（窗口/登录态/状态）
         self._kernel_account = None # 内核 Cookie 里现在是谁的登录态
         self.net_note = ""          # 内核网络说明（代理还是直连），写进诊断页
+        self.net_info = {}          # 内核网络细节（含 proxy_arg，真实浏览器窗口沿用同一个代理）
         self.demo = False           # 演示模式：账号窗口不碰真站，走本机代理页
 
     def __call__(self, action: str, payload=None) -> None:
@@ -1312,6 +1314,9 @@ class Control:
             return
         if action == "extensions":
             self.extensions(payload or {})
+            return
+        if action == "account_browser":
+            self.account_browser(payload or {})
             return
         if action == "open_external":
             # 账号窗口里的「用系统浏览器打开」：走本机 HTTP 端点进来，不经任何 JS 桥
@@ -1352,6 +1357,22 @@ class Control:
                       "load_extension_supported": supported, "warning": warn,
                       "profile": extension_browser_profile(),
                       "roots": [r for r in extension_roots() if os.path.isdir(r)]}
+        if isinstance(out, dict):
+            out.update(result)
+
+    def account_browser(self, payload: dict) -> None:
+        """用带扩展的真实 Edge/Chrome 打开某个账号的 Dola 页面（CK 由扩展写进去）。"""
+        out = payload.get("out")
+        account_id = int(payload.get("account_id") or 0)
+        if str(payload.get("op") or "launch") == "manager":
+            # 这个账号的 profile 里手动装扩展（Chrome 137+ 才需要）
+            result = open_extension_manager(profile=account_browser_profile(account_id))
+        else:
+            proxy_arg = str((getattr(self, "net_info", {}) or {}).get("proxy_arg") or "")
+            result = launch_account_browser(
+                account_id, str(payload.get("url") or "https://www.dola.com/chat/"),
+                proxy_arg=proxy_arg)
+        print("[desktop] 账号扩展窗口：%s" % ("已启动" if result.get("ok") else result.get("error")))
         if isinstance(out, dict):
             out.update(result)
 
@@ -2032,8 +2053,9 @@ def _spawn_detached(cmd: list) -> None:
     subprocess.Popen(cmd, **kwargs)
 
 
-def open_extension_manager(browser: str = "", roots: list = None) -> dict:
-    """在独立 profile 里打开扩展管理页（Chrome 137+ 只能手动装一次）并返回扩展目录。"""
+def open_extension_manager(browser: str = "", roots: list = None,
+                           profile: str = "") -> dict:
+    """在指定 profile 里打开扩展管理页（Chrome 137+ 只能手动装一次）。"""
     exts = discover_extensions(roots)
     info = {"ok": False, "error": "", "browser": "", "url": "", "dirs": [e["path"] for e in exts]}
     if not exts:
@@ -2043,7 +2065,7 @@ def open_extension_manager(browser: str = "", roots: list = None) -> dict:
     if not exe:
         info["error"] = "没找到 Edge 或 Chrome，请先安装（或用环境变量 DOLA_BROWSER 指定路径）"
         return info
-    profile = extension_browser_profile()
+    profile = profile or extension_browser_profile()
     try:
         os.makedirs(profile, exist_ok=True)
     except Exception as exc:  # noqa: BLE001
@@ -2139,6 +2161,80 @@ def launch_extension_browser(url: str = "https://www.dola.com/chat/",
     return info
 
 
+def account_browser_profile(account_id: int) -> str:
+    """每个账号一个独立的浏览器 profile，互不串登录态。"""
+    safe = "acc-%d" % int(account_id or 0)
+    return os.path.join(DATA_DIR, "account-browsers", safe)
+
+
+def build_account_browser_command(browser: str, profile_dir: str, ext_dirs: list,
+                                  url: str, proxy_arg: str = "") -> list:
+    """带扩展 + 代理的账号窗口启动参数（单独抽出来便于不开浏览器自检）。"""
+    joined = ",".join(ext_dirs)
+    cmd = [
+        browser,
+        "--user-data-dir=" + profile_dir,
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--new-window",
+        "--disable-extensions-except=" + joined,
+        "--load-extension=" + joined,
+    ]
+    if proxy_arg:
+        cmd += ["--proxy-server=" + proxy_arg, _PROXY_BYPASS]
+    cmd.append(url)
+    return cmd
+
+
+def launch_account_browser(account_id: int, url: str, ext_roots: list = None,
+                           browser: str = "", proxy_arg: str = "") -> dict:
+    """用带扩展的 Edge/Chrome 打开「这个账号」的 Dola 页面。
+
+    登录态怎么来的：启动参数里带的是 dola.com 的一次性 token；扩展
+    `extensions/dola-login` 读到后向本机 /api/desktop/bridge/cookies 取 CK，
+    再用 chrome.cookies.set 写进这个 profile，页面刷新就是登录态。
+    """
+    exts = discover_extensions(ext_roots)
+    info = {"ok": False, "browser": "", "account_id": int(account_id or 0),
+            "extensions": [e["name"] for e in exts], "command": "", "error": "",
+            "profile": account_browser_profile(account_id), "warning": "",
+            "load_extension_supported": True}
+    if not exts:
+        info["error"] = ("没找到扩展：把扩展放到程序目录的 extensions/ 下，"
+                         "确保某一层目录里有 manifest.json")
+        return info
+    if not any("CK 自动登录" in e["name"] or os.path.basename(e["path"]) == "dola-login"
+               for e in exts):
+        info["warning"] = ("没找到「Dola Pool · CK 自动登录」扩展，"
+                           "窗口会打开但不会自动带入这个账号的登录态。")
+    exe = browser or find_chromium_browser()
+    if not exe:
+        info["error"] = "没找到 Edge 或 Chrome，请先安装（或用环境变量 DOLA_BROWSER 指定路径）"
+        return info
+    supported, warn = load_extension_supported(exe)
+    info["load_extension_supported"] = supported
+    if warn:
+        info["warning"] = (info["warning"] + " " + warn).strip()
+    profile = info["profile"]
+    try:
+        os.makedirs(profile, exist_ok=True)
+    except Exception as exc:  # noqa: BLE001
+        info["error"] = "创建浏览器 profile 失败：%s" % exc
+        return info
+    cmd = build_account_browser_command(exe, profile, [e["path"] for e in exts],
+                                        url, proxy_arg=proxy_arg)
+    info["browser"] = exe
+    info["browser_version"] = browser_version(exe)
+    info["command"] = " ".join(cmd)
+    try:
+        _spawn_detached(cmd)
+    except Exception as exc:  # noqa: BLE001
+        info["error"] = "启动浏览器失败：%s" % exc
+        return info
+    info["ok"] = True
+    return info
+
+
 def _open_in_browser(url: str) -> None:
     """打开系统浏览器；无图形环境时只记日志，绝不抛异常。"""
     try:
@@ -2231,8 +2327,9 @@ def main(argv=None) -> int:
 
     # 内核（WebView2）的网络必须先准备好：WebView2 只在**创建浏览器环境时**读
     # WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS，等窗口建出来再设就没用了。
-    control.net_note = _prepare_browser_network(
-        {} if args.no_proxy else cfg, log=print, allow_env=not args.no_proxy).get("note", "")
+    control.net_info = _prepare_browser_network(
+        {} if args.no_proxy else cfg, log=print, allow_env=not args.no_proxy)
+    control.net_note = control.net_info.get("note", "")
 
     storage_path = os.path.join(DATA_DIR, "webview")
     os.makedirs(storage_path, exist_ok=True)

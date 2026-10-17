@@ -55,7 +55,7 @@ from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
                                RedirectResponse, Response)
 from fastapi.staticfiles import StaticFiles
 
-VERSION = "2.0.16"
+VERSION = "2.0.17"
 
 # --------------------------------------------------------------------------
 # 目录与配置
@@ -1014,6 +1014,10 @@ async def auth_middleware(request: Request, call_next):
     if not ADMIN_TOKEN:
         return await call_next(request)
     if path in ("/login", "/api/login", "/api/health") or path.startswith("/static"):
+        return await call_next(request)
+    # 浏览器扩展拿 CK 的两个口子：它们自带一次性 token（不可猜、只能用一次），
+    # 扩展里没法带 X-Admin-Token，所以这里不套管理员鉴权。
+    if path.startswith("/api/desktop/bridge/"):
         return await call_next(request)
     if _authed(request):
         return await call_next(request)
@@ -3023,6 +3027,76 @@ async def api_dola_web(account_id: int, request: Request, rest: str = ""):
     return await _serve_dola_proxy(account_id, rest, request)
 
 
+# --------------------------------------------------------------------------
+# 浏览器扩展自动登录用的「一次性 token」
+#
+# 为什么不在地址里直接塞 Cookie：地址栏、历史记录、截图都会把它留下来。
+# 这里只给扩展一个 2 分钟、只能用一次、且只能换本账号 Cookie 的凭证；
+# 真正的 CK 由扩展后台走 127.0.0.1 取，dola.com 页面 JS 拿不到。
+# --------------------------------------------------------------------------
+_BRIDGE_TOKENS = {}
+_BRIDGE_LOCK = threading.Lock()
+_BRIDGE_TTL = 180
+
+
+def bridge_issue(account_id: int, ttl: int = _BRIDGE_TTL) -> str:
+    token = secrets.token_urlsafe(18)
+    now = time.time()
+    with _BRIDGE_LOCK:
+        for key in [k for k, v in _BRIDGE_TOKENS.items() if v.get("expires", 0) < now]:
+            _BRIDGE_TOKENS.pop(key, None)
+        _BRIDGE_TOKENS[token] = {"account_id": int(account_id), "expires": now + ttl,
+                                 "used": False, "count": 0, "at": 0.0}
+    return token
+
+
+def bridge_take(token: str):
+    """取用一次（同一 token 第二次直接失败）。返回 (entry, error)。"""
+    now = time.time()
+    with _BRIDGE_LOCK:
+        entry = _BRIDGE_TOKENS.get(token or "")
+        if entry is None:
+            return None, "token 不存在"
+        if entry["expires"] < now:
+            _BRIDGE_TOKENS.pop(token, None)
+            return None, "token 已过期（重新点一次「🌐 网页」）"
+        if entry["used"]:
+            return None, "token 已经用过了（重新点一次「🌐 网页」）"
+        entry["used"] = True
+        entry["at"] = now
+        return dict(entry), ""
+
+
+def bridge_status(token: str):
+    with _BRIDGE_LOCK:
+        entry = _BRIDGE_TOKENS.get(token or "")
+        return dict(entry) if entry else None
+
+
+def _cookie_pairs(raw: str) -> list:
+    """'a=1; b=2' -> [('a','1'), ('b','2')]（和 desktop.py 里那份逻辑一致）。"""
+    pairs = []
+    for part in (raw or "").split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        name, _, value = part.partition("=")
+        name = name.strip()
+        if name:
+            pairs.append((name, value.strip()))
+    return pairs
+
+
+def bridge_cookie_list(cookie: str) -> list:
+    """'a=1; b=2' -> chrome.cookies.set 能吃的结构（与 WebView2 注入保持同样的属性）。"""
+    out = []
+    for name, value in _cookie_pairs(cookie):
+        out.append({"name": name, "value": value, "domain": ".dola.com",
+                    "path": "/", "secure": True, "httpOnly": True,
+                    "host": "www.dola.com", "sameSite": "unspecified"})
+    return out
+
+
 def _account_web_payload(account_id: int):
     """拼出「打开这个账号的 Dola 页面」需要的一切（桌面窗口与网页版共用）。"""
     if not WEB_PROXY:
@@ -3067,6 +3141,176 @@ def api_account_web(account_id: int):
         except Exception as exc:  # noqa: BLE001
             log.warning("桌面窗口打开失败，退回浏览器：%s", exc)
     return {"ok": True, "mode": "browser", "url": payload["url"], "title": payload["title"]}
+
+
+_BRIDGE_PAGE = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="referrer" content="no-referrer"><title>Dola Pool · 正在登录 %(label)s</title>
+<style>
+ :root{color-scheme:dark} *{box-sizing:border-box}
+ body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+      background:#0a0f11;color:#e7eeee;font:15px/1.7 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+ .card{max-width:560px;margin:24px;padding:26px 28px;border-radius:14px;background:#12191b;
+       border:1px solid #243235;box-shadow:0 18px 50px rgba(0,0,0,.5)}
+ h1{margin:0 0 6px;font-size:19px} .dim{color:#93a5a8;font-size:13px}
+ .spin{display:inline-block;width:14px;height:14px;margin-right:8px;border-radius:50%%;
+       border:2px solid #2f8f7c;border-top-color:transparent;animation:r 1s linear infinite;
+       vertical-align:-2px}
+ @keyframes r{to{transform:rotate(360deg)}}
+ li{margin:4px 0;font-size:13px} code{background:#0d1416;border:1px solid #263335;border-radius:5px;padding:1px 6px;font-size:12.5px}
+ a{color:#5fe3c8} .warn{color:#f5c76b}
+</style></head><body><div class="card" id="card">
+<h1><span class="spin"></span>正在用 %(label)s 的 CK 登录…</h1>
+<div class="dim">Dola Pool 正在把「%(name)s」的 Cookie 写进这个浏览器，写好后会自动进入 dola.com。请不要关掉这个标签页。</div>
+<div id="err" class="warn" style="margin-top:12px;display:none"></div>
+</div>
+<script>
+(function(){
+  var token = %(token_js)s;
+  var started = Date.now();
+  var box = document.getElementById('card');
+  var err = document.getElementById('err');
+  function fail(html){ err.style.display = 'block'; err.innerHTML = html; }
+  function poll(){
+    if (Date.now() - started > 15000) {
+      fail('⚠️ 15 秒内没等到扩展回话。说明这个浏览器里没有加载 <b>Dola Pool · CK 自动登录</b> 扩展。<br>' +
+           '在地址栏打开 <code>edge://extensions</code>（Chrome 是 <code>chrome://extensions</code>）→ 打开【开发者模式】→ ' +
+           '【加载已解压的扩展程序】→ 选程序目录里的 <code>extensions\\dola-login</code>，再回到账号池点一次【🌐 网页】。' +
+           '<br><br>也可以直接 <a href="https://www.dola.com/chat/">先进入 dola.com</a> 手动登录。');
+      return;
+    }
+    fetch('/api/desktop/bridge/status?token=' + encodeURIComponent(token), {cache:'no-store'})
+      .then(function(r){ return r.json(); })
+      .then(function(st){
+        if (st && st.used) { location.replace('https://www.dola.com/chat/'); return; }
+        if (st && st.known === false) { fail('⚠️ 这个登录凭证已失效，请回账号池重新点【🌐 网页】。'); return; }
+        setTimeout(poll, 700);
+      })
+      .catch(function(){ setTimeout(poll, 1200); });
+  }
+  setTimeout(poll, 500);
+})();
+</script></div></body></html>"""
+
+
+@app.get("/desktop/bridge", response_class=HTMLResponse)
+def desktop_bridge_page(token: str = ""):
+    """浏览器扩展的中转页：页面在 127.0.0.1，扩展读 token → 写 CK → 跳到 dola.com。
+
+    好处：CK 和 token 都不出现在 dola.com 的地址栏/Referer 里；扩展没加载时，
+    这张页面能把「怎么装」直接写给人看。
+    """
+    entry = bridge_status(token)
+    headers = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
+    if entry is None:
+        return HTMLResponse(
+            "<!doctype html><meta charset='utf-8'><title>凭证失效</title>"
+            "<body style='background:#0a0f11;color:#e7eeee;font:15px/1.7 sans-serif;padding:40px'>"
+            "<h2>这个登录凭证不存在或已过期</h2>"
+            "<p>回账号池，重新点一次该账号的【🌐 网页】。</p></body>",
+            401, headers=headers)
+    if entry.get("used"):
+        return RedirectResponse("https://www.dola.com/chat/", status_code=302,
+                                headers=headers)
+    conn = db()
+    row = conn.execute("select name from accounts where id=?", (entry["account_id"],)).fetchone()
+    conn.close()
+    name = (row["name"] if row else "") or ("#%s" % entry["account_id"])
+    html = _BRIDGE_PAGE % {"label": _html_escape("#%s" % entry["account_id"]),
+                           "name": _html_escape(name),
+                           "token_js": _js_json(token)}
+    return HTMLResponse(html, headers=headers)
+
+
+@app.post("/api/accounts/{account_id}/browser")
+def api_account_browser(account_id: int):
+    """用带扩展的真实 Edge/Chrome 打开这个账号的 Dola 页面，CK 由扩展自动写入。
+
+    和 /web（WebView2 原生窗口）的区别：WebView2 内核装不了扩展，
+    所以「30 秒 / 2.5 / 无水印」这些必须走真浏览器 —— 这个端点就是那条路。
+    """
+    if not (DESKTOP_MODE and _control_hook):
+        return JSONResponse({"error": "网页版不能启动本机浏览器；请用桌面版"}, 400)
+    conn = db()
+    row = conn.execute("select id,name,cookie from accounts where id=?",
+                       (account_id,)).fetchone()
+    conn.close()
+    if row is None:
+        return JSONResponse({"error": "账号不存在"}, 404)
+    cookie, _note = sanitize_cookie(row["cookie"] or "")
+    if not cookie:
+        return JSONResponse({"error": "该账号没有可用的 Cookie，先补上再打开网页"}, 400)
+    token = bridge_issue(account_id)
+    # 先开本机的桥接页：扩展在那里读 token、写 CK，再跳 dola.com。
+    # （CK 和 token 都不会出现在 dola.com 的地址栏 / Referer 里）
+    url = ("http://127.0.0.1:%d/desktop/bridge?token=%s"
+           % (PORT, urllib.parse.quote(token, safe="")))
+    out = {}
+    try:
+        _control_hook("account_browser", {"account_id": account_id, "url": url, "out": out})
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"error": "启动带扩展的浏览器失败：%s" % exc}, 500)
+    if not out.get("ok"):
+        return JSONResponse({"error": out.get("error") or "启动带扩展的浏览器失败"}, 400)
+    audit("account.browser", "id=%s" % account_id)
+    return {"ok": True, "mode": "desktop", "account_id": account_id, "token": token,
+            "url": url, "browser": out.get("browser") or "",
+            "browser_version": out.get("browser_version") or "",
+            "extensions": out.get("extensions") or [],
+            "warning": out.get("warning") or ""}
+
+
+@app.post("/api/accounts/{account_id}/browser/manager")
+def api_account_browser_manager(account_id: int):
+    """在这个账号的浏览器 profile 里打开扩展管理页（Chrome 137+ 手动装扩展用）。"""
+    if not (DESKTOP_MODE and _control_hook):
+        return JSONResponse({"error": "该接口仅在桌面版可用"}, 400)
+    out = {}
+    try:
+        _control_hook("account_browser", {"op": "manager", "account_id": account_id, "out": out})
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"error": "打开扩展管理页失败：%s" % exc}, 500)
+    if not out.get("ok"):
+        return JSONResponse({"error": out.get("error") or "打开扩展管理页失败"}, 400)
+    audit("account.browser_manager", "id=%s" % account_id)
+    return out
+
+
+@app.get("/api/desktop/bridge/cookies")
+def api_bridge_cookies(token: str = ""):
+    """给浏览器扩展的 CK 取用口（一次性 token，2 分钟有效，只回本账号）。"""
+    entry, why = bridge_take(token)
+    if entry is None:
+        return JSONResponse({"error": why or "token 无效"}, 401,
+                            headers={"Cache-Control": "no-store"})
+    conn = db()
+    row = conn.execute("select id,name,cookie from accounts where id=?",
+                       (entry["account_id"],)).fetchone()
+    conn.close()
+    if row is None:
+        return JSONResponse({"error": "账号不存在"}, 404,
+                            headers={"Cache-Control": "no-store"})
+    cookie, _note = sanitize_cookie(row["cookie"] or "")
+    cookies = bridge_cookie_list(cookie)
+    with _BRIDGE_LOCK:
+        if token in _BRIDGE_TOKENS:
+            _BRIDGE_TOKENS[token]["count"] = len(cookies)
+    return JSONResponse({"ok": bool(cookies), "account_id": entry["account_id"],
+                         "name": row["name"] or "", "home": "https://www.dola.com/chat/",
+                         "cookies": cookies, "count": len(cookies)},
+                        headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/desktop/bridge/status")
+def api_bridge_status(token: str = ""):
+    """前端轮询：扩展到底有没有把 CK 写进去（判断扩展有没有加载成功）。"""
+    entry = bridge_status(token)
+    if entry is None:
+        return {"ok": False, "known": False, "used": False,
+                "error": "token 不存在或已过期"}
+    return {"ok": True, "known": True, "used": bool(entry.get("used")),
+            "count": int(entry.get("count") or 0),
+            "account_id": entry.get("account_id"), "expires_in":
+            max(0, int(entry.get("expires", 0) - time.time()))}
 
 
 @app.post("/api/accounts/{account_id}/session")

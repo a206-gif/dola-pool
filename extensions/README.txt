@@ -2,6 +2,9 @@
 
 现在自带两套（来自你上传的 Extensions.zip，原样保留）：
 
+  dola-login/    Dola Pool · CK 自动登录 v1.0.0
+                 · 账号池点【🌐 网页】时，把该账号的 CK 从本机接口取来写进浏览器
+                 · 只在本机桥接页 /desktop/bridge?token=… 上工作，平时完全不动
   dola30/        哆啦助手 · 30秒无水印助手 v1.6.12
                  · 视频生成页的「30 秒」开关（Seedance 2.5 的 30s）
                  · 720P / 1080P 分辨率注入

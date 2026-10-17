@@ -35,6 +35,7 @@ const BASE = process.env.DOLA_BASE || 'http://127.0.0.1:8000';
     extensions: [{ name: '哆啦助手 · 30秒无水印助手', version: '1.6.12', path: 'C:/DolaPool/extensions/dola30' },
                  { name: 'Cookie-Editor', version: '1.13.0', path: 'C:/DolaPool/extensions/cookie-editor' }] };
   let openedWithExtension = 0, openedManager = 0, revealedDir = 0;
+  let accountBrowserCalls = 0, accountNativeCalls = 0;
 
   const dom = new JSDOM(html, {
     url: BASE + '/', runScripts: 'dangerously', pretendToBeVisual: true, virtualConsole: vc,
@@ -43,6 +44,11 @@ const BASE = process.env.DOLA_BASE || 'http://127.0.0.1:8000';
         const url = String(u);
         calls.push((o && o.method ? o.method + ' ' : 'GET ') + url);
         const body = url.includes('api/desktop/extensions/open') ? (openedWithExtension++, { ok: true, browser: extInfo.browser })
+          : /api\/accounts\/\d+\/browser\/manager/.test(url) ? (openedManager++, { ok: true, browser: extInfo.browser, url: 'edge://extensions' })
+          : /api\/accounts\/\d+\/browser/.test(url) ? (accountBrowserCalls++, { ok: true, mode: 'desktop', token: 'tok-1',
+              browser: extInfo.browser, url: 'https://www.dola.com/chat/#dp-login=tok-1:8000', warning: '' })
+          : url.includes('api/desktop/bridge/status') ? { ok: true, known: true, used: true, count: 3 }
+          : /api\/accounts\/\d+\/web/.test(url) ? (accountNativeCalls++, { ok: true, mode: 'desktop', url: '/dola-web/1/' })
           : url.includes('api/desktop/extensions/manager') ? (openedManager++, { ok: true, browser: extInfo.browser, url: 'edge://extensions' })
           : url.includes('api/desktop/extensions/reveal') ? (revealedDir++, { ok: true, path: extInfo.roots[0] })
           : url.includes('api/desktop/extensions') ? extInfo
@@ -170,6 +176,20 @@ const BASE = process.env.DOLA_BASE || 'http://127.0.0.1:8000';
   await new Promise(r => setTimeout(r, 400));
   out.push(['点「切换过去」→ 调用会话接口 activate',
             calls.some(c => /api\/accounts\/2\/session/.test(c)), calls.join('|').slice(0, 120)]);
+  // ⑤ 账号行：「🌐 网页」= 带扩展的浏览器 + 这个账号的 CK；「🪟 原生」= 老窗口
+  await w.eval('render()');
+  await new Promise(r => setTimeout(r, 500));
+  const webBtn = Array.from(d.querySelectorAll('button')).find(b => /🌐 网页/.test(b.textContent));
+  const nativeBtn = Array.from(d.querySelectorAll('button')).find(b => /🪟 原生/.test(b.textContent));
+  out.push(['账号行有「🌐 网页」和「🪟 原生」两个入口', !!webBtn && !!nativeBtn, '']);
+  if (webBtn) { webBtn.click(); await new Promise(r => setTimeout(r, 300)); }
+  out.push(['点「🌐 网页」会走带扩展的账号窗口接口（不是原生窗口）',
+            accountBrowserCalls === 1 && accountNativeCalls === 0,
+            '扩展窗口 ' + accountBrowserCalls + ' 次 / 原生 ' + accountNativeCalls + ' 次']);
+  if (nativeBtn) { nativeBtn.click(); await new Promise(r => setTimeout(r, 300)); }
+  out.push(['点「🪟 原生」仍然走老的原生窗口', accountNativeCalls === 1, '原生 ' + accountNativeCalls + ' 次']);
+  out.push(['token 用完后前端会轮询状态并弹「已登录」', /已用 CK 登录/.test(d.body.textContent), '']);
+
   out.push(['无 JS 错误', errors.length === 0, errors.slice(0, 2).join(' | ')]);
 
   let bad = 0;

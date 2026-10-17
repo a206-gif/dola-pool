@@ -1,0 +1,43 @@
+{
+  "manifest_version": 3,
+  "name": "Dola Pool · CK 自动登录",
+  "version": "1.0.0",
+  "description": "打开 dola.com 时，从本机 Dola Pool 取该账号的 CK 写进浏览器，自动变成登录态（配合账号池的「🌐 网页」按钮使用）。",
+  "permissions": [
+    "cookies",
+    "tabs",
+    "storage"
+  ],
+  "host_permissions": [
+    "*://*.dola.com/*",
+    "http://127.0.0.1/*",
+    "http://localhost/*"
+  ],
+  "background": {
+    "service_worker": "service-worker.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://127.0.0.1/*",
+        "http://localhost/*"
+      ],
+      "js": [
+        "bridge.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "*://*.dola.com/*"
+      ],
+      "js": [
+        "bridge.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "Dola Pool · CK 自动登录"
+  }
+}
