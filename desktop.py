@@ -2649,8 +2649,23 @@ def run_browser_generation(port: int, prompt: str, cookie: str = "",
                 {k: (prep.get("status") or {}).get(k) for k in ("model", "duration", "ratio")},
                 ensure_ascii=False))
 
-            sub = cdp.eval("window.__dolaPoolKernel.submit(%s)"
-                           % json.dumps(prompt, ensure_ascii=False), timeout=40)
+            # 用 CDP 的 Input.insertText 真「打字」：受控编辑器也能收到输入事件。
+            # 失败再退回页面内 execCommand 写入。
+            sub = None
+            focus = cdp.eval("window.__dolaPoolKernel.focusEditor()", timeout=15)
+            if isinstance(focus, dict) and focus.get("ok"):
+                try:
+                    cdp.call("Input.insertText", {"text": prompt}, timeout=10)
+                    await_status = cdp.eval("window.__dolaPoolKernel.status()", timeout=10) or {}
+                    head = prompt.strip()[:12]
+                    if head and head in str(await_status.get("prompt") or ""):
+                        log("[扩展内核] 提示词已插入（%d 字）" % len(prompt))
+                        sub = cdp.eval("window.__dolaPoolKernel.sendNow()", timeout=40)
+                except Exception as exc:  # noqa: BLE001
+                    log("[扩展内核] Input.insertText 失败，改用页面内写入：%s" % exc)
+            if not isinstance(sub, dict):
+                sub = cdp.eval("window.__dolaPoolKernel.submit(%s)"
+                               % json.dumps(prompt, ensure_ascii=False), timeout=40)
             if not isinstance(sub, dict) or not sub.get("ok"):
                 out["steps"] = (sub or {}).get("steps") or []
                 out["error"] = "发送失败：%s" % ((sub or {}).get("error") or "未知原因")

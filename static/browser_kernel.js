@@ -633,15 +633,32 @@
     return out;
   }
 
-  async function submit(prompt) {
+  // 聚焦输入框并把光标放到末尾：桌面版随后用 CDP 的 Input.insertText 真正「打字」，
+  // 比 execCommand 更像人，React / Lexical 这类受控编辑器不会漏掉输入事件。
+  function focusEditor() {
+    var ed = findEditor();
+    if (!ed) return { ok: false, error: "找不到提示词输入框" };
+    try { ed.focus(); } catch (e) {}
+    try {
+      var range = document.createRange();
+      range.selectNodeContents(ed);
+      range.collapse(false);
+      var sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+    } catch (e) {}
+    return { ok: true, tag: String(ed.tagName || ""), text: editorText(ed).slice(0, 40) };
+  }
+
+  async function sendNow(promptForLog) {
     var out = { ok: false, error: "" };
     try {
       var ed = findEditor();
       if (!ed) throw new Error("找不到提示词输入框");
-      var wrote = writeEditor(ed, String(prompt || ""));
-      step("写入提示词", wrote, (prompt || "").slice(0, 60));
-      if (!wrote) throw new Error("写提示词失败");
-      await sleep(300);
+      var current = editorText(ed);
+      step("输入框内容", !!current.trim(), (current || "").slice(0, 60));
+      if (!current.trim()) throw new Error("输入框是空的，写提示词失败");
+      await sleep(250);
       var btn = findSendButton(ed);
       if (!btn) throw new Error("找不到发送按钮");
       step("发送按钮", true, textOf(btn) || btn.getAttribute("aria-label") || "图标按钮");
@@ -663,6 +680,22 @@
       out.error = K.lastError;
     }
     out.steps = K.steps.slice(-12);
+    return out;
+  }
+
+  async function submit(prompt) {
+    var out = { ok: false, error: "" };
+    try {
+      var ed = findEditor();
+      if (!ed) throw new Error("找不到提示词输入框");
+      var wrote = writeEditor(ed, String(prompt || ""));
+      step("写入提示词", wrote, (prompt || "").slice(0, 60));
+      if (!wrote) throw new Error("写提示词失败");
+      out = await sendNow(prompt);
+    } catch (e) {
+      K.lastError = String(e && e.message || e);
+      out = { ok: false, error: K.lastError, steps: K.steps.slice(-12) };
+    }
     return out;
   }
 
@@ -693,6 +726,8 @@
   K.status = status;
   K.prepare = prepare;
   K.submit = submit;
+  K.focusEditor = focusEditor;
+  K.sendNow = sendNow;
   K.waitConversation = waitConversation;
   K.latestChain = latestChain;
   K.reset = reset;

@@ -85,6 +85,12 @@ def page_eval(expr: str):
         return SCENARIO["kernel"]
     if "window.__dolaPoolKernel.prepare" in expr:
         return SCENARIO["prepare"]
+    if "focusEditor" in expr:
+        return {"ok": True, "tag": "DIV"}
+    if "__dolaPoolKernel.status()" in expr:
+        return {"ok": True, "prompt": SCENARIO.get("inserted", ""), "body": ""}
+    if "sendNow" in expr:
+        return SCENARIO["submit"]
     if "window.__dolaPoolKernel.submit" in expr:
         return SCENARIO["submit"]
     if "waitConversation" in expr:
@@ -122,7 +128,10 @@ def handle(conn, port):
                 params = msg.get("params") or {}
                 COMMANDS.append((method, params))
                 result = {}
-                if method == "Runtime.evaluate":
+                if method == "Input.insertText":
+                    SCENARIO["inserted"] = str(params.get("text") or "")
+                    result = {}
+                elif method == "Runtime.evaluate":
                     value = page_eval(str(params.get("expression") or ""))
                     result = {"result": {"type": "object", "value": value}}
                 conn.sendall(_ws_frame(json.dumps({"id": msg.get("id"), "result": result})))
@@ -198,6 +207,7 @@ def main():
                     submit={"ok": True, "steps": [{"name": "写入提示词", "ok": True, "detail": "雨夜"}]},
                     conv={"ok": True, "id": "7123456789012345678",
                           "status": {"steps": [{"name": "发送按钮", "ok": True, "detail": "发送"}]}})
+    SCENARIO["inserted"] = ""
     reset_commands()
     res = desktop.run_browser_generation(port, "雨夜街头，霓虹倒影", cookie="sessionid=abc; sid_guard=def",
                                          model="seedance_v2.5", duration=30, ratio="9:16",
@@ -219,6 +229,14 @@ def main():
     names = [m for m, _ in COMMANDS]
     check("顺序：导航 → 内核检查 → prepare → submit → 等 conversation_id",
           names.index("Page.navigate") < names.index("Runtime.evaluate"), names[:12])
+    check("提示词用 CDP Input.insertText 真打字，而不是只改 DOM 文本",
+          has_command("Input.insertText")
+          and (params_of("Input.insertText") or {}).get("text") == "雨夜街头，霓虹倒影",
+          params_of("Input.insertText"))
+    check("打完字确认输入框里真的有内容才点发送",
+          has_command("Runtime.evaluate")
+          and any("sendNow" in str(p.get("expression")) for m, p in COMMANDS if m == "Runtime.evaluate"),
+          "没走到 sendNow")
     check("prepare 的入参带 2.5 / 30 / 9:16",
           any('"duration": 30' in str(p.get("expression")) and "2.5" in str(p.get("expression"))
               for m, p in COMMANDS if m == "Runtime.evaluate"),
