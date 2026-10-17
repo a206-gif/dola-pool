@@ -2274,8 +2274,14 @@ def api_desktop_extensions():
         info["error"] = "读取扩展失败：%s" % exc
         return info
     info.update(mode="desktop", extensions=out.get("extensions") or [],
-                browser=out.get("browser") or "")
+                browser=out.get("browser") or "",
+                browser_version=out.get("browser_version") or "",
+                load_extension_supported=out.get("load_extension_supported", True),
+                warning=out.get("warning") or "",
+                profile=out.get("profile") or "",
+                roots=out.get("roots") or [])
     info["can_launch"] = bool(info["extensions"] and info["browser"])
+    info["can_open_manager"] = bool(info["extensions"] and info["browser"])
     if not info["extensions"]:
         info["error"] = ("没找到扩展：把扩展解压到程序目录的 extensions/ 下，"
                          "保证某一层目录里有 manifest.json")
@@ -2304,6 +2310,37 @@ async def api_desktop_extensions_open(request: Request):
     if not out.get("ok"):
         return JSONResponse({"error": out.get("error") or "启动失败"}, 400)
     audit("desktop.extension_browser", (out.get("browser") or "")[:200])
+    return out
+
+
+@app.post("/api/desktop/extensions/manager")
+def api_desktop_extensions_manager():
+    """在独立 profile 里打开扩展管理页：Chrome 137+ 只能手动「加载已解压」一次。"""
+    if not (DESKTOP_MODE and _control_hook):
+        return JSONResponse({"error": "该接口仅在桌面版可用"}, 400)
+    out = {}
+    try:
+        _control_hook("extensions", {"op": "manager", "out": out})
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"error": "打开扩展管理页失败：%s" % exc}, 500)
+    if not out.get("ok"):
+        return JSONResponse({"error": out.get("error") or "打开扩展管理页失败"}, 400)
+    audit("desktop.extension_manager", (out.get("browser") or "")[:200])
+    return out
+
+
+@app.post("/api/desktop/extensions/reveal")
+def api_desktop_extensions_reveal():
+    """在文件管理器里打开 extensions/ 目录（拖进扩展管理页 / 检查文件用）。"""
+    if not (DESKTOP_MODE and _control_hook):
+        return JSONResponse({"error": "该接口仅在桌面版可用"}, 400)
+    out = {}
+    try:
+        _control_hook("extensions", {"op": "reveal", "out": out})
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"error": "打开扩展目录失败：%s" % exc}, 500)
+    if not out.get("ok"):
+        return JSONResponse({"error": out.get("error") or "打开扩展目录失败"}, 400)
     return out
 
 

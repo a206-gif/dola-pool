@@ -1338,8 +1338,20 @@ class Control:
             result = launch_extension_browser(
                 str(payload.get("url") or "https://www.dola.com/chat/"))
             print("[desktop] 带扩展的浏览器：%s" % ("已启动" if result.get("ok") else result.get("error")))
+        elif op == "manager":
+            result = open_extension_manager()
+            print("[desktop] 扩展管理页：%s" % ("已打开" if result.get("ok") else result.get("error")))
+        elif op == "reveal":
+            roots = extension_roots()
+            result = reveal_path(roots[0] if roots else "")
         else:
-            result = {"extensions": discover_extensions(), "browser": find_chromium_browser()}
+            exe = find_chromium_browser()
+            supported, warn = load_extension_supported(exe)
+            result = {"extensions": discover_extensions(), "browser": exe,
+                      "browser_version": browser_version(exe),
+                      "load_extension_supported": supported, "warning": warn,
+                      "profile": extension_browser_profile(),
+                      "roots": [r for r in extension_roots() if os.path.isdir(r)]}
         if isinstance(out, dict):
             out.update(result)
 
@@ -1963,6 +1975,110 @@ def find_chromium_browser() -> str:
     return ""
 
 
+def browser_version(exe: str) -> str:
+    """从安装目录里的版本号文件夹读浏览器版本（不启动浏览器）。
+
+    Windows 的 Edge/Chrome 都把主程序放在 Application\\ 下，旁边就是
+    「137.0.7151.56」这种版本目录；取最大的那个即是当前版本。
+    """
+    try:
+        parent = os.path.dirname(os.path.abspath(exe))
+        best = ""
+        for name in os.listdir(parent):
+            parts = name.split(".")
+            if len(parts) >= 3 and parts[0].isdigit():
+                if not best or tuple(int(x) for x in parts[:3] if x.isdigit()) > \
+                        tuple(int(x) for x in best.split(".")[:3] if x.isdigit()):
+                    best = name
+        return best
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def is_branded_chrome(exe: str) -> bool:
+    name = os.path.basename(exe or "").lower()
+    return name in ("chrome.exe", "chrome", "google chrome", "google-chrome",
+                    "google-chrome-stable")
+
+
+def load_extension_supported(exe: str) -> tuple:
+    """Chrome 官方版 137 起不再认 --load-extension。返回 (是否支持, 提示语)。"""
+    if not is_branded_chrome(exe):
+        return True, ""
+    ver = browser_version(exe)
+    major = 0
+    try:
+        major = int(ver.split(".")[0])
+    except Exception:  # noqa: BLE001
+        major = 0
+    if major >= 137:
+        return False, ("Chrome %s 起官方版不再支持 --load-extension（谷歌的安全限制）。"
+                       "建议改用 Edge；或者点【⚙ 手动加载】一次性装进这个独立 profile，"
+                       "以后不用再装。" % major)
+    return True, ""
+
+
+def extension_manager_url(exe: str) -> str:
+    return "edge://extensions" if "edge" in os.path.basename(exe or "").lower() \
+        else "chrome://extensions"
+
+
+def _spawn_detached(cmd: list) -> None:
+    kwargs = {}
+    if platform.system() == "Windows":
+        kwargs["creationflags"] = 0x00000008      # DETACHED_PROCESS
+    else:
+        kwargs["start_new_session"] = True
+    subprocess.Popen(cmd, **kwargs)
+
+
+def open_extension_manager(browser: str = "", roots: list = None) -> dict:
+    """在独立 profile 里打开扩展管理页（Chrome 137+ 只能手动装一次）并返回扩展目录。"""
+    exts = discover_extensions(roots)
+    info = {"ok": False, "error": "", "browser": "", "url": "", "dirs": [e["path"] for e in exts]}
+    if not exts:
+        info["error"] = "extensions/ 下没有找到扩展目录（要求某层目录里有 manifest.json）"
+        return info
+    exe = browser or find_chromium_browser()
+    if not exe:
+        info["error"] = "没找到 Edge 或 Chrome，请先安装（或用环境变量 DOLA_BROWSER 指定路径）"
+        return info
+    profile = extension_browser_profile()
+    try:
+        os.makedirs(profile, exist_ok=True)
+    except Exception as exc:  # noqa: BLE001
+        info["error"] = "创建浏览器 profile 失败：%s" % exc
+        return info
+    url = extension_manager_url(exe)
+    cmd = [exe, "--user-data-dir=" + profile, "--no-first-run",
+           "--no-default-browser-check", url]
+    try:
+        _spawn_detached(cmd)
+    except Exception as exc:  # noqa: BLE001
+        info["error"] = "启动浏览器失败：%s" % exc
+        return info
+    info.update(ok=True, browser=exe, url=url)
+    return info
+
+
+def reveal_path(path: str) -> dict:
+    """在文件管理器里打开一个目录（扩展目录用）。"""
+    target = os.path.abspath(path) if path else ""
+    if not target or not os.path.exists(target):
+        return {"ok": False, "error": "目录不存在：%s" % target}
+    try:
+        system = platform.system()
+        if system == "Windows":
+            os.startfile(target)                       # noqa: S606
+        elif system == "Darwin":
+            subprocess.Popen(["open", target])
+        else:
+            subprocess.Popen(["xdg-open", target])
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": "打开文件夹失败：%s" % exc}
+    return {"ok": True, "path": target}
+
+
 def extension_browser_profile() -> str:
     return os.path.join(DATA_DIR, "extension-browser")
 
@@ -2016,6 +2132,10 @@ def launch_extension_browser(url: str = "https://www.dola.com/chat/",
         info["error"] = "启动浏览器失败：%s" % exc
         return info
     info["ok"] = True
+    info["browser_version"] = browser_version(exe)
+    supported, warn = load_extension_supported(exe)
+    info["load_extension_supported"] = supported
+    info["warning"] = warn
     return info
 
 

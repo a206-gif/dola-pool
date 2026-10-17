@@ -7,8 +7,8 @@
 		},
 		"video_generation": {
 			"meta": {
-				"title": "ÊÓÆµÉú³É",
-				"desc": "×ÔÓÉÔË¾µ£¬Í¼Æ¬ÎÄ×ÖÒ»¼ü³ÉÆ¬",
+				"title": "è§†é¢‘ç”Ÿæˆ",
+				"desc": "è‡ªç”±è¿é•œï¼Œå›¾ç‰‡æ–‡å­—ä¸€é”®æˆç‰‡",
 				"option_list": [{
 					"type": 3,
 					"value": "ratio",
@@ -16,12 +16,12 @@
 					"options": [{
 						"show_name": "1:1",
 						"value": "1:1",
-						"is_default": true,
+          "is_default": false,
 						"sub_display": ""
 					}, {
 						"show_name": "3:4",
 						"value": "3:4",
-						"is_default": false,
+          "is_default": true,
 						"sub_display": ""
 					}, {
 						"show_name": "4:3",
@@ -56,12 +56,17 @@
 					}, {
 						"show_name": "10s",
 						"value": "10",
-						"is_default": true,
+						"is_default": false,
+						"sub_display": ""
+					}, {
+						"show_name": "15s",
+						"value": "15",
+						"is_default": false,
 						"sub_display": ""
 					}, {
 						"show_name": "30s",
 						"value": "30",
-						"is_default": false,
+						"is_default": true,
 						"sub_display": ""
 					}]
 				}, {
@@ -69,9 +74,15 @@
 					"value": "model",
 					"show_name": "",
 					"options": [{
+						"show_name": "Seedance2.5",
+						"value": "seedance_v2.5",
+						"is_default": true,
+						"sub_display": "DreaminaSeedance2.5",
+						"subscription_tag": "none"
+					}, {
 						"show_name": "Seedance2.0Fast",
 						"value": "seedance_v2.0",
-						"is_default": true,
+						"is_default": false,
 						"sub_display": "DreaminaSeedance2.0",
 						"subscription_tag": "none"
 					}, {
@@ -83,13 +94,18 @@
 					}]
 				}],
 				"model_capability": {
+					"seedance_v2.5": {
+						"supported_durations": ["5", "10", "15", "30"],
+						"supported_resolutions": ["720p"],
+						"support_video_ref": false
+					},
 					"ic_mini": {
-						"supported_durations": ["5", "10", "30"],
+						"supported_durations": ["5", "10", "15"],
 						"supported_resolutions": ["720p"],
 						"support_video_ref": false
 					},
 					"seedance_v2.0": {
-						"supported_durations": ["5", "10", "30"],
+						"supported_durations": ["5", "10", "15"],
 						"supported_resolutions": ["720p"],
 						"support_video_ref": false
 					}

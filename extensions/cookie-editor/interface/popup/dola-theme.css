@@ -1,0 +1,123 @@
+/* 对齐豆啦啦主界面：微软雅黑、主题色、圆角按钮 */
+
+:root {
+  --primary-surface-color: #ffffff;
+  --primary-border-color: #d4d4d8;
+  --primary-outline-color: #1473e6;
+  --primary-text-color: #1f1f1f;
+  --primary-link-color: #1473e6;
+  --primary-link-hover-color: #1177bb;
+  --primary-danger-color: #c0392b;
+  --primary-safe-color: #2e7d32;
+  --secondary-danger-color: #a93226;
+  --secondary-surface-color: #f0f0f2;
+  --secondary-border-color: #c8c8cc;
+  --secondary-text-color: #6f6f73;
+  --search-surface-color: #ffffff;
+  --search-surface-hover-color: #eef6fb;
+  --button-primary-surface-color: #1473e6;
+  --button-primary-text-color: #ffffff;
+  --menu-surface-color: #ffffff;
+  --menu-surface-hover-color: #eef6fb;
+  --menu-border-color: #d4d4d8;
+  --switch-surface-on-color: #1473e6;
+  --switch-surface-neutral-color: #c4c4c8;
+}
+
+[data-theme='dark'] {
+  --primary-surface-color: #1e1e1e;
+  --primary-border-color: #3c3c3c;
+  --primary-outline-color: #1473e6;
+  --primary-text-color: #ffffff;
+  --primary-link-color: #4da3dd;
+  --primary-link-hover-color: #1177bb;
+  --primary-danger-color: #e88a8a;
+  --secondary-surface-color: #242424;
+  --secondary-border-color: #4a4a4a;
+  --secondary-text-color: #9a9a9a;
+  --secondary-text-onsurface-color: #e8e8e8;
+  --search-surface-color: #1e1e1e;
+  --search-surface-hover-color: #2d2d2d;
+  --button-primary-surface-color: #1473e6;
+  --menu-surface-color: #242424;
+  --menu-surface-hover-color: #2d2d2d;
+  --menu-border-color: #3c3c3c;
+  --switch-surface-on-color: #1473e6;
+  --switch-surface-neutral-color: #4a4a4a;
+}
+
+body {
+  font-family: "Microsoft YaHei", "Segoe UI", sans-serif;
+  font-size: 12px;
+}
+
+#pageTitle {
+  overflow: visible;
+}
+
+#pageTitle h1 {
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0;
+  white-space: normal;
+  line-height: 1.35;
+  overflow: visible;
+  text-overflow: clip;
+  padding-right: 36px;
+}
+
+#cookie-container input,
+#cookie-container textarea,
+#cookie-container select,
+#searchField {
+  border-radius: 4px;
+  font-family: inherit;
+}
+
+.panel-section-footer-button {
+  border-radius: 4px;
+  margin: 4px;
+  font-family: inherit;
+  padding: 0 8px;
+  height: 36px;
+  color: var(--primary-text-color);
+  font-size: 13px;
+}
+
+.panel-section-footer {
+  height: auto;
+  overflow: visible;
+}
+
+.panel-section-footer-button > div,
+.panel-section-footer-button:hover > div,
+.panel-section-footer-button:focus > div {
+  transform: none;
+}
+
+.panel-section-footer-button .tooltip,
+.panel-section-footer-button:hover .tooltip,
+.panel-section-footer-button:focus .tooltip,
+.panel-section-footer-button.primary .tooltip,
+.panel-section-footer-button.primary:hover .tooltip,
+.panel-section-footer-button.primary:focus .tooltip {
+  opacity: 1;
+  margin-top: 4px;
+  font-size: 11px;
+  line-height: 14px;
+  color: var(--secondary-text-color);
+}
+
+#cookie-container {
+  max-height: 260px;
+}
+
+#main-menu-content {
+  border: 1px solid var(--primary-border-color);
+  border-radius: 8px;
+}
+
+#cookie-container .header,
+#cookie-container .expando {
+  border-color: var(--primary-border-color);
+}

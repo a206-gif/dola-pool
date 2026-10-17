@@ -55,6 +55,9 @@ check("跳过 _ 开头的目录", all("_metadata" not in f["path"] for f in foun
 # 3) 仓库自带的扩展能被识别
 builtin = desktop.discover_extensions([os.path.join(HERE, "extensions")])
 check("程序自带的 extensions/ 能被识别", len(builtin) >= 1, str([f["name"] for f in builtin]))
+check("自带的两套（哆啦助手 + Cookie-Editor）都在",
+      len(builtin) >= 2 and all(f["version"] for f in builtin),
+      str([(f["name"], f["version"]) for f in builtin]))
 
 # 4) 启动参数
 cmd = desktop.build_extension_browser_command("/x/msedge", "/tmp/p", ["/e/a", "/e/b"],
@@ -84,6 +87,29 @@ check("能真的把浏览器拉起来（这里用假脚本验证）", res.get("o
 check("假浏览器收到的参数里有扩展目录",
       any(a.startswith("--load-extension=") and deep in a for a in got), " | ".join(got)[:120])
 check("profile 目录被自动创建", os.path.isdir(desktop.extension_browser_profile()), "")
+
+# 7) 浏览器版本 / Chrome 137+ 的限制判断（不启动浏览器）
+fake_edge = os.path.join(tmp, "Microsoft", "Edge", "Application", "msedge.exe")
+fake_chrome = os.path.join(tmp, "Google", "Chrome", "Application", "chrome.exe")
+for exe in (fake_edge, fake_chrome):
+    os.makedirs(os.path.dirname(exe), exist_ok=True)
+    open(exe, "w").close()
+os.makedirs(os.path.join(os.path.dirname(fake_edge), "142.0.3595.53"), exist_ok=True)
+os.makedirs(os.path.join(os.path.dirname(fake_chrome), "142.0.7444.60"), exist_ok=True)
+check("能读出浏览器版本号（看安装目录里的版本文件夹）",
+      desktop.browser_version(fake_edge) == "142.0.3595.53",
+      desktop.browser_version(fake_edge))
+check("Edge 仍然支持 --load-extension",
+      desktop.load_extension_supported(fake_edge) == (True, ""), "")
+ok_chrome, chrome_warn = desktop.load_extension_supported(fake_chrome)
+check("Chrome 137+ 会提示改用 Edge / 手动加载",
+      ok_chrome is False and "Chrome" in chrome_warn and "手动加载" in chrome_warn,
+      chrome_warn[:60])
+check("扩展管理页按浏览器选 edge:// 还是 chrome://",
+      desktop.extension_manager_url(fake_edge) == "edge://extensions" and
+      desktop.extension_manager_url(fake_chrome) == "chrome://extensions", "")
+check("打开不存在的扩展目录会报错，不会瞎开文件管理器",
+      desktop.reveal_path(os.path.join(tmp, "nope")).get("ok") is False, "")
 
 bad = 0
 for name, ok, detail in OUT:

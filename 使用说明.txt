@@ -398,26 +398,41 @@ Linux   ：终端执行  ./start-linux.sh
 ★ 新的 2.5 / 30 秒路线：浏览器扩展（🧩）
   30 秒和 2.5 是**网页端靠扩展解锁**的，而这个扩展必须跑在真正的
   Edge / Chrome 里 —— WebView2 内核（软件里的账号窗口）装不了扩展。
-  所以这版改成：把扩展放进程序目录，然后用带扩展的浏览器打开 Dola。
+  所以这版改成：把扩展放在程序目录里，然后用带扩展的浏览器打开 Dola。
 
-  1) 把扩展解压到程序目录的 extensions 下，保证某一层目录里有 manifest.json：
-       DolaPool\extensions\dola30\manifest.json
-     （如果是 Extensions.zip，直接解压到 extensions\ 即可，多套一层也能识别）
-  2) 打开软件 → 左侧【账号池】→ 顶部「🧩 浏览器扩展」卡片
-     会列出：识别到的扩展名、本机找到的 Edge / Chrome 路径。
-  3) 点【🧩 带扩展浏览器打开】→ 会用独立 profile 启动 Edge/Chrome 并打开
-     https://www.dola.com/chat/ 。首次需要在这个窗口里登录一次，之后会记住。
-  4) 在网页里正常生成即可；扩展自己会把 30 秒选项加进时长菜单。
+  ★ 你上传的 Extensions.zip 已经解压好放进去了，不用再装：
+      DolaPool\extensions\dola30\        哆啦助手 · 30秒无水印助手 v1.6.12
+                                          （30 秒开关 / 720P-1080P / 无水印下载）
+      DolaPool\extensions\cookie-editor\ Cookie-Editor v1.13.0
+                                          （看/导出当前站点的 Cookie）
+
+  用法（三步）：
+  1) 打开软件 → 左侧【账号池】→ 顶部「🧩 浏览器扩展」卡片
+     卡片会列出识别到的扩展名和版本、本机找到的 Edge / Chrome（含版本号）。
+  2) 点【🧩 带扩展浏览器打开】→ 用独立 profile 启动 Edge（找不到 Edge 才用 Chrome），
+     直接打开 https://www.dola.com/chat/ 。首次需要在这个窗口里登录一次，之后会记住。
+  3) 在网页里正常生成：右下角出现「哆啦助手」浮动面板，
+     打开里面的 30 秒开关即可；成片后点面板里的「下载」拿无水印原片。
+     想导出 CK：点工具栏的 Cookie-Editor 图标 → Export。
 
   说明与边界：
-  · 软件只是「把扩展装进浏览器的启动参数」：
+  · 软件只是「把扩展装进浏览器的启动参数」，不碰扩展本身：
       msedge.exe --user-data-dir=<数据目录>\extension-browser
-                 --disable-extensions-except=...\extensions\dola30
-                 --load-extension=...\extensions\dola30 https://www.dola.com/chat/
+                 --disable-extensions-except=...\extensions\dola30,...
+                 --load-extension=...\extensions\dola30,... https://www.dola.com/chat/
   · 这个窗口和软件里的账号窗口互不影响，登录态各自保存。
   · 能不能真的出 30 秒，最终由 Dola 服务端决定；扩展只是让网页「敢请求」30 秒。
-    被服务端拒的话，网页会自己提示「只支持 4~15 秒」，那不是本软件的问题。
+    被服务端拒的话，网页会提示「只支持 4~15 秒」，那不是本软件的问题。
   · 没找到扩展 / 没找到 Edge 或 Chrome 时，卡片会直接写原因，按钮是灰的。
+
+  ★ 如果你电脑上只有 Chrome（没有 Edge）：
+    谷歌从 Chrome 137 起**删掉了 --load-extension**（官方版才删，Edge 没删），
+    所以命令行装扩展在 Chrome 上会失效。程序会检测到并在卡片上给出黄字提示，
+    这时点【⚙ 手动加载】：
+      在弹出的扩展管理页右上角打开【开发者模式】
+      →【加载已解压的扩展程序】→ 选 DolaPool\extensions\dola30（再装一次 cookie-editor）
+    只需要装这一次，扩展会留在这个独立 profile 里，以后照常点【🧩 带扩展浏览器打开】。
+    【📂 扩展文件夹】按钮可以直接把目录在资源管理器里打开，方便拖进去。
 
 【v2.0.15 更新：画布教程/演示、体检 404 误报】
 

@@ -30,8 +30,11 @@ const BASE = process.env.DOLA_BASE || 'http://127.0.0.1:8000';
   let sessions = { mode: 'web', can_manage: false, sessions: [] };
   // 桌面版 + 扩展：账号页应该出现「🧩 浏览器扩展」卡片
   const extInfo = { mode: 'desktop', browser: 'C:/Program Files/Microsoft/Edge/Application/msedge.exe',
-    can_launch: true, extensions: [{ name: '豆包 Dola 去水印助手', version: '1.0.0', path: 'C:/DolaPool/extensions/dola30' }] };
-  let openedWithExtension = 0;
+    browser_version: '142.0.3595.53', can_launch: true, can_open_manager: true,
+    roots: ['C:/DolaPool/extensions'],
+    extensions: [{ name: '哆啦助手 · 30秒无水印助手', version: '1.6.12', path: 'C:/DolaPool/extensions/dola30' },
+                 { name: 'Cookie-Editor', version: '1.13.0', path: 'C:/DolaPool/extensions/cookie-editor' }] };
+  let openedWithExtension = 0, openedManager = 0, revealedDir = 0;
 
   const dom = new JSDOM(html, {
     url: BASE + '/', runScripts: 'dangerously', pretendToBeVisual: true, virtualConsole: vc,
@@ -40,6 +43,8 @@ const BASE = process.env.DOLA_BASE || 'http://127.0.0.1:8000';
         const url = String(u);
         calls.push((o && o.method ? o.method + ' ' : 'GET ') + url);
         const body = url.includes('api/desktop/extensions/open') ? (openedWithExtension++, { ok: true, browser: extInfo.browser })
+          : url.includes('api/desktop/extensions/manager') ? (openedManager++, { ok: true, browser: extInfo.browser, url: 'edge://extensions' })
+          : url.includes('api/desktop/extensions/reveal') ? (revealedDir++, { ok: true, path: extInfo.roots[0] })
           : url.includes('api/desktop/extensions') ? extInfo
           : url.includes('api/desktop/sessions') ? sessions
           : url.includes('api/accounts/export') ? 'sessionid=abc\nsessionid=def\n'
@@ -86,7 +91,7 @@ const BASE = process.env.DOLA_BASE || 'http://127.0.0.1:8000';
   const extPanel = Array.from(d.querySelectorAll('.panel'))
     .find(p => /浏览器扩展/.test(p.textContent));
   out.push(['账号页有「🧩 浏览器扩展」卡片，并列出识别到的扩展',
-            !!extPanel && /豆包 Dola 去水印助手/.test(extPanel.textContent),
+            !!extPanel && /哆啦助手/.test(extPanel.textContent),
             extPanel ? extPanel.textContent.replace(/\s+/g, ' ').slice(0, 70) : '没有卡片']);
   out.push(['卡片写明本机浏览器路径（知道会用哪个打开）',
             !!extPanel && /msedge\.exe/.test(extPanel.textContent), '']);
@@ -101,6 +106,17 @@ const BASE = process.env.DOLA_BASE || 'http://127.0.0.1:8000';
             openedWithExtension === 1 &&
             calls.some(c => c.includes('api/desktop/extensions/open')),
             '调用 ' + openedWithExtension + ' 次']);
+  out.push(['两套扩展（哆啦助手 / Cookie-Editor）和浏览器版本都显示出来',
+            !!extPanel && /哆啦助手/.test(extPanel.textContent) && /Cookie-Editor/.test(extPanel.textContent)
+              && /142\.0/.test(extPanel.textContent), '']);
+  const mgrBtn = Array.from(d.querySelectorAll('button')).find(b => /手动加载/.test(b.textContent));
+  const revBtn = Array.from(d.querySelectorAll('button')).find(b => /扩展文件夹/.test(b.textContent));
+  out.push(['「⚙ 手动加载」「📂 扩展文件夹」两个兜底按钮都在', !!mgrBtn && !!revBtn, '']);
+  if (mgrBtn) { mgrBtn.click(); await new Promise(r => setTimeout(r, 300)); }
+  if (revBtn) { revBtn.click(); await new Promise(r => setTimeout(r, 300)); }
+  out.push(['点「手动加载」会打开扩展管理页、点「扩展文件夹」会定位目录',
+            openedManager === 1 && revealedDir === 1,
+            '管理页 ' + openedManager + ' 次 / 目录 ' + revealedDir + ' 次']);
 
   // ① 导出 CK：点按钮 → 选格式 → 真的发起下载
   $('exportCk').click();
