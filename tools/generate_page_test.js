@@ -21,6 +21,8 @@ const SHOT = process.env.DOLA_SHOT || '';   // 可选：把渲染后的 HTML 存
   vc.on('jsdomError', e => errors.push('jsdomError: ' + ((e.detail && e.detail.message) || e.message)));
 
   let queueCalls = 0, uploadCalls = 0, taskCalls = 0;
+  const posted = [];        // 提交任务时的请求体（验证单条/批量到底拆没拆）
+  const cancelCalls = [];   // 点「停止」打到的接口
   const fakeQueue = () => ({ queue_depth: ++queueCalls, active: 1, workers: 4 });
   // 第一次 1 条，之后 2 条：验证「新增行是插进去的，旧行不动」
   const fakeTasks = () => {
@@ -47,6 +49,14 @@ const SHOT = process.env.DOLA_SHOT || '';   // 可选：把渲染后的 HTML 存
             verdict: '登录态失效：先去账号池更新 Cookie' };
         } else if (url.includes('api/queue')) {
           body = fakeQueue();
+        } else if (url.includes('/cancel')) {
+          cancelCalls.push(url);
+          body = { ok: true, action: 'cancelling', status: 'cancelling' };
+        } else if (url.includes('api/tasks') && String((o || {}).method || '').toUpperCase() === 'POST') {
+          const payload = JSON.parse((o || {}).body || '{}');
+          posted.push(payload);
+          const n = (payload.tasks || []).length;
+          body = { ok: true, ids: Array.from({ length: n }, (x, i) => 'new' + i), count: n, queue_depth: 0 };
         } else if (url.includes('api/tasks')) {
           body = fakeTasks();
         } else if (url.includes('api/upload-image')) {
@@ -198,6 +208,77 @@ const SHOT = process.env.DOLA_SHOT || '';   // 可选：把渲染后的 HTML 存
   out.push(['刷新后旧任务行没被重建（只做增量更新）', !!row7b && row7b === row7, row7b === row7 ? '#7 未重建' : '#7 被换了']);
   out.push(['新任务出现时只插入新行', !!d.querySelector('#genTasksBox tr[data-id="8"]') && d.querySelectorAll('#genTasksBox tr[data-id]').length === 2,
             d.querySelectorAll('#genTasksBox tr[data-id]').length + ' 行']);
+  // —— 提交方式：默认「单条任务」，整段提示词（含换行）不能被拆开 ——
+  $('genCopies').value = '1';
+  $('genCopies').dispatchEvent(new w.Event('input', { bubbles: true }));
+  await new Promise(r => setTimeout(r, 100));
+  const splitSingle = $('genSplitSingle'), splitBatch = $('genSplitBatch');
+  out.push(['提交方式默认是「单条任务」', !!(splitSingle && splitSingle.checked), '']);
+  out.push(['默认模式写明「换行不会被拆开」',
+            /不会被拆开/.test(($('genSplitHint') || {}).textContent || ''),
+            (($('genSplitHint') || {}).textContent || '').slice(0, 70)]);
+  out.push(['默认模式按钮只写「提交任务」（不是 N 条）',
+            ($('genSubmit') || {}).textContent === '✧ 提交任务', ($('genSubmit') || {}).textContent]);
+
+  // 点提交 → 必须只有 1 条，且提示词是整段（换行保留）
+  $('genSubmit').dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+  await new Promise(r => setTimeout(r, 500));
+  out.push(['单条模式下点提交 → 只创建 1 条任务', posted.length === 1 && posted[0].tasks.length === 1,
+            posted.length ? JSON.stringify(posted[0].tasks.length) : '没发请求']);
+  out.push(['整段提示词原样提交（两行没被拆成两条）',
+            posted.length === 1 && posted[0].tasks[0].prompt === '第一行提示词\n第二行提示词',
+            posted.length ? JSON.stringify(posted[0].tasks[0].prompt) : '']);
+
+  // —— 切到「批量任务」：只有这次明确选择才会按行拆 ——
+  await w.eval("go('generate')");
+  await new Promise(r => setTimeout(r, 600));
+  $('genCopies').value = '1';
+  $('genCopies').dispatchEvent(new w.Event('input', { bubbles: true }));
+  $('genSplitBatch').checked = true;
+  $('genSplitBatch').dispatchEvent(new w.Event('change', { bubbles: true }));
+  await new Promise(r => setTimeout(r, 100));
+  out.push(['切到批量后提示「2 行 → 2 条任务」',
+            /2\s*行/.test(($('genSplitHint') || {}).textContent || '') &&
+            /2/.test(($('genCountHint') || {}).textContent || ''),
+            (($('genSplitHint') || {}).textContent || '').slice(0, 70)]);
+  out.push(['切到批量后按钮写明要提交 2 条',
+            ($('genSubmit') || {}).textContent === '✧ 提交 2 条任务', ($('genSubmit') || {}).textContent]);
+  $('genSubmit').dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+  await new Promise(r => setTimeout(r, 200));
+  out.push(['批量提交前会先弹确认（避免误拆）', !!$('okBtn'), $('okBtn') ? '有确认框' : '没有']);
+  if ($('okBtn')) $('okBtn').dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+  await new Promise(r => setTimeout(r, 500));
+  out.push(['确认后才按行拆成 2 条', posted.length === 2 && posted[1].tasks.length === 2,
+            posted.length > 1 ? String(posted[1].tasks.length) : '没发第二次请求']);
+  out.push(['拆出来的每条是单独的一行',
+            posted.length > 1 && posted[1].tasks[0].prompt === '第一行提示词' &&
+            posted[1].tasks[1].prompt === '第二行提示词',
+            posted.length > 1 ? JSON.stringify(posted[1].tasks.map(t => t.prompt)) : '']);
+
+  // —— 任务队列：运行中的任务有「停止」，一键停止全部也在 ——
+  await w.eval("go('tasks')");
+  await new Promise(r => setTimeout(r, 700));
+  const stopBtns = d.querySelectorAll('#taskTable button');
+  const hasStop = Array.from(stopBtns).some(b => /停止/.test(b.textContent));
+  out.push(['任务队列里运行中的任务有「■ 停止」按钮', hasStop,
+            Array.from(stopBtns).map(b => b.textContent.trim()).join(' | ')]);
+  out.push(['任务队列有「■ 停止全部」', !!$('stopAllBtn'), $('stopAllBtn') ? '有' : '没有']);
+  const runningStop = Array.from(stopBtns).find(b => /停止/.test(b.textContent) && b.textContent !== '■ 停止全部');
+  if (runningStop) {
+    runningStop.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+    await new Promise(r => setTimeout(r, 400));
+  }
+  out.push(['点「停止」会调用取消接口', cancelCalls.length === 1, JSON.stringify(cancelCalls)]);
+
+  // 「一键任务」：从任务队列直接回到单条任务的生成页
+  const quick = Array.from(d.querySelectorAll('button')).find(b => /单条任务/.test(b.textContent));
+  out.push(['任务队列有「＋ 单条任务」一键入口', !!quick, quick ? quick.textContent : '没有']);
+  if (quick) quick.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+  await new Promise(r => setTimeout(r, 900));
+  out.push(['点它回到生成页，且是「单条任务」模式',
+            !!$('genPrompt') && !!$('genSplitSingle') && $('genSplitSingle').checked,
+            $('genPrompt') ? '已回到生成页' : '没回去']);
+
   out.push(['无 JS 错误', errors.length === 0, errors.slice(0, 3).join(' | ')]);
 
   if (SHOT) require('fs').writeFileSync(SHOT, d.body.innerHTML);

@@ -55,7 +55,7 @@ from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
                                RedirectResponse, Response)
 from fastapi.staticfiles import StaticFiles
 
-VERSION = "2.1.0"
+VERSION = "2.1.1"
 
 # --------------------------------------------------------------------------
 # 目录与配置
@@ -295,6 +295,11 @@ MAX_DAILY_PER_ACCOUNT = max(1, int(get_setting("max_daily_per_account", os.geten
 DEFAULT_MIN_BYTES = int(get_setting("min_bytes_default", "30000000"))
 START_TIME = time.time()
 _STOP = threading.Event()
+# 用户点「停止」的任务 id。运行中的任务不会立刻死，靠 process_task 里的看门狗
+# 在 0.4 秒内把状态改成 cancelled 并释放并发槽（远端 Dola 那边可能还会把视频生成完，
+# 这是服务端行为，程序只能做到「这边不再等待 / 下载」）。
+_CANCEL: "set[str]" = set()
+_CANCEL_LOCK = threading.Lock()
 
 _ai_module = None
 _memory_ai_key = AI_API_KEY or ""
@@ -615,6 +620,68 @@ def ensure_demo_account() -> int:
 # --------------------------------------------------------------------------
 # 任务处理
 # --------------------------------------------------------------------------
+def cancel_requested(task_id: str) -> bool:
+    """这个任务是否被用户点过「停止」（内存标记或库里已是 cancelled）。"""
+    with _CANCEL_LOCK:
+        if task_id in _CANCEL:
+            return True
+    conn = db()
+    row = conn.execute("select status from tasks where id=?", (task_id,)).fetchone()
+    conn.close()
+    return bool(row) and row["status"] == "cancelled"
+
+
+def _cancel_one(task_id: str, status: str = "") -> str:
+    """取消一条任务，返回 cancelled（排队中，立即停）/ cancelling（正在跑，收尾中）。
+
+    进函数后再查一次库：从「列出要停的任务」到「真正下手」之间，可能有任务刚好
+    生成完了 —— 不能把已完成的成片记录冲成「已取消」。
+    """
+    conn = db()
+    row = conn.execute("select status from tasks where id=?", (task_id,)).fetchone()
+    conn.close()
+    if row is None:
+        return "noop"
+    status = str(row["status"] or status)
+    if status not in ("queued", "running"):
+        return "noop"
+    with _CANCEL_LOCK:
+        _CANCEL.add(task_id)
+    if status == "queued":
+        _finish(task_id, "cancelled", "已取消（还没开始执行）", "已取消")
+        return "cancelled"
+    # 运行中：先把状态落成 cancelled，再靠 process_task 的看门狗释放并发槽。
+    # 这样即使此刻程序被关掉，重启后 recover_stuck_tasks 也不会把它重新排队。
+    _finish(task_id, "cancelled", "正在停止…", "已取消")
+    return "cancelling"
+
+
+def _cleanup_after_cancel(task_id: str, worker: threading.Thread) -> None:
+    """被放弃的生成线程跑完后，把它可能写出来的半成品删掉（任务已取消）。
+
+    生成核心的轮询最长 44 分钟、且不能改（gen/dola_gen_clean.py 一行不动），
+    所以「停止」是程序这边立刻放手；远端可能还在生成，等它结束再把文件清掉。
+    """
+    def _run():
+        try:
+            worker.join()
+        except Exception:  # noqa: BLE001
+            return
+        conn = db()
+        row = conn.execute("select status from tasks where id=?", (task_id,)).fetchone()
+        conn.close()
+        if row is not None and row["status"] != "cancelled":
+            return                       # 用户已经重试 / 删除了，别动它的成片
+        path = os.path.join(OUTPUT_DIR, "task_%s.mp4" % task_id)
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+                log.info("task %s 已取消，清理掉后台线程后来写出的成片", task_id)
+        except OSError:
+            pass
+    threading.Thread(target=_run, daemon=True, name="cancel-clean-%s" % task_id).start()
+
+
 def process_task(task_id: str) -> None:
     conn = db()
     row = conn.execute("select * from tasks where id=?", (task_id,)).fetchone()
@@ -623,6 +690,10 @@ def process_task(task_id: str) -> None:
         return
     task = dict(row)
     if task["status"] == "cancelled":
+        return
+    if cancel_requested(task_id):
+        # 排队时点了「停止」：任务已经在队列里，这里补一次落库再退出
+        _finish(task_id, "cancelled", "已取消（还没开始执行）", "已取消")
         return
 
     account_id = task.get("account_id")
@@ -653,11 +724,47 @@ def process_task(task_id: str) -> None:
         conn.commit()
         conn.close()
 
+    if cancel_requested(task_id):
+        _finish(task_id, "cancelled", "已取消（还没开始执行）", "已取消")
+        return
+
     _update_task(task_id, status="running", progress=10, started_at=utcnow(), result="已分配账号，准备提交")
     log.info("task %s -> account %s", task_id, account_id)
 
+    # 把真正的生成放进子线程，外面留一个看门狗：用户点「停止」后 0.4 秒内
+    # 任务状态就变成 cancelled、并发槽也立刻释放（不必等 44 分钟的轮询结束）。
+    box: dict = {}
+
+    def _work():
+        try:
+            box["result"] = _render_task(task, cookie)
+        except Exception as exc:  # noqa: BLE001 - 交给外面的看门狗处理
+            box["error"] = exc
+
+    worker = threading.Thread(target=_work, name="render-%s" % task_id, daemon=True)
+    worker.start()
+    cancelled = False
+    while worker.is_alive():
+        worker.join(0.4)
+        # 只看内存标记（点「停止」的端点一定会先写它）——别在 0.4 秒的循环里查库
+        with _CANCEL_LOCK:
+            if task_id in _CANCEL:
+                cancelled = True
+                break
+
+    if cancelled:
+        _finish(task_id, "cancelled",
+                "已按你的要求停止：这边不再等待 / 下载（Dola 那边可能还会把视频生成完）",
+                "已取消")
+        _cleanup_after_cancel(task_id, worker)
+        audit("task.cancel", task_id)
+        log.info("task %s cancelled by user", task_id)
+        return
+
     try:
-        result = _render_task(task, cookie)
+        if "error" in box:
+            raise box["error"]
+        result = box.get("result") or {}
         if result.get("url"):
             _finish(task_id, "completed", f"{result['path']}|{result['bytes']}bytes", None, progress=100)
             audit("task.complete", task_id)
@@ -814,6 +921,8 @@ def _demo_render(task: dict) -> dict:
 
 def _update_task(task_id: str, **fields) -> None:
     if not fields:
+        return
+    if task_id in _CANCEL:      # 已经点了停止：别让后台线程再把「已取消」改成别的进度
         return
     fields["updated_at"] = utcnow()
     cols = ", ".join(f"{k}=?" for k in fields)
@@ -1867,9 +1976,55 @@ def api_retry(task_id: str):
     )
     conn.commit()
     conn.close()
+    with _CANCEL_LOCK:            # 取消过又重试：把「停止」标记清掉，否则会被立刻取消
+        _CANCEL.discard(task_id)
     TASK_QUEUE.put(task_id)
     audit("task.retry", task_id)
     return {"ok": True, "queue_depth": TASK_QUEUE.qsize()}
+
+
+@app.post("/api/tasks/{task_id}/cancel")
+def api_cancel_task(task_id: str):
+    """停止一条任务：排队中的立刻取消；生成中的立即释放并发槽（不再等待/下载）。
+
+    注意：视频提交一旦发给了 Dola，服务端可能仍会把这一条生成完 —— 程序能停的是
+    「这边等它、下载它」，不是远端任务。所以取消后不会再把成片写进任务记录。
+    """
+    conn = db()
+    row = conn.execute("select id,status from tasks where id=?", (task_id,)).fetchone()
+    conn.close()
+    if row is None:
+        return JSONResponse({"error": "任务不存在"}, 404)
+    status = str(row["status"] or "")
+    if status in ("completed", "failed", "cancelled"):
+        return {"ok": True, "action": "noop", "status": status,
+                "detail": "任务已经结束了，不需要停止"}
+    action = _cancel_one(task_id, status)
+    if action == "noop":
+        return {"ok": True, "action": "noop", "status": status,
+                "detail": "任务刚好已经结束了，不需要停止"}
+    audit("task.cancel", "%s:%s" % (task_id, action))
+    return {"ok": True, "action": action,
+            "status": "cancelled" if action == "cancelled" else "cancelling",
+            "detail": ("已取消" if action == "cancelled"
+                       else "已发出停止请求，正在收尾（最多 1 秒）")}
+
+
+@app.post("/api/tasks/cancel-active")
+def api_cancel_active():
+    """一键停止全部：排队中的直接取消，生成中的立即放手（不再等待/下载）。"""
+    conn = db()
+    rows = list(conn.execute(
+        "select id,status from tasks where status in ('queued','running')"))
+    conn.close()
+    queued = [r["id"] for r in rows if r["status"] == "queued"]
+    running = [r["id"] for r in rows if r["status"] == "running"]
+    for tid in queued + running:
+        _cancel_one(tid, "queued" if tid in queued else "running")
+    if rows:
+        audit("task.cancel_all", "queued=%d running=%d" % (len(queued), len(running)))
+    return {"ok": True, "total": len(rows), "cancelled": len(queued),
+            "cancelling": len(running)}
 
 
 @app.post("/api/tasks/retry-failed")
@@ -1883,6 +2038,9 @@ def api_retry_failed() -> dict:
     )
     conn.commit()
     conn.close()
+    with _CANCEL_LOCK:
+        for tid in ids:
+            _CANCEL.discard(tid)
     for tid in ids:
         TASK_QUEUE.put(tid)
     audit("task.retry_all", str(len(ids)))

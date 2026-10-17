@@ -449,6 +449,116 @@ def main():
     check("这条任务的通道是扩展内核",
           webapp.task_channel(seen) == "extension", webapp.task_channel(seen))
 
+    # 9) 停止任务：排队中立即取消；运行中 0.4 秒内放手（不干等 44 分钟轮询）
+    def add_task(tid, status="queued"):
+        c = webapp.db()
+        c.execute(
+            "insert into tasks(id,prompt,duration,ratio,model,status,quality,min_bytes,"
+            "ref_images,created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?,?)",
+            (tid, "雨夜", 30, "9:16", "seedance_v2.5", status, "720p", 0, "",
+             webapp.utcnow(), webapp.utcnow()))
+        c.commit()
+        c.close()
+
+    def task_status(tid):
+        c = webapp.db()
+        row = c.execute("select status,result from tasks where id=?", (tid,)).fetchone()
+        c.close()
+        return (row["status"], row["result"] or "") if row else ("", "")
+
+    add_task("t-cancel-q")
+    r = webapp.api_cancel_task("t-cancel-q")
+    st, note = task_status("t-cancel-q")
+    check("排队中的任务：点停止 → 立即变成「已取消」",
+          r.get("action") == "cancelled" and st == "cancelled", (r, st, note))
+    check("已结束的任务再点停止：只是提示，不会改状态",
+          webapp.api_cancel_task("t-cancel-q").get("action") == "noop",
+          webapp.api_cancel_task("t-cancel-q"))
+
+    # 已完成（有视频）的任务不能被「停止全部」冲掉结果
+    add_task("t-done", "completed")
+    c = webapp.db()
+    c.execute("update tasks set result='/tmp/task_t-done.mp4|123bytes' where id='t-done'")
+    c.commit()
+    c.close()
+    r = webapp.api_cancel_task("t-done")
+    c = webapp.db()
+    row = c.execute("select status,result from tasks where id='t-done'").fetchone()
+    c.close()
+    check("已完成的成片不会被「停止」冲掉（状态和结果都不动）",
+          r.get("action") == "noop" and row["status"] == "completed"
+          and "task_t-done.mp4" in (row["result"] or ""),
+          (r, dict(row)))
+
+    # 运行中：用一个 4 秒的假渲染，模拟「扩展内核提交 / 轮询」这种长任务。
+    # 前面的用例把 _update_task 打桩成空操作了，这里换回真实实现（取消逻辑要靠 running 状态）。
+    def real_update_task(task_id, **fields):
+        if not fields or task_id in webapp._CANCEL:
+            return
+        fields["updated_at"] = webapp.utcnow()
+        cols = ", ".join("%s=?" % k for k in fields)
+        c = webapp.db()
+        c.execute("update tasks set %s where id=?" % cols, (*fields.values(), task_id))
+        c.commit()
+        c.close()
+
+    webapp._update_task = real_update_task
+    add_task("t-cancel-run")
+    began = threading.Event()
+
+    def slow_render(task, cookie):
+        began.set()
+        time.sleep(4)
+        path = os.path.join(webapp.OUTPUT_DIR, "task_t-cancel-run.mp4")
+        with open(path, "wb") as fh:
+            fh.write(b"x" * 16)
+        return {"path": path, "bytes": 16, "url": "/output/task_t-cancel-run.mp4"}
+
+    orig3 = webapp._render_task
+    webapp._render_task = slow_render
+    worker = threading.Thread(target=webapp.process_task, args=("t-cancel-run",), daemon=True)
+    try:
+        worker.start()
+        began.wait(5)
+        time.sleep(0.2)                       # 让它进入 running
+        st_before, _ = task_status("t-cancel-run")
+        t0 = time.time()
+        rc = webapp.api_cancel_task("t-cancel-run")
+        worker.join(3)
+        took = time.time() - t0
+    finally:
+        webapp._render_task = orig3
+    st_after, note_after = task_status("t-cancel-run")
+    check("生成中的任务：点停止后 1 秒内就放手（不占并发槽）",
+          rc.get("action") == "cancelling" and not worker.is_alive() and took < 1.5,
+          {"before": st_before, "action": rc.get("action"), "took": round(took, 2)})
+    check("生成中的任务：库里落成「已取消」并说明原因",
+          st_after == "cancelled" and ("停止" in note_after or "取消" in note_after),
+          (st_after, note_after))
+    path_run = os.path.join(webapp.OUTPUT_DIR, "task_t-cancel-run.mp4")
+    for _ in range(24):                       # 后台线程 4 秒后才写完，之后应被清理
+        if not os.path.exists(path_run):
+            break
+        time.sleep(0.5)
+    check("取消后后台线程才写出来的成片会被清掉（不留半成品）",
+          not os.path.exists(path_run), "文件还在：" + path_run)
+
+    # 一键停止全部
+    add_task("t-all-1", "queued")
+    add_task("t-all-2", "running")
+    r = webapp.api_cancel_active()
+    check("一键停止全部：排队 / 生成中的都算进去",
+          r.get("total") >= 2 and r.get("cancelled") >= 1 and r.get("cancelling") >= 1, r)
+    check("一键停止全部：两条都落成 cancelled",
+          task_status("t-all-1")[0] == "cancelled" and task_status("t-all-2")[0] == "cancelled",
+          (task_status("t-all-1"), task_status("t-all-2")))
+
+    # 重试要清掉取消标记，否则刚重试就被「已取消」拦住
+    webapp.api_retry("t-all-1")
+    check("取消过的任务重试后，取消标记被清掉（能正常排队）",
+          "t-all-1" not in webapp._CANCEL and task_status("t-all-1")[0] == "queued",
+          (list(webapp._CANCEL), task_status("t-all-1")))
+
     # 汇总
     bad = 0
     for name, ok, detail in OUT:
