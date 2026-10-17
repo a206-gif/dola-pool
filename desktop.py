@@ -29,7 +29,9 @@ import logging.handlers
 import os
 import platform
 import select
+import shutil
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -1308,6 +1310,9 @@ class Control:
         if action == "session":
             self.session(payload or {})
             return
+        if action == "extensions":
+            self.extensions(payload or {})
+            return
         if action == "open_external":
             # 账号窗口里的「用系统浏览器打开」：走本机 HTTP 端点进来，不经任何 JS 桥
             target = str((payload or {}).get("url") or "").strip()
@@ -1324,6 +1329,19 @@ class Control:
                 threading.Thread(target=win.destroy, daemon=True).start()
             except Exception as exc:
                 print(f"[desktop] 关闭窗口失败：{exc}")
+
+    def extensions(self, payload: dict) -> None:
+        """列扩展 / 用带扩展的 Edge-Chrome 打开 Dola（结果同步写回 payload['out']）。"""
+        out = payload.get("out")
+        op = str(payload.get("op") or "list")
+        if op == "launch":
+            result = launch_extension_browser(
+                str(payload.get("url") or "https://www.dola.com/chat/"))
+            print("[desktop] 带扩展的浏览器：%s" % ("已启动" if result.get("ok") else result.get("error")))
+        else:
+            result = {"extensions": discover_extensions(), "browser": find_chromium_browser()}
+        if isinstance(out, dict):
+            out.update(result)
 
     # ---------------- 账号会话：前台打开 / 后台挂起 / 切换 / 关闭 ----------------
     def session(self, payload: dict) -> None:
@@ -1851,6 +1869,154 @@ def open_window(url: str, title: str, size, storage_path: str, control: Control,
         print("[desktop] 提示：Linux 需要 WebKitGTK，例如 sudo apt install python3-gi gir1.2-webkit2-4.1")
         print("[desktop]       也可以 pip install \"pywebview[qt]\" 使用 Qt 后端")
         return False
+
+
+# --------------------------------------------------------------------------
+# 浏览器扩展：账号网页里的 2.5 / 30 秒是「扩展 + 真浏览器」才有的能力。
+# WebView2（pywebview 用的内核）不支持加载扩展：微软要求在建环境之前打开
+# AreBrowserExtensionsEnabled，而 pywebview 的 WinForms 封装没有暴露这个开关。
+# 所以这里走另一条稳的路：找到本机的 Edge / Chrome，用 --load-extension 把
+# 程序目录 extensions/ 下的扩展装进去，再用一个独立 profile 打开 Dola。
+# 登录一次会记住，下次直接是登录态；完全不碰 pywebview / 内核。
+# --------------------------------------------------------------------------
+def extension_roots() -> list:
+    roots = []
+    env = os.getenv("DOLA_EXTENSIONS_DIR")
+    if env:
+        roots.append(os.path.abspath(os.path.expanduser(env)))
+    roots.append(os.path.join(HERE, "extensions"))
+    try:
+        roots.append(os.path.join(DATA_DIR, "extensions"))
+    except Exception:  # noqa: BLE001
+        pass
+    seen, out = set(), []
+    for r in roots:
+        if r and r not in seen:
+            seen.add(r)
+            out.append(r)
+    return out
+
+
+def discover_extensions(roots: list = None, max_depth: int = 3) -> list:
+    """找出所有「目录里有 manifest.json」的扩展。返回 [{"name","version","path"}]。"""
+    found, seen = [], set()
+    for root in (roots if roots is not None else extension_roots()):
+        if not root or not os.path.isdir(root):
+            continue
+        base_depth = root.rstrip(os.sep).count(os.sep)
+        for dirpath, dirnames, filenames in os.walk(root):
+            depth = dirpath.rstrip(os.sep).count(os.sep) - base_depth
+            if depth >= max_depth:
+                dirnames[:] = []
+            # 跳过隐藏目录和系统保留目录（WebView2 不允许以下划线开头的扩展名）
+            dirnames[:] = [d for d in dirnames if not d.startswith((".", "_"))]
+            if "manifest.json" not in filenames:
+                continue
+            path = os.path.abspath(dirpath)
+            if path in seen:
+                continue
+            seen.add(path)
+            name, version = os.path.basename(path), ""
+            try:
+                import json
+                with open(os.path.join(path, "manifest.json"), "r", encoding="utf-8-sig") as f:
+                    data = json.load(f)
+                name = str(data.get("name") or name)
+                version = str(data.get("version") or "")
+            except Exception:  # noqa: BLE001
+                pass
+            found.append({"name": name, "version": version, "path": path})
+    return found
+
+
+def find_chromium_browser() -> str:
+    """找本机可用的 Edge / Chrome。找不到返回空串。"""
+    explicit = os.getenv("DOLA_BROWSER")
+    if explicit and os.path.exists(explicit):
+        return explicit
+    system = platform.system()
+    candidates = []
+    if system == "Windows":
+        for base in (os.getenv("PROGRAMFILES(X86)"), os.getenv("PROGRAMFILES"),
+                     os.getenv("LOCALAPPDATA")):
+            if not base:
+                continue
+            candidates += [
+                os.path.join(base, "Microsoft", "Edge", "Application", "msedge.exe"),
+                os.path.join(base, "Google", "Chrome", "Application", "chrome.exe"),
+            ]
+    elif system == "Darwin":
+        candidates += [
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            os.path.expanduser("~/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+            os.path.expanduser("~/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+        ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    for name in ("msedge", "google-chrome", "google-chrome-stable", "chromium",
+                 "chromium-browser", "microsoft-edge", "microsoft-edge-stable"):
+        hit = shutil.which(name)
+        if hit:
+            return hit
+    return ""
+
+
+def extension_browser_profile() -> str:
+    return os.path.join(DATA_DIR, "extension-browser")
+
+
+def build_extension_browser_command(browser: str, profile_dir: str,
+                                    ext_dirs: list, url: str) -> list:
+    """拼 Edge/Chrome 的启动参数。单独抽出来是为了能不开浏览器就自检。"""
+    joined = ",".join(ext_dirs)
+    return [
+        browser,
+        "--user-data-dir=" + profile_dir,
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-extensions-except=" + joined,
+        "--load-extension=" + joined,
+        url,
+    ]
+
+
+def launch_extension_browser(url: str = "https://www.dola.com/chat/",
+                             roots: list = None, browser: str = "") -> dict:
+    """用带扩展的 Edge/Chrome 打开 Dola。返回 {"ok","error","browser","extensions"}。"""
+    exts = discover_extensions(roots)
+    info = {"ok": False, "browser": "", "extensions": [e["name"] for e in exts],
+            "command": "", "error": ""}
+    if not exts:
+        info["error"] = ("没找到扩展：把扩展解压到程序目录的 extensions/ 下，"
+                         "确保某一层目录里有 manifest.json")
+        return info
+    exe = browser or find_chromium_browser()
+    if not exe:
+        info["error"] = "没找到 Edge 或 Chrome，请先安装（或用环境变量 DOLA_BROWSER 指定路径）"
+        return info
+    profile = extension_browser_profile()
+    try:
+        os.makedirs(profile, exist_ok=True)
+    except Exception as exc:  # noqa: BLE001
+        info["error"] = "创建浏览器 profile 失败：%s" % exc
+        return info
+    cmd = build_extension_browser_command(exe, profile, [e["path"] for e in exts], url)
+    info["browser"] = exe
+    info["command"] = " ".join(cmd)
+    try:
+        kwargs = {}
+        if platform.system() == "Windows":
+            kwargs["creationflags"] = 0x00000008      # DETACHED_PROCESS
+        else:
+            kwargs["start_new_session"] = True
+        subprocess.Popen(cmd, **kwargs)
+    except Exception as exc:  # noqa: BLE001
+        info["error"] = "启动浏览器失败：%s" % exc
+        return info
+    info["ok"] = True
+    return info
 
 
 def _open_in_browser(url: str) -> None:

@@ -87,17 +87,18 @@ const SHOT = process.env.DOLA_SHOT || '';   // 可选：把渲染后的 HTML 存
 
   // —— 模型体检：时长联动 + 弹窗 + 结果渲染 ——
   const modelSel = $('genModel');
-  out.push(['生成页默认就是 Seedance 2.5 + 30 秒（不用再手动找）',
-            modelSel.value === 'seedance_v2.5' && $('genDuration').value === '30',
+  out.push(['生成页默认是能用的 Dreamina Seedance 2.0 Fast + 10 秒',
+            modelSel.value === 'seedance_v2.0' && $('genDuration').value === '10',
             modelSel.value + ' / ' + $('genDuration').value + 's']);
-  out.push(['模型下拉写的是官方名字（Dreamina Seedance 2.5）',
-            /Dreamina Seedance 2\.5/.test(modelSel.options[modelSel.selectedIndex].textContent),
-            modelSel.options[modelSel.selectedIndex].textContent]);
+  out.push(['2.5 还在选项里，但明确标注「多数账号调不到」',
+            /Seedance 2\.5/.test(modelSel.textContent) && /调不到/.test(modelSel.textContent),
+            modelSel.textContent.replace(/\s+/g, ' ').slice(0, 80)]);
   modelSel.value = 'seedance_v2.5';
   modelSel.dispatchEvent(new w.Event('change', { bubbles: true }));
   const d25 = Array.from($('genDuration').options).map(o => o.value).join(',');
-  out.push(['选 v2.5 时时长只剩 30/10 秒，且默认 30 秒',
-            d25 === '30,10' && $('genDuration').value === '30', d25 + ' / 当前 ' + $('genDuration').value]);
+  out.push(['选 v2.5 时时长只剩 30/10 秒，并给出「多数账号调不到」警告',
+            d25 === '30,10' && /调不到/.test(($('genHint') || {}).textContent || ''),
+            d25 + ' / ' + (($('genHint') || {}).textContent || '').slice(0, 40)]);
   modelSel.value = 'seedance_v2.0';
   modelSel.dispatchEvent(new w.Event('change', { bubbles: true }));
   const d20 = Array.from($('genDuration').options).map(o => o.value).join(',');

@@ -837,8 +837,6 @@ def network_checks():
               and desktop._judge_page_state(p2)[0] is True, desktop._judge_page_state(p2)[1])
         check("JS 探针走的是内核的 ExecuteScriptAsync（不是 pywebview 的 evaluate_js）",
               any("html_len" in t for t in core.script_texts), core.script_calls)
-        check("真站加载完会顺带注入「生成助手」小条（同一条内核通道）",
-              any("__DLP_HELPER__" in t for t in core.script_texts), len(core.script_texts))
 
         # 脚本通道坏掉（返回 null）→ 只记一笔，绝不能挂住
         core2 = NavCore(script_result=None)

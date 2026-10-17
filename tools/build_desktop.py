@@ -54,7 +54,7 @@ ENTRY = os.path.join(ROOT, "desktop.py")
 NAME = "DolaPool"
 
 # 运行时需要的数据文件（模板 / 静态资源 / 生成核心）
-DATA_DIRS = ["templates", "static", "gen", "tools"]
+DATA_DIRS = ["templates", "static", "gen", "tools", "extensions"]   # extensions：浏览器扩展（2.5/30 秒）
 DATA_FILES = ["cleanup.sh", "README.md", ".env.example", "requirements.txt",
               "requirements-desktop.txt", "scripts"]
 

@@ -28,6 +28,10 @@ const BASE = process.env.DOLA_BASE || 'http://127.0.0.1:8000';
       daily_limit: 0, usage_manual_today: false, check_state: 'ready', check_detail: '', last_checked: '', cookie: '••••••' },
   ];
   let sessions = { mode: 'web', can_manage: false, sessions: [] };
+  // 桌面版 + 扩展：账号页应该出现「🧩 浏览器扩展」卡片
+  const extInfo = { mode: 'desktop', browser: 'C:/Program Files/Microsoft/Edge/Application/msedge.exe',
+    can_launch: true, extensions: [{ name: '豆包 Dola 去水印助手', version: '1.0.0', path: 'C:/DolaPool/extensions/dola30' }] };
+  let openedWithExtension = 0;
 
   const dom = new JSDOM(html, {
     url: BASE + '/', runScripts: 'dangerously', pretendToBeVisual: true, virtualConsole: vc,
@@ -35,7 +39,9 @@ const BASE = process.env.DOLA_BASE || 'http://127.0.0.1:8000';
       w.fetch = async (u, o) => {
         const url = String(u);
         calls.push((o && o.method ? o.method + ' ' : 'GET ') + url);
-        const body = url.includes('api/desktop/sessions') ? sessions
+        const body = url.includes('api/desktop/extensions/open') ? (openedWithExtension++, { ok: true, browser: extInfo.browser })
+          : url.includes('api/desktop/extensions') ? extInfo
+          : url.includes('api/desktop/sessions') ? sessions
           : url.includes('api/accounts/export') ? 'sessionid=abc\nsessionid=def\n'
           : /api\/accounts\/\d+\/update/.test(url) ? { ok: true, account: accounts[0] }
           : url.includes('api/accounts') ? accounts
@@ -75,6 +81,26 @@ const BASE = process.env.DOLA_BASE || 'http://127.0.0.1:8000';
   out.push(['网页版提示：没有可挂起的原生窗口',
             /网页版/.test(d.body.textContent), '']);
   out.push(['今日用量显示手动标记', d.body.textContent.indexOf('手动') >= 0, '']);
+
+  // ④ 浏览器扩展卡片：列出扩展 + 一键用带扩展的浏览器打开
+  const extPanel = Array.from(d.querySelectorAll('.panel'))
+    .find(p => /浏览器扩展/.test(p.textContent));
+  out.push(['账号页有「🧩 浏览器扩展」卡片，并列出识别到的扩展',
+            !!extPanel && /豆包 Dola 去水印助手/.test(extPanel.textContent),
+            extPanel ? extPanel.textContent.replace(/\s+/g, ' ').slice(0, 70) : '没有卡片']);
+  out.push(['卡片写明本机浏览器路径（知道会用哪个打开）',
+            !!extPanel && /msedge\.exe/.test(extPanel.textContent), '']);
+  const extBtn = Array.from(d.querySelectorAll('button'))
+    .find(b => /带扩展浏览器打开/.test(b.textContent));
+  out.push(['「带扩展浏览器打开」按钮可用', !!extBtn && !extBtn.disabled, '']);
+  if (extBtn) {
+    extBtn.click();
+    await new Promise(r => setTimeout(r, 400));
+  }
+  out.push(['点按钮会调用桌面端扩展启动接口',
+            openedWithExtension === 1 &&
+            calls.some(c => c.includes('api/desktop/extensions/open')),
+            '调用 ' + openedWithExtension + ' 次']);
 
   // ① 导出 CK：点按钮 → 选格式 → 真的发起下载
   $('exportCk').click();

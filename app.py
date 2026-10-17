@@ -55,7 +55,7 @@ from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
                                RedirectResponse, Response)
 from fastapi.staticfiles import StaticFiles
 
-VERSION = "2.0.15"
+VERSION = "2.0.16"
 
 # --------------------------------------------------------------------------
 # 目录与配置
@@ -2258,6 +2258,53 @@ def api_desktop_open_external(url: str = ""):
         "opacity:.8;margin-top:8px;word-break:break-all\">%s</div>"
         "<div style=\"opacity:.6;margin-top:14px\">这个窗口可以直接关掉。</div>"
         "</div></body></html>" % _html_escape(target))
+
+
+@app.get("/api/desktop/extensions")
+def api_desktop_extensions():
+    """列出程序目录下 extensions/ 里的浏览器扩展，以及本机找到的 Edge/Chrome。"""
+    info = {"mode": "web", "extensions": [], "browser": "", "can_launch": False}
+    if not (DESKTOP_MODE and _control_hook):
+        info["error"] = "网页版不能启动本机浏览器；请用桌面版，或自己把扩展装进浏览器"
+        return info
+    out = {}
+    try:
+        _control_hook("extensions", {"op": "list", "out": out})
+    except Exception as exc:  # noqa: BLE001
+        info["error"] = "读取扩展失败：%s" % exc
+        return info
+    info.update(mode="desktop", extensions=out.get("extensions") or [],
+                browser=out.get("browser") or "")
+    info["can_launch"] = bool(info["extensions"] and info["browser"])
+    if not info["extensions"]:
+        info["error"] = ("没找到扩展：把扩展解压到程序目录的 extensions/ 下，"
+                         "保证某一层目录里有 manifest.json")
+    elif not info["browser"]:
+        info["error"] = "没找到 Edge 或 Chrome，请先安装"
+    return info
+
+
+@app.post("/api/desktop/extensions/open")
+async def api_desktop_extensions_open(request: Request):
+    """用带扩展的 Edge/Chrome 打开 Dola（扩展由本机浏览器加载，不经过 WebView2）。"""
+    if not (DESKTOP_MODE and _control_hook):
+        return JSONResponse({"error": "该接口仅在桌面版可用"}, 400)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    target = str((body or {}).get("url") or "https://www.dola.com/chat/").strip()
+    if not _external_url_allowed(target):
+        return JSONResponse({"error": "只允许打开 dola.com 的地址"}, 400)
+    out = {}
+    try:
+        _control_hook("extensions", {"op": "launch", "url": target, "out": out})
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"error": "启动失败：%s" % exc}, 500)
+    if not out.get("ok"):
+        return JSONResponse({"error": out.get("error") or "启动失败"}, 400)
+    audit("desktop.extension_browser", (out.get("browser") or "")[:200])
+    return out
 
 
 @app.post("/api/desktop/quit")

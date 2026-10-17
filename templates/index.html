@@ -476,10 +476,10 @@ async function pageGenerate(){
       '<textarea id="genPrompt" style="min-height:180px" placeholder="例：9:16 竖屏，女孩在雨后街道回头，霓虹倒影，慢动作水花，电影级光影，8K 超清"></textarea>' +
       '<div class="grid g4" style="margin-top:12px">' +
         '<div><label class="f">模型</label><select id="genModel">' +
-          '<option value="seedance_v2.5">Dreamina Seedance 2.5 · 30 秒（推荐）</option>' +
-          '<option value="seedance_v2.0">Dreamina Seedance 2.0 Fast · 5/10/15 秒</option>' +
+          '<option value="seedance_v2.0">Dreamina Seedance 2.0 Fast（默认，5/10/15 秒）</option>' +
+          '<option value="seedance_v2.5">Dreamina Seedance 2.5（多数账号调不到，别当默认）</option>' +
         '</select></div>' +
-        '<div><label class="f">时长</label><select id="genDuration"><option>30</option><option>10</option></select></div>' +
+        '<div><label class="f">时长</label><select id="genDuration"><option>10</option><option>15</option><option>5</option></select></div>' +
         '<div><label class="f">比例</label><select id="genRatio"><option>9:16</option><option>16:9</option><option>1:1</option></select></div>' +
         '<div><label class="f">画质</label><select id="genQuality"><option>720p</option><option>1080p</option><option>480p</option></select></div>' +
       '</div>' +
@@ -522,11 +522,10 @@ async function pageGenerate(){
     const sel = $('genDuration');
     const keep = reset ? '' : sel.value;
     sel.innerHTML = allowed.map(v => '<option>' + v + '</option>').join('');
-    // 2.5 默认直接给 30 秒（官方最长）；2.0 默认 10 秒
     sel.value = allowed.indexOf(keep) >= 0 ? keep : (model === 'seedance_v2.5' ? '30' : '10');
     const hint = $('genHint');
     if (hint) hint.textContent = model === 'seedance_v2.5'
-      ? '已选 Dreamina Seedance 2.5 · 30 秒（v2.5 只支持 10 / 30 秒）'
+      ? '⚠️ 2.5 大多数账号调不到，先用 2.0 Fast；2.5 只支持 10 / 30 秒'
       : '已选 Dreamina Seedance 2.0 Fast（支持 5 / 10 / 15 秒）';
   };
   $('genModel').onchange = () => syncDurations(true);
@@ -684,13 +683,13 @@ async function probeModel(){
     return;
   }
   const opts = withCookie.map(a => '<option value="' + a.id + '">#' + a.id + ' ' + esc(a.name) + '</option>').join('');
-  const model = ($('genModel') || {}).value || 'seedance_v2.5';
+  const model = ($('genModel') || {}).value || 'seedance_v2.0';
   openModal('🩺 模型体检', 
     '<div class="grid g2">' +
       '<div><label class="f">账号</label><select id="probeAccount">' + opts + '</select></div>' +
       '<div><label class="f">模型</label><select id="probeModel">' +
-        '<option value="seedance_v2.5"' + (model === 'seedance_v2.5' ? ' selected' : '') + '>Dreamina Seedance 2.5</option>' +
         '<option value="seedance_v2.0"' + (model === 'seedance_v2.0' ? ' selected' : '') + '>Dreamina Seedance 2.0 Fast</option>' +
+        '<option value="seedance_v2.5"' + (model === 'seedance_v2.5' ? ' selected' : '') + '>Dreamina Seedance 2.5（多数账号调不到）</option>' +
       '</select></div>' +
     '</div>' +
     '<p class="muted" style="font-size:12.5px;margin-top:10px">依次检查：生成核心 → 网络(DNS/TCP/TLS) → 站点与登录态 → 提交端点。' +
@@ -960,8 +959,47 @@ async function silentRefreshTasks(){
 }
 
 /* ==================== 账号池 ==================== */
+/* 扩展卡片：只有桌面版、且程序目录里有 extensions/ 时才「有用」。
+   2.5 / 30 秒是网页端靠扩展解锁的；它跑在真正的 Edge/Chrome 里，
+   不是 WebView2 内核（微软要求建环境时开 AreBrowserExtensionsEnabled，pywebview 没这个开关）。 */
+function extPanel(ext){
+  if (!ext || ext.mode !== 'desktop') return '';
+  const list = ext.extensions || [];
+  const what = list.length
+    ? list.map(e => esc(e.name) + (e.version ? ' <span class="dim">v' + esc(e.version) + '</span>' : '')).join('、')
+    : '<span class="dim">未检测到扩展（把解压后的目录放到程序目录的 extensions/ 下，里面要有 manifest.json）</span>';
+  return '<div class="panel"><h2>🧩 浏览器扩展 <small>网页端 2.5 / 30 秒靠它；WebView2 内核装不了扩展，所以用本机 Edge/Chrome</small></h2>' +
+    '<div class="row" style="align-items:flex-start;gap:16px;flex-wrap:wrap">' +
+      '<div style="flex:1;min-width:260px">' +
+        '<div style="font-size:13px">已识别：' + what + '</div>' +
+        '<div class="dim" style="font-size:12px;margin-top:6px">浏览器：' +
+          (ext.browser ? '<span class="mono">' + esc(ext.browser) + '</span>' : '没找到 Edge / Chrome') + '</div>' +
+        (ext.error ? '<div style="font-size:12px;color:#f5c76b;margin-top:6px">' + esc(ext.error) + '</div>' : '') +
+      '</div>' +
+      '<div class="row" style="gap:8px">' +
+        '<button class="btn primary" onclick="openWithExtensions()"' + (ext.can_launch ? '' : ' disabled') +
+          ' title="用带扩展的 Edge/Chrome 打开 dola.com（独立 profile，登录一次会记住）">🧩 带扩展浏览器打开</button>' +
+        '<button class="btn" onclick="render()">↻ 重新检测</button>' +
+      '</div>' +
+    '</div>' +
+    '<div class="dim" style="font-size:11.5px;margin-top:8px">' +
+      '等价命令：<span class="mono">msedge.exe --load-extension=…\extensions\dola30 https://www.dola.com/chat/</span>' +
+      '　·　这个窗口和软件里的账号窗口互不影响，登录态各自保存。</div>' +
+  '</div>';
+}
+
+async function openWithExtensions(){
+  try {
+    const r = await api('api/desktop/extensions/open', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({}),
+      timeout: 15000});
+    toast('已用带扩展的浏览器打开：' + (r.browser || '').split(/[\\/]/).pop());
+  } catch(e){ toast(e.message, true); }
+}
+
 async function pageAccounts(){
-  const [accounts, sess] = await Promise.all([api('api/accounts'), api('api/desktop/sessions')]);
+  const [accounts, sess, ext] = await Promise.all([
+    api('api/accounts'), api('api/desktop/sessions'), api('api/desktop/extensions').catch(() => null)]);
   state.accounts = accounts;
   state.sessions = {};
   (sess.sessions || []).forEach(s => { state.sessions[s.account_id] = s; });
@@ -979,6 +1017,7 @@ async function pageAccounts(){
           ? '桌面版可「前台打开 / 后台挂起 / 切换」多个账号，挂起的窗口不占屏幕，切换秒开'
           : '网页版没有原生窗口，点「网页」在新标签页打开') + '</span>' +
       '</div></div>' +
+    extPanel(ext) +
     '<div class="panel">' + (accounts.length ? '<div class="scroll-x"><table><thead><tr>' +
       '<th>ID</th><th>名称</th><th>状态</th><th>今日用量</th><th>验活</th><th>窗口</th><th>操作</th>' +
       '</tr></thead><tbody>' + accounts.map(a =>
