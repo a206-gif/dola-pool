@@ -964,6 +964,107 @@ def network_checks():
             sys.modules.pop("webview", None)
 
 
+def windowed_startup_checks():
+    """exe 双击启动（PyInstaller --windowed：sys.stdout/stderr 都是 None）。
+
+    真机 v2.0.12 就是在这里炸的：
+        AttributeError: 'NoneType' object has no attribute 'isatty'
+        ValueError: Unable to configure formatter 'default'
+    """
+    print("\n== 0. 双击 exe 启动（没有控制台）==")
+    work = os.path.join(DATA, "windowed")
+    os.makedirs(work, exist_ok=True)
+    for name in os.listdir(work):
+        try:
+            os.remove(os.path.join(work, name))
+        except OSError:
+            pass
+    script = os.path.join(work, "run.py")
+    child = r"""
+import sys, os, json
+sys.stdout = None            # PyInstaller --windowed 的真实状态
+sys.stderr = None
+sys.stdin = None
+os.environ["DOLA_DATA_DIR"] = __WORK__
+os.environ["DOLA_DEMO"] = "1"
+os.environ["DOLA_HOST_BIND"] = "127.0.0.1"
+sys.path.insert(0, __ROOT__)
+import desktop
+desktop._make_output_robust()
+desktop._setup_logging()
+res = {}
+try:
+    b = desktop.Backend(__PORT__, True)
+    b.start(lambda *a, **k: None)
+    res["start"] = "ok"
+    res["ready"] = bool(b.wait_ready(40))
+    b.stop()
+except Exception as exc:
+    import traceback
+    res["start"] = "失败: " + str(exc)
+    res["trace"] = traceback.format_exc()
+open(os.path.join(__WORK__, "result.json"), "w", encoding="utf-8").write(
+    json.dumps(res, ensure_ascii=False))
+""".replace("__WORK__", repr(work)).replace("__ROOT__", repr(ROOT)).replace("__PORT__", str(PORT + 41))
+    with open(script, "w", encoding="utf-8") as f:
+        f.write(child)
+    try:
+        subprocess.run([PY, script], cwd=ROOT, timeout=120,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        with open(os.path.join(work, "result.json"), encoding="utf-8") as f:
+            result = json.load(f)
+    except Exception as exc:  # noqa: BLE001
+        result = {"start": "没有结果文件（%s）" % exc, "trace": ""}
+    check("没有控制台时也能正常启动后端（不再 NoneType.isatty 崩溃）",
+          result.get("start") == "ok" and result.get("ready") is True,
+          result.get("start") if result.get("start") != "ok" else "ready=%s" % result.get("ready"))
+    if result.get("trace"):
+        print("     " + result["trace"].strip().splitlines()[-1][:140])
+    log_path = os.path.join(work, "desktop.log")
+    log_text = ""
+    try:
+        with open(log_path, encoding="utf-8") as f:
+            log_text = f.read()
+    except Exception:  # noqa: BLE001
+        pass
+    check("没有控制台时日志落到数据目录的 desktop.log（用户能发给我们）",
+          "Dola Pool v" in log_text, log_text.strip().splitlines()[0][:70] if log_text else "没有日志")
+
+    src = open(os.path.join(ROOT, "desktop.py"), encoding="utf-8").read()
+    check("uvicorn 不再用它自带的 dictConfig（ext://sys.stderr + isatty）",
+          "log_config=None" in src, "")
+    check("入口有全捕获 + 崩溃日志/弹框（不会再甩英文堆栈给用户）",
+          "_install_crash_handler()" in src.split('if __name__ == "__main__":')[-1]
+          and "sys.excepthook(*sys.exc_info())" in src, "")
+
+    # 崩溃兜底真的会写文件
+    crash_dir = os.path.join(work, "crash")
+    os.makedirs(crash_dir, exist_ok=True)
+    code = r"""
+import sys, os
+sys.stdout = None
+sys.stderr = None
+os.environ['DOLA_DATA_DIR'] = __DIR__
+sys.path.insert(0, __ROOT__)
+import desktop
+desktop._make_output_robust()
+desktop._install_crash_handler()
+raise RuntimeError('故意制造的一次启动失败')
+""".replace("__DIR__", repr(crash_dir)).replace("__ROOT__", repr(ROOT))
+    subprocess.run([PY, "-c", code], cwd=ROOT, timeout=60,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    crashes = [n for n in os.listdir(crash_dir) if n.startswith("crash-")]
+    detail = ""
+    if crashes:
+        with open(os.path.join(crash_dir, crashes[0]), encoding="utf-8") as f:
+            detail = f.read()
+    check("启动失败时写出 crash-*.log（无控制台也能拿到堆栈）",
+          bool(crashes) and "故意制造的一次启动失败" in detail, crashes[0] if crashes else "没有文件")
+
+
 def wait_up(should_be_up=True, timeout=45):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -999,6 +1100,8 @@ def main():
     proc = None
     try:
         print("桌面版无头测试（数据目录：%s）\n" % DATA)
+        windowed_startup_checks()
+
         print("== 1. 启动（演示模式）==")
         proc = spawn(["--demo"])
         ok, health = wait_up()

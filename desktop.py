@@ -22,7 +22,10 @@ from __future__ import annotations
 
 import argparse
 import base64
+import io
 import json
+import logging
+import logging.handlers
 import os
 import platform
 import select
@@ -30,6 +33,7 @@ import socket
 import sys
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -47,19 +51,175 @@ CONFIG_NAME = "config.json"
 # --------------------------------------------------------------------------
 # 用户数据目录（桌面版默认不写在程序目录里，避免只读安装目录 / 权限问题）
 # --------------------------------------------------------------------------
-def _make_output_robust() -> None:
-    """控制台编码兜底。
+class _LogStream:
+    """没有控制台时的替身流（PyInstaller --windowed 下 sys.stdout/stderr 是 None）。
 
-    Windows 控制台默认编码可能是 cp1252（英文版系统），这时 print 中文会抛
-    UnicodeEncodeError —— 而我们的日志大多打在后台线程里，抛出去就等于悄悄中断
-    （真机上踩过一次同类问题）。这里把编不出来的字符换成 ?，保住线程；
-    控制台本来就支持中文时（cp936 / UTF-8）显示不受影响。
+    为什么必须有：uvicorn 的默认日志配置会 `ext://sys.stderr` 拿流、再用
+    `isatty()` 判断要不要上色；流是 None 时直接
+    `AttributeError: 'NoneType' object has no attribute 'isatty'`
+    → `ValueError: Unable to configure formatter 'default'` → 双击 exe 直接弹
+    「Unhandled exception in script」，一个字都看不到。v2.0.13 真机上就是这样炸的。
+
+    所以这里给一个「能写、能 isatty、没有控制台也不报错」的流，
+    并把内容落到日志文件里（用户要发给我们排障时也有东西可发）。
     """
+
+    encoding = "utf-8"
+    errors = "replace"
+
+    def __init__(self, path: str = ""):
+        self._path = path
+        self._lock = threading.Lock()
+
+    def write(self, text):
+        if not text:
+            return 0
+        if self._path:
+            try:
+                with self._lock:
+                    with open(self._path, "a", encoding="utf-8", errors="replace") as f:
+                        f.write(text)
+            except Exception:  # noqa: BLE001 （写日志失败也绝不能让程序挂）
+                pass
+        return len(text)
+
+    def writelines(self, lines):
+        for line in lines:
+            self.write(line)
+
+    def flush(self):
+        pass
+
+    def close(self):
+        pass
+
+    def isatty(self):
+        return False
+
+    def readable(self):
+        return False
+
+    def writable(self):
+        return True
+
+    def seekable(self):
+        return False
+
+    def reconfigure(self, **kwargs):  # noqa: D401 （和 TextIOWrapper 的签名兼容）
+        pass
+
+    def fileno(self):
+        raise OSError("没有控制台（windowed 模式）")
+
+
+def _make_output_robust() -> None:
+    """输出兜底，两件事：
+
+    1. PyInstaller --windowed 下 sys.stdin/stdout/stderr 是 **None**，
+       任何 print / logging / uvicorn 的日志配置都会炸（v2.0.13 真机崩溃的根因）。
+       这里统统换成 _LogStream，并且把输出落到数据目录的 desktop.log。
+    2. Windows 控制台的默认编码可能是 cp1252（英文版系统），print 中文会抛
+       UnicodeEncodeError —— 后台线程里抛出去就等于悄悄中断。
+       把编不出来的字符换成 ?，保住线程；控制台本来就支持中文时显示不受影响。
+    """
+    log_path = os.path.join(DATA_DIR, "desktop.log")
+    for name in ("stdin", "stdout", "stderr"):
+        if getattr(sys, name, None) is None:
+            if name == "stdin":
+                setattr(sys, name, io.StringIO(""))
+            else:
+                setattr(sys, name, _LogStream(log_path))
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(errors="replace")
         except Exception:  # noqa: BLE001 （没有 reconfigure 的对象、已关闭的管道都无所谓）
             pass
+
+
+def _setup_logging() -> None:
+    """自己配 logging —— 不再让 uvicorn 用它的 dictConfig。
+
+    uvicorn 的默认配置里有 `"stream": "ext://sys.stderr"` 和依赖 `isatty()` 的
+    formatter；在没有控制台的 exe 里（sys.stderr 是 None）会直接
+    `AttributeError: 'NoneType' object has no attribute 'isatty'`。
+    `_make_output_robust()` 已经把 None 换成替身流，这里再加一道：
+    `uvicorn.Config(log_config=None)`，日志完全由我们接管（文件 + 有控制台时也打屏）。
+    """
+    root = logging.getLogger()
+    if getattr(root, "_dola_handlers_ready", False):
+        return
+    level = os.getenv("DOLA_LOG_LEVEL", "INFO").upper()
+    root.setLevel(level)
+    fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(name)s | %(message)s")
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        fh = logging.handlers.RotatingFileHandler(
+            os.path.join(DATA_DIR, "desktop.log"), maxBytes=5 * 1024 * 1024,
+            backupCount=2, encoding="utf-8")
+        fh.setFormatter(fmt)
+        root.addHandler(fh)
+    except Exception as exc:  # noqa: BLE001 （写不了文件也不能影响启动）
+        try:
+            print(f"[desktop] 日志文件不可用（{exc}），只打控制台", flush=True)
+        except Exception:
+            pass
+    if sys.stderr is not None and not isinstance(sys.stderr, _LogStream):
+        try:
+            sh = logging.StreamHandler(sys.stderr)
+            sh.setFormatter(fmt)
+            root.addHandler(sh)
+        except Exception:  # noqa: BLE001
+            pass
+    root._dola_handlers_ready = True   # noqa: SLF001 （自己打的标记，避免重复添加）
+
+
+def _message_box(title: str, text: str) -> None:
+    """windowed 模式没有控制台，出错只能弹一个框（否则用户看到的是「双击没反应」）。"""
+    try:
+        if platform.system() == "Windows":
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(None, text, title, 0x10)   # MB_ICONERROR
+            return
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        print(f"[{title}]\n{text}", flush=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _install_crash_handler() -> None:
+    """把未捕获异常写成日志 + 弹框，而不是让用户对着 PyInstaller 的英文堆栈发呆。"""
+
+    def hook(exc_type, exc, tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc, tb)
+            return
+        text = "".join(traceback.format_exception(exc_type, exc, tb))
+        path = ""
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            path = os.path.join(DATA_DIR, "crash-%s.log" % time.strftime("%Y%m%d-%H%M%S"))
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+        except Exception:  # noqa: BLE001
+            path = ""
+        try:
+            print(text, flush=True)
+        except Exception:  # noqa: BLE001
+            pass
+        hint = "程序启动失败，完整堆栈如下（也可以把这段发给我）：\n\n" + text[-1200:]
+        if path:
+            hint += "\n\n完整日志：" + path
+        _message_box(APP_NAME + " 启动失败", hint)
+
+    sys.excepthook = hook
+    try:                                    # 后台线程里的未捕获异常也记下来
+        def thread_hook(args):
+            hook(args.exc_type, args.exc_value, args.exc_traceback)
+        threading.excepthook = thread_hook
+    except Exception:  # noqa: BLE001 （Python < 3.8 没有 threading.excepthook）
+        pass
 
 
 def user_data_dir() -> str:
@@ -166,6 +326,9 @@ class Backend:
             port=self.port,
             log_level="info" if not self.quiet else "warning",
             access_log=False,
+            # 关键：不用 uvicorn 自带的 dictConfig（它会 ext://sys.stderr + isatty()，
+            # 没有控制台的 exe 里必炸）。日志由 _setup_logging() 接管。
+            log_config=None,
         )
         self.server = uvicorn.Server(config)
         self.thread = threading.Thread(target=self.server.run, name="dola-uvicorn", daemon=True)
@@ -1684,6 +1847,7 @@ def open_browser(url: str) -> None:
 # --------------------------------------------------------------------------
 def main(argv=None) -> int:
     _make_output_robust()
+    _setup_logging()
     cfg = load_config()
     parser = argparse.ArgumentParser(description=f"{APP_NAME} 桌面版")
     mode = parser.add_mutually_exclusive_group()
@@ -1784,4 +1948,15 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # 顺序有讲究：先装崩溃兜底（它自己也可能用到 DATA_DIR），再兜住输出。
+    _install_crash_handler()
+    _make_output_robust()
+    _setup_logging()
+    try:
+        _code = main()
+    except SystemExit:
+        raise
+    except BaseException:            # noqa: BLE001 （windowed 模式下没人看得到堆栈）
+        sys.excepthook(*sys.exc_info())
+        _code = 1
+    sys.exit(_code)
