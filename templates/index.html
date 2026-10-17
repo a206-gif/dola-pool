@@ -110,6 +110,10 @@ tbody tr:hover{background:rgba(12,165,140,.06)}
 .card{background:var(--panel-2);border:1px solid var(--line);border-radius:var(--radius);padding:14px}
 .chip{font-size:11px;color:var(--muted);border:1px solid var(--line-2);border-radius:999px;padding:3px 9px}
 .thumb{width:64px;height:64px;object-fit:cover;border-radius:8px;border:1px solid var(--line-2);background:#0b1113}
+.ref-thumb{position:relative;width:64px;height:64px;flex:0 0 auto}
+.ref-thumb .ref-del{position:absolute;top:-6px;right:-6px;width:20px;height:20px;padding:0;line-height:18px;
+  border-radius:50%;border:1px solid #3a4a4d;background:#182224;color:#dbe7e5;font-size:12px;cursor:pointer}
+.ref-thumb .ref-del:hover{background:#7a2b2b;border-color:#b45;color:#fff}
 .video-box{background:#05090a;border:1px solid var(--line);border-radius:10px;display:flex;align-items:center;
   justify-content:center;min-height:230px;color:var(--dim);overflow:hidden}
 .video-box video{width:100%;max-height:460px;display:block;background:#000}
@@ -468,6 +472,26 @@ function retryAllFailed(){
 /* ==================== 生成页 ==================== */
 /* 生成页：先渲染骨架，之后只刷新动态区域——绝不整页重渲染，
    否则每 4 秒会把已经填好的提示词、上传的参考图全清掉（也会闪）。*/
+/* 生成页草稿：切到左边任何页面再回来，提示词 / 选项 / 已上传的参考图都还在。
+   存在 localStorage 里，所以按 F5 刷新、甚至重开程序也不会丢。 */
+const GEN_FORM_KEY = 'dola.genForm.v1';
+function genFormLoad(){
+  try { return JSON.parse(localStorage.getItem(GEN_FORM_KEY) || '{}') || {}; } catch(e){ return {}; }
+}
+function genFormSave(patch){
+  try {
+    const next = Object.assign(genFormLoad(), patch || {});
+    localStorage.setItem(GEN_FORM_KEY, JSON.stringify(next));
+    return next;
+  } catch(e){ return {}; }
+}
+function genFormPatch(){
+  const pick = id => ($(id) ? $(id).value : '');
+  return { prompt: pick('genPrompt'), model: pick('genModel'), duration: pick('genDuration'),
+           ratio: pick('genRatio'), quality: pick('genQuality'), copies: pick('genCopies'),
+           account: pick('genAccount') };
+}
+
 async function pageGenerate(){
   view.innerHTML =
   '<div class="grid g2" style="grid-template-columns:minmax(0,1.15fr) minmax(0,.85fr)">' +
@@ -485,11 +509,11 @@ async function pageGenerate(){
       '</div>' +
       '<div class="row" style="margin-top:12px">' +
         '<div style="width:150px"><label class="f">每条重复次数</label><input id="genCopies" type="number" min="1" max="20" value="1"></div>' +
-        '<div style="flex:1;min-width:200px"><label class="f">指定账号（留空自动选号）</label><input id="genAccount" type="number" placeholder="账号 ID，可留空"></div>' +
+        '<div style="flex:1;min-width:200px"><label class="f">指定账号（默认自动选号）</label><select id="genAccount"><option value="">自动选择（按队列挑可用账号）</option></select></div>' +
       '</div>' +
       '<div style="margin-top:12px"><label class="f">参考图（可选，最多 9 张，上传后不会丢）</label>' +
         '<input type="file" id="genRefs" accept="image/*" multiple>' +
-        '<div id="refThumbs" class="row" style="margin-top:8px;flex-wrap:wrap;gap:6px"></div>' +
+        '<div id="refThumbs" class="row" style="margin-top:8px;flex-wrap:wrap;gap:10px"></div>' +
         '<div class="dim" id="refHint" style="font-size:12px;margin-top:6px"></div></div>' +
       '<div class="row" style="margin-top:16px"><button class="btn primary" id="genSubmit">✧ 提交任务</button>' +
         '<button class="btn" onclick="openAiAssist()">✦ AI 帮我写提示词</button>' +
@@ -508,13 +532,38 @@ async function pageGenerate(){
   '</div>' +
   '<div class="panel"><h2>最近任务</h2><div id="genTasksBox"><span class="dim">加载中…</span></div></div>';
 
-  // 参考图：状态存在 state 上，页内任何局部刷新都不会丢
-  state.genRefs = state.genRefs || [];
+  // 参考图：状态存在 state 上（页内任何局部刷新都不会丢），首次进来从草稿恢复
+  const draft = genFormLoad();
+  if (!Array.isArray(state.genRefs)) state.genRefs = Array.isArray(draft.refs) ? draft.refs : [];
   const paintRefs = () => {
-    $('refThumbs').innerHTML = state.genRefs.map(r => '<img class="thumb" src="' + esc(r.url) + '">').join('');
-    $('refHint').textContent = state.genRefs.length ? ('已上传 ' + state.genRefs.length + ' 张：' + state.genRefs.map(r => r.path.split(/[\\/]/).pop()).join('、')) : '还没有参考图';
+    const box = $('refThumbs');
+    if (!box) return;
+    box.innerHTML = state.genRefs.map((r, i) =>
+      '<div class="ref-thumb" title="' + esc(r.path || '') + '">' +
+        '<img class="thumb" src="' + esc(r.url) + '">' +
+        '<button type="button" class="ref-del" title="移除这张参考图" onclick="removeGenRef(' + i + ')">✕</button>' +
+      '</div>').join('');
+    if ($('refHint')) $('refHint').textContent = state.genRefs.length
+      ? ('已上传 ' + state.genRefs.length + ' 张：' + state.genRefs.map(r => String(r.path || '').split(/[\\/]/).pop()).join('、') + '（点缩略图右上角 ✕ 可单张移除）')
+      : '还没有参考图';
+    genFormSave({ refs: state.genRefs });
+  };
+  window.removeGenRef = (i) => {
+    if (!Array.isArray(state.genRefs)) return;
+    const gone = state.genRefs.splice(i, 1)[0];
+    paintRefs();
+    if (gone) toast('已移除参考图 ' + String(gone.path || '').split(/[\\/]/).pop());
   };
   paintRefs();
+
+  // 恢复上次填的内容（切页 / 刷新都不丢）
+  const setVal = (id, v) => { const el = $(id); if (el && v !== undefined && v !== null && v !== '') el.value = v; };
+  setVal('genPrompt', draft.prompt);
+  setVal('genModel', draft.model);
+  setVal('genQuality', draft.quality);
+  setVal('genRatio', draft.ratio);
+  setVal('genCopies', draft.copies);
+
   // 2.5 只支持 10/30 秒，2.0 支持 5/10/15 —— 选错会被后端悄悄改掉，这里直接限制，别让人猜
   const syncDurations = (reset) => {
     const model = $('genModel').value;
@@ -525,11 +574,45 @@ async function pageGenerate(){
     sel.value = allowed.indexOf(keep) >= 0 ? keep : (model === 'seedance_v2.5' ? '30' : '10');
     const hint = $('genHint');
     if (hint) hint.textContent = model === 'seedance_v2.5'
-      ? '🧩 2.5 走扩展内核：提交时自动用这个账号的带扩展浏览器，页面自己签名（30 / 10 秒）'
+      ? ('🧩 2.5 走扩展内核：提交时自动用这个账号的带扩展浏览器，页面自己签名（30 / 10 秒）'
+         + (IS_DESKTOP ? '' : '；网页版没有本机浏览器，2.5 只能在桌面版用'))
       : '已选 Dreamina Seedance 2.0 Fast（直连提交，支持 5 / 10 / 15 秒）';
   };
-  $('genModel').onchange = () => syncDurations(true);
+  $('genModel').onchange = () => { syncDurations(true); genFormSave(genFormPatch()); };
   syncDurations(false);
+  // 时长：草稿里那个值还合法就用它（否则用默认）
+  if (draft.duration && Array.from($('genDuration').options).some(o => o.value === String(draft.duration)))
+    $('genDuration').value = String(draft.duration);
+
+  // 指定账号：直接列出账号池，不用再记 ID
+  const fillAccounts = async (want) => {
+    const sel = $('genAccount');
+    if (!sel) return;
+    let list = [];
+    try { list = await api('api/accounts'); } catch(e){ list = []; }
+    const keep = (want !== undefined ? String(want) : String(sel.value || draft.account || ''));
+    if (!Array.isArray(list) || !list.length){
+      sel.innerHTML = '<option value="">账号池是空的，先去【账号池】导入</option>';
+      genFormSave({ account: '' });
+      return;
+    }
+    sel.innerHTML = '<option value="">自动选择（按队列挑可用账号）</option>' + list.map(a => {
+      const st = String(a.status || '');
+      const bad = st && !['ready','ok','local_ready'].includes(st);
+      const label = '#' + a.id + ' ' + (a.name || '') + (bad ? '（' + st + '）' : '');
+      return '<option value="' + a.id + '">' + esc(label) + '</option>';
+    }).join('');
+    sel.value = Array.from(sel.options).some(o => o.value === keep) ? keep : '';
+    genFormSave({ account: sel.value });
+  };
+  fillAccounts();
+
+  ['genPrompt','genModel','genDuration','genRatio','genQuality','genCopies','genAccount'].forEach(id => {
+    const el = $(id); if (!el) return;
+    el.addEventListener('input', () => genFormSave(genFormPatch()));
+    el.addEventListener('change', () => genFormSave(genFormPatch()));
+  });
+  genFormSave(genFormPatch());
 
   $('genProbe').onclick = () => probeModel();
 
@@ -545,6 +628,7 @@ async function pageGenerate(){
         const r = await api('api/upload-image', {method:'POST', body: fd});
         state.genRefs.push({path: r.path, url: r.url});
         paintRefs();
+        genFormSave({ refs: state.genRefs });
       } catch(err){
         paintRefs();
         toast('上传失败：' + err.message, true);
@@ -556,6 +640,7 @@ async function pageGenerate(){
     if (!lines.length) return toast('请先填写提示词', true);
     const copies = Math.max(1, Math.min(20, Number($('genCopies').value) || 1));
     const accountId = Number($('genAccount').value) || null;
+    genFormSave(genFormPatch());
     const items = [];
     lines.forEach(p => { for (let i = 0; i < copies; i++) items.push({prompt: p}); });
     if (items.length > 500) return toast('单次最多 500 条', true);
@@ -1281,12 +1366,20 @@ function installExtForAccount(id){
 }
 
 function openAccountBrowser(id){
-  // 带扩展的真实 Edge/Chrome + 这个账号的 CK：CK 由 extensions/dola-login 写进浏览器
+  // 带扩展的真实 Edge/Chrome + 这个账号的 CK。
+  // 正常情况 CK 由程序通过调试端口直接写进浏览器（不等扩展醒过来），
+  // 只有 CDP 写不进去时才退回桥接页 + dola-login 扩展。
   toast('正在启动带扩展的浏览器…');
-  api('api/accounts/' + id + '/browser', {method:'POST', timeout: 30000}).then(r => {
-    if (r.warning) toast(r.warning, true);
+  api('api/accounts/' + id + '/browser', {method:'POST', timeout: 60000}).then(r => {
     const exe = (r.browser || '').split(/[\\/]/).pop() || '浏览器';
-    toast(exe + ' 已打开 #' + id + '，正在写入 CK…（网页右下角会提示）');
+    if (r.login === 'cdp'){
+      toast('✅ ' + exe + ' 已打开 #' + id + '，并写入 ' + (r.cookie_count || 0) + ' 个 Cookie（已登录）');
+      if (r.warning) toast(r.warning, true);
+      if (typeof refreshSessions === 'function') refreshSessions();
+      return;
+    }
+    if (r.warning) toast(r.warning, true);
+    toast(exe + ' 已打开 #' + id + '，正在用扩展写入 CK…（网页右下角会提示）');
     watchBridgeLogin(r.token, id);
   }).catch(e => {
     toast(e.message + '；已退回不带扩展的原生窗口', true);
@@ -1296,7 +1389,7 @@ function openAccountBrowser(id){
 
 async function watchBridgeLogin(token, id){
   if (!token) return;
-  for (let i = 0; i < 15; i++){
+  for (let i = 0; i < 25; i++){
     await new Promise(res => setTimeout(res, 1000));
     let st = null;
     try { st = await api('api/desktop/bridge/status?token=' + encodeURIComponent(token), {timeout: 4000}); }
@@ -1308,9 +1401,10 @@ async function watchBridgeLogin(token, id){
     }
     if (st && st.known === false) return;
   }
-  toast('⚠️ 15 秒内没等到扩展回话：那个浏览器窗口还是未登录状态。' +
-        '桥接页上也写了步骤：edge://extensions → 开发者模式 → 加载已解压的扩展程序 → 选 extensions\\dola-login（一次就够），' +
-        '再点【🌐 网页】。Chrome 137+ 还会要你顺便把 dola30、cookie-editor 一起装上（行末有【⚙ 装扩展】）。', true);
+  toast('⚠️ 25 秒内没等到登录完成。先看那个窗口是不是已经进了 dola.com：' +
+        '进了就说明程序用调试端口写 CK 成功了（这条提示忽略即可）。还停在桥接页的话：' +
+        '回账号池再点一次【🌐 网页】；要用扩展兜底就 edge://extensions → 开发者模式 → 加载已解压的扩展程序 → ' +
+        '选 extensions\\dola-login（行末有【⚙ 装扩展】）。', true);
 }
 
 function openAccountWeb(id){

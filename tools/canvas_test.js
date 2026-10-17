@@ -23,7 +23,13 @@ const BASE = process.env.DOLA_BASE || 'http://127.0.0.1:8000';
   const dom = new JSDOM(html, {
     url: BASE + '/canvas', runScripts: 'dangerously', pretendToBeVisual: true, virtualConsole: vc,
     beforeParse(w) {
-      w.fetch = async () => ({ ok: true, status: 200, text: async () => '[]', json: async () => [] });
+      w.fetch = async (u) => {
+        const isAccounts = String(u).includes('/api/accounts');
+        const body = isAccounts ? [{ id: 1, name: '主号', status: 'ready' },
+                                   { id: 7, name: '小号', status: 'ready' }] : [];
+        return { ok: true, status: 200, text: async () => JSON.stringify(body),
+                 json: async () => body };
+      };
       w.alert = () => {}; w.confirm = () => true; w.prompt = () => 'x';
       w.console.error = (...a) => errors.push('console.error: ' + a.join(' ').slice(0, 200));
     },
@@ -238,6 +244,43 @@ const BASE = process.env.DOLA_BASE || 'http://127.0.0.1:8000';
   const sx = w.eval("nodes[0].x"), sy = w.eval("nodes[0].y");
   out.push(['拖动时节点吸附到 10px 网格（不会歪）',
             Number.isFinite(sx) && sx % 10 === 0 && sy % 10 === 0, 'x=' + sx + ' y=' + sy]);
+
+  // —— 场景 18b：视频节点的账号选择 + 30 秒走扩展内核 ——
+  w.eval('clearCanvas(false)');
+  const accV = w.eval("createNode('video_gen', 300, 300)");
+  w.eval("updateNodeData('" + accV.id + "','model','sd2.5')");
+  w.eval("updateVideoHint('" + accV.id + "')");
+  const accSel = d.getElementById('acc_' + accV.id);
+  await new Promise(r => setTimeout(r, 300));
+  out.push(['视频节点有「账号」下拉（直接读账号池，不用记 ID）', !!accSel,
+            accSel ? '有 ' + accSel.options.length + ' 个选项' : '没有']);
+  out.push(['账号下拉里真能选到账号池的账号',
+            !!accSel && Array.from(accSel.options).some(o => o.value === '7' && /小号/.test(o.textContent)),
+            accSel ? Array.from(accSel.options).map(o => o.value + ':' + o.textContent).join(' | ') : '']);
+  out.push(['选 sd2.5 时节点上写明走扩展内核',
+            /扩展内核/.test((d.getElementById('vhint_' + accV.id) || {}).textContent || ''),
+            (d.getElementById('vhint_' + accV.id) || {}).textContent]);
+  // 执行节点：抓 POST /api/tasks 的 body，确认 account_id 带上了
+  const posts = [];
+  const origFetch = w.fetch;
+  w.fetch = async (u, o) => {
+    if (String(u).includes('/api/tasks') && o && o.method === 'POST') {
+      posts.push(JSON.parse(o.body));
+      return { ok: true, status: 200, json: async () => ({ id: 'task-x' }), text: async () => '{}' };
+    }
+    return origFetch(u, o);
+  };
+  w.eval("updateNodeData('" + accV.id + "','account_id','7')");
+  const txt = w.eval("createNode('text_input', 40, 300)");
+  w.eval("connections.push({id:'c-acc', from_node:'" + txt.id + "', from_port:'output', from_node_port:'output', to_node:'" + accV.id + "', to_port:'input'}); updateConnections();");
+  await w.eval("executeNode(nodes.find(n=>n.id==='" + accV.id + "'), (function(){var o={}; o['" + txt.id + "']={output:{prompt:'雨夜街头'}}; return o;})())");
+  out.push(['执行视频节点时把选中的账号带给后端',
+            posts.length === 1 && posts[0].account_id === 7,
+            posts.length ? JSON.stringify(posts[0]) : '没发请求']);
+  out.push(['sd2.5 节点提交的是 seedance_v2.5 + 30 秒',
+            posts.length === 1 && posts[0].model === 'seedance_v2.5' && posts[0].duration === 30,
+            posts.length ? posts[0].model + ' / ' + posts[0].duration + 's' : '没发请求']);
+  w.fetch = origFetch;
 
   // —— 场景 19：使用说明 + 30 秒演示 ——
   d.getElementById('guideBtn').dispatchEvent(new w.MouseEvent('click', { bubbles: true }));

@@ -55,7 +55,7 @@ from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
                                RedirectResponse, Response)
 from fastapi.staticfiles import StaticFiles
 
-VERSION = "2.0.20"
+VERSION = "2.1.0"
 
 # --------------------------------------------------------------------------
 # 目录与配置
@@ -647,6 +647,7 @@ def process_task(task_id: str) -> None:
             return
         account_id = acc["id"]
         cookie = acc["cookie"]
+        task["account_id"] = account_id      # 扩展内核按它找窗口，这里不写回就会退化成直连
         conn = db()
         conn.execute("update tasks set account_id=? where id=?", (account_id, task_id))
         conn.commit()
@@ -3231,10 +3232,14 @@ _BRIDGE_PAGE = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
   var err = document.getElementById('err');
   function fail(html){ err.style.display = 'block'; err.innerHTML = html; }
   function poll(){
-    if (Date.now() - started > 15000) {
-      fail('⚠️ 15 秒内没等到扩展回话。说明这个浏览器里没有加载 <b>Dola Pool · CK 自动登录</b> 扩展。<br>' +
-           '在地址栏打开 <code>edge://extensions</code>（Chrome 是 <code>chrome://extensions</code>）→ 打开【开发者模式】→ ' +
-           '【加载已解压的扩展程序】→ 选程序目录里的 <code>extensions\\dola-login</code>，再回到账号池点一次【🌐 网页】。' +
+    if (Date.now() - started > 25000) {
+      fail('⚠️ 25 秒内没等到任何登录动作。<br>' +
+           '正常情况下 Dola Pool 会用这个浏览器的调试端口<b>直接写 CK</b>（不依赖扩展），' +
+           '写好后本页会自动跳到 dola.com —— 一直停在这页，说明这个窗口不是从账号池【🌐 网页】开的，' +
+           '或者调试端口被别的程序占用了。<br>' +
+           '排查：回账号池重新点一次【🌐 网页】；如果想让扩展兜底，再到 ' +
+           '<code>edge://extensions</code>（Chrome 是 <code>chrome://extensions</code>）→ 开发者模式 → ' +
+           '【加载已解压的扩展程序】→ 选 <code>extensions\\dola-login</code>。' +
            '<br><br>也可以直接 <a href="https://www.dola.com/chat/">先进入 dola.com</a> 手动登录。');
       return;
     }
@@ -3283,7 +3288,11 @@ def desktop_bridge_page(token: str = ""):
 
 @app.post("/api/accounts/{account_id}/browser")
 def api_account_browser(account_id: int):
-    """用带扩展的真实 Edge/Chrome 打开这个账号的 Dola 页面，CK 由扩展自动写入。
+    """用带扩展的真实 Edge/Chrome 打开这个账号的 Dola 页面，登录态由程序写入。
+
+    登录怎么进去：桌面版拿到调试端口后，用 CDP 直接 Network.setCookies 再导航，
+    不依赖扩展有没有醒过来（扩展只在前者失败时兜底）。这就是「不用每次删掉
+    扩展重新加载」的原因。
 
     和 /web（WebView2 原生窗口）的区别：WebView2 内核装不了扩展，
     所以「30 秒 / 2.5 / 无水印」这些必须走真浏览器 —— 这个端点就是那条路。
@@ -3300,20 +3309,27 @@ def api_account_browser(account_id: int):
     if not cookie:
         return JSONResponse({"error": "该账号没有可用的 Cookie，先补上再打开网页"}, 400)
     token = bridge_issue(account_id)
-    # 先开本机的桥接页：扩展在那里读 token、写 CK，再跳 dola.com。
-    # （CK 和 token 都不会出现在 dola.com 的地址栏 / Referer 里）
-    url = ("http://127.0.0.1:%d/desktop/bridge?token=%s"
-           % (PORT, urllib.parse.quote(token, safe="")))
+    # 桥接页只做兜底（CDP 写不进去时才用）：扩展在那里读 token、写 CK，再跳 dola.com。
+    # 正常情况下桌面版直接用调试端口把 CK 写进浏览器 —— 不依赖扩展有没有醒过来，
+    # 所以不用再「每次先删掉扩展重新加载」。
+    bridge_url = ("http://127.0.0.1:%d/desktop/bridge?token=%s"
+                  % (PORT, urllib.parse.quote(token, safe="")))
+    home = "https://www.dola.com/chat/"
     out = {}
     try:
-        _control_hook("account_browser", {"account_id": account_id, "url": url, "out": out})
+        _control_hook("account_browser", {"account_id": account_id, "url": home,
+                                          "bridge_url": bridge_url, "cookie": cookie,
+                                          "out": out})
     except Exception as exc:  # noqa: BLE001
         return JSONResponse({"error": "启动带扩展的浏览器失败：%s" % exc}, 500)
     if not out.get("ok"):
         return JSONResponse({"error": out.get("error") or "启动带扩展的浏览器失败"}, 400)
-    audit("account.browser", "id=%s" % account_id)
+    audit("account.browser", "id=%s login=%s" % (account_id, out.get("login") or ""))
     return {"ok": True, "mode": "desktop", "account_id": account_id, "token": token,
-            "url": url, "browser": out.get("browser") or "",
+            "url": out.get("url_used") or bridge_url, "bridge_url": bridge_url,
+            "login": out.get("login") or "bridge",
+            "cookie_count": int(out.get("cookie_count") or 0),
+            "browser": out.get("browser") or "",
             "browser_version": out.get("browser_version") or "",
             "extensions": out.get("extensions") or [],
             "warning": out.get("warning") or ""}

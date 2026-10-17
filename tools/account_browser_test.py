@@ -146,7 +146,9 @@ def main():
 
         # 再用假浏览器启动：检查真实拼出来的命令
         proc = spawn({"DOLA_BROWSER": fake,
-                      "DOLA_PROXY": ""})
+                      "DOLA_PROXY": "",
+                      # 假浏览器不会开调试端口；别让自检干等 15 秒
+                      "DOLA_CDP_BOOT_WAIT": "0.5"})
         if not wait_up():
             print("❌ 服务第二次没起来")
             return 1
@@ -173,6 +175,12 @@ def main():
         check("返回的 url 和实际打开的一致", bool(url) and url == (args[-1] if args else ""), url)
         check("返回里写明浏览器和提示",
               isinstance(body, dict) and body.get("browser") and "warning" in body, body)
+        check("返回里写明这次靠什么登录（CDP / 桥接页兜底）",
+              isinstance(body, dict) and body.get("login") in ("cdp", "bridge", "no-cdp")
+              and "cookie_count" in body, body)
+        check("假浏览器开不出调试端口 → 退回桥接页，而不是失败",
+              isinstance(body, dict) and body.get("login") == "bridge"
+              and body.get("bridge_url") == body.get("url"), body)
 
         # 桥接页：扩展没回话时，这张页面要能把「怎么装扩展」写清楚
         status, page = call_raw("GET", "/desktop/bridge?token=" + urllib.parse.quote(token, safe=""))

@@ -807,7 +807,7 @@ function renderNode(node) {
     } else if (node.type === 'video_gen') {
         bodyContent = `
             <label>模型</label>
-            <select onchange="updateNodeData('${node.id}','model',this.value)">
+            <select onchange="updateNodeData('${node.id}','model',this.value);updateVideoHint('${node.id}')">
                 <option value="sd2.5" ${node.data.model==='sd2.5'?'selected':''}>官方sd2.5-30秒</option>
                 <option value="sd2.0" ${node.data.model==='sd2.0'?'selected':''}>sd2.0-15秒</option>
                 <option value="sd2.0_10" ${node.data.model==='sd2.0_10'?'selected':''}>sd2.0-10秒</option>
@@ -818,6 +818,11 @@ function renderNode(node) {
                 <option value="16:9" ${node.data.ratio==='16:9'?'selected':''}>16:9 横屏</option>
                 <option value="1:1" ${node.data.ratio==='1:1'?'selected':''}>1:1 方形</option>
             </select>
+            <label>账号</label>
+            <select id="acc_${node.id}" onchange="updateNodeData('${node.id}','account_id',this.value)">
+                <option value="">自动选择（按队列挑可用账号）</option>
+            </select>
+            <div id="vhint_${node.id}" style="font-size:11px;color:#7a8a8d;margin-top:6px;line-height:1.6"></div>
             <div id="status_${node.id}"></div>`;
     }
     
@@ -833,6 +838,11 @@ function renderNode(node) {
     `;
     
     canvasWorld.appendChild(el);
+    // 账号下拉 / 提示必须在节点挂到 DOM 之后填（此前 getElementById 还拿不到）
+    if (node.type === 'video_gen') {
+        loadAccountsForNode(node.id, node.data.account_id || '');
+        updateVideoHint(node.id);
+    }
     
     // 节点拖拽
     el.querySelector('.node-header').addEventListener('mousedown', (e) => {
@@ -873,6 +883,33 @@ function renderNode(node) {
             selectNode(node.id);
         }
     });
+}
+
+// 视频节点的账号下拉：直接读账号池，不用记 ID（30 秒/2.5 需要账号的带扩展窗口）
+async function loadAccountsForNode(nodeId, want) {
+    const sel = document.getElementById('acc_' + nodeId);
+    if (!sel) return;
+    try {
+        const r = await fetch('/api/accounts');
+        const list = await r.json();
+        const keep = String(want || sel.value || '');
+        sel.innerHTML = '<option value="">自动选择（按队列挑可用账号）</option>' + (Array.isArray(list) ? list : []).map(a =>
+            `<option value="${a.id}">#${a.id} ${a.name || ''}</option>`).join('');
+        sel.value = Array.from(sel.options).some(o => o.value === keep) ? keep : '';
+        const node = nodes.find(n => n.id === nodeId);
+        if (node) node.data.account_id = sel.value;
+    } catch (e) {}
+}
+
+function updateVideoHint(nodeId) {
+    const node = nodes.find(n => n.id === nodeId);
+    const el = document.getElementById('vhint_' + nodeId);
+    if (!node || !el) return;
+    el.innerHTML = node.data.model === 'sd2.5'
+        ? '🧩 2.5 / 30 秒走扩展内核：提交后会用这个账号的<b>带扩展浏览器</b>让页面自己签名（桌面版才有）；账号留空会自动选一个。'
+        : '2.0 Fast 走直连提交，5~15 秒。';
+    const sel = document.getElementById('acc_' + nodeId);
+    if (sel) sel.value = node.data.account_id || '';
 }
 
 function updateNodePosition(node) {
@@ -1620,6 +1657,7 @@ async function executeNode(node, nodeOutputs) {
                 model: model,
                 duration: duration,
                 ratio: node.data.ratio || '9:16',
+                account_id: node.data.account_id ? Number(node.data.account_id) : null,
                 ref_images: image
             })
         });

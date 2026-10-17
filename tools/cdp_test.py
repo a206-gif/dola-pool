@@ -174,6 +174,35 @@ def main():
           [m for m, _ in COMMANDS][:2] == ["Browser.getWindowForTarget", "Browser.setWindowBounds"],
           [m for m, _ in COMMANDS])
 
+    # —— CDP 直接写 CK：不依赖扩展有没有醒过来 ——
+    COMMANDS.clear()
+    login = desktop.cdp_login(port, "sessionid=abc123; sid_guard=xyz%3D%3D",
+                              url="https://www.dola.com/chat/")
+    check("CDP 能把 CK 直接写进浏览器（不用等扩展醒）",
+          login.get("ok") is True and login.get("count") == 2 and login.get("url"), login)
+    methods = [m for m, _ in COMMANDS]
+    check("写 CK 的顺序：先 enable 再 setCookies 再 navigate",
+          "Page.enable" in methods
+          and methods.index("Network.setCookies") < methods.index("Page.navigate")
+          and methods.index("Page.enable") < methods.index("Network.setCookies"),
+          methods[:6])
+    sent = [p for m, p in COMMANDS if m == "Network.setCookies"]
+    chrome_cookies = (sent[0].get("cookies") if sent else []) or []
+    check("写进去的 Cookie 是 .dola.com + 值没被弄坏",
+          len(chrome_cookies) == 2 and all(c.get("domain") == ".dola.com" for c in chrome_cookies)
+          and chrome_cookies[1].get("value") == "xyz%3D%3D", chrome_cookies)
+    check("最后跳到 dola 首页",
+          [p.get("url") for m, p in COMMANDS if m == "Page.navigate"] == ["https://www.dola.com/chat/"],
+          [p.get("url") for m, p in COMMANDS if m == "Page.navigate"])
+    COMMANDS.clear()
+    desktop.cdp_login(port, "sessionid=abc123", url="https://www.dola.com/chat/", navigate=False)
+    check("navigate=False 时只写 Cookie、不动当前页面",
+          "Page.navigate" not in [m for m, _ in COMMANDS], [m for m, _ in COMMANDS])
+    check("空 CK 直接说明原因，不去连浏览器",
+          desktop.cdp_login(port, "  ").get("ok") is False
+          and "Cookie" in desktop.cdp_login(port, "  ").get("error", ""),
+          desktop.cdp_login(port, "  "))
+
     # Control：状态要回写给后端，账号池的「窗口」列才显示得出来
     class FakeApp:
         def __init__(self):
@@ -193,9 +222,16 @@ def main():
         payload["out"] = out
         ctl(action, payload)
 
-    hook("account_browser", {"account_id": 5, "url": "http://127.0.0.1:1/x"})
+    COMMANDS.clear()
+    hook("account_browser", {"account_id": 5, "url": "https://www.dola.com/chat/",
+                             "cookie": "sessionid=abc123; ttwid=tt-1"})
     check("再点一次「🌐 网页」不会开第二个窗口，而是把已有的叫到前台",
           out.get("reused") is True and out.get("ok") is True, out)
+    check("复用已开的窗口时也会重新写一遍 CK（CK 过期不用关窗重登）",
+          out.get("login") == "cdp" and out.get("cookie_count") == 2
+          and "Network.setCookies" in [m for m, _ in COMMANDS],
+          {"login": out.get("login"), "count": out.get("cookie_count"),
+           "methods": [m for m, _ in COMMANDS]})
 
     ctl.session({"account_id": 5, "action": "suspend"})
     check("挂起扩展窗口后，后端记成 parked + kind=browser",

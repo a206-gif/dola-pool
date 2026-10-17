@@ -417,6 +417,38 @@ def main():
         err = str(exc)
     check("扩展内核失败时把页面给的原因带回任务错误", "30s" in err and "选择时长" in err, err)
 
+    # 8) process_task：自动选号后要把 account_id 写回 task。
+    #    画布 / 分镜 / 批量任务都不传账号，2.5 全靠这个字段找浏览器窗口。
+    conn = webapp.db()
+    cur = conn.execute(
+        "insert into accounts(name,cookie,status,created_at,check_state,check_detail) "
+        "values(?,?,?,?,?,?)", ("自动选号", "a=1", "ready", webapp.utcnow(), "", ""))
+    auto_acc = cur.lastrowid
+    conn.execute(
+        "insert into tasks(id,prompt,duration,ratio,model,status,quality,min_bytes,"
+        "ref_images,created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?,?)",
+        ("t-auto", "雨夜", 30, "9:16", "seedance_v2.5", "queued", "720p", 0, "",
+         webapp.utcnow(), webapp.utcnow()))
+    conn.commit()
+    conn.close()
+    seen = {}
+    orig_render = webapp._render_task
+
+    def fake_render(task, cookie):
+        seen.update(dict(task))
+        return {"url": "/output/t-auto.mp4", "path": "/tmp/t-auto.mp4", "bytes": 1}
+
+    webapp._render_task = fake_render
+    try:
+        webapp.process_task("t-auto")
+    finally:
+        webapp._render_task = orig_render
+    check("批量/画布任务自动选号后，account_id 会写回 task（2.5 才能找到浏览器窗口）",
+          seen.get("account_id") == auto_acc,
+          "account_id=%s（期望 %s）" % (seen.get("account_id"), auto_acc))
+    check("这条任务的通道是扩展内核",
+          webapp.task_channel(seen) == "extension", webapp.task_channel(seen))
+
     # 汇总
     bad = 0
     for name, ok, detail in OUT:

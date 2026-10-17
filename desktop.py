@@ -1375,12 +1375,28 @@ class Control:
             # 这个账号的 profile 里手动装扩展（Chrome 137+ 才需要）
             result = open_extension_manager(profile=account_browser_profile(account_id))
         else:
+            cookie = str(payload.get("cookie") or "")
+            target = str(payload.get("url") or "https://www.dola.com/chat/")
+            bridge_url = str(payload.get("bridge_url") or "")
             sess = self._browser_sessions.get(account_id)
             if sess and cdp_ready(sess.get("port") or 0):
-                # 已经开着这个账号的扩展窗口：不再开第二个（同 profile 会抢实例），
-                # 直接把它叫到前台；登录态本来就在。
+                # 已经开着这个账号的扩展窗口：不再开第二个（同 profile 会抢实例）。
+                # 顺手把 CK 重新写一遍（CK 过期时不用关窗口重登），然后叫到前台。
+                login = cdp_login(sess["port"], cookie, url=target, navigate=False) if cookie else {"ok": False}
+                went_login = False
+                try:
+                    page = choose_page_target(sess["port"], create=False) or {}
+                    went_login = "/login" in str(page.get("url") or "")
+                except Exception:  # noqa: BLE001
+                    went_login = False
+                if cookie and (went_login or not login.get("ok")):
+                    # 停在登录页 / 写不进去：直接重导一次首页，别让人对着旧页面发呆
+                    cdp_login(sess["port"], cookie, url=target, navigate=True)
                 brought = browser_window_action(sess["port"], "activate")
                 result = {"ok": bool(brought.get("ok")), "reused": True,
+                          "login": "cdp" if login.get("ok") else "reused",
+                          "cookie_count": int(login.get("count") or 0),
+                          "url_used": target,
                           "browser": sess.get("browser") or "",
                           "browser_version": sess.get("browser_version") or "",
                           "extensions": sess.get("extensions") or [],
@@ -1390,8 +1406,8 @@ class Control:
             else:
                 proxy_arg = str((getattr(self, "net_info", {}) or {}).get("proxy_arg") or "")
                 result = launch_account_browser(
-                    account_id, str(payload.get("url") or "https://www.dola.com/chat/"),
-                    proxy_arg=proxy_arg)
+                    account_id, target, proxy_arg=proxy_arg,
+                    cookie=cookie, fallback_url=bridge_url)
                 if result.get("ok"):
                     self._browser_sessions[account_id] = {
                         "port": result.get("debug_port"), "pid": result.get("pid"),
@@ -1492,7 +1508,8 @@ class Control:
                         proxy_arg = str((getattr(self, "net_info", {}) or {}).get("proxy_arg") or "")
                         launched = launch_account_browser(account_id, "about:blank",
                                                           proxy_arg=proxy_arg,
-                                                          debug_port=port)
+                                                          debug_port=port,
+                                                          cookie=str(payload.get("cookie") or ""))
                         if not launched.get("ok"):
                             result["error"] = launched.get("error") or "启动带扩展的浏览器失败"
                             if isinstance(out, dict):
@@ -2709,6 +2726,40 @@ def _prepare_hint(steps: list) -> str:
     return ""
 
 
+def cdp_login(port: int, cookie: str, url: str = "https://www.dola.com/chat/",
+              navigate: bool = True, timeout: float = 15.0) -> dict:
+    """用调试端口把账号 CK 直接写进浏览器，再把页面导到目标地址。
+
+    为什么不用扩展做这件事：扩展的 content script / service worker 什么时候醒，
+    取决于浏览器启动时序 —— 冷启动打开的第一个页面经常赶不上，于是「必须先删掉
+    扩展再重新加载」才好使。CDP 是浏览器自己开的调试通道，页面还没加载就能写
+    Cookie，写完整页导航进去就是登录态，稳定得多。
+    """
+    out = {"ok": False, "count": 0, "url": url, "error": ""}
+    page = choose_page_target(port)
+    if not page:
+        out["error"] = "这个浏览器没有可用的标签页"
+        return out
+    cookies = _cookie_entries(cookie)
+    if not cookies:
+        out["error"] = "这个账号没有可用的 Cookie"
+        return out
+    try:
+        with _CdpPage(page["webSocketDebuggerUrl"], timeout=timeout) as cdp:
+            cdp.call("Page.enable", timeout=5)
+            try:
+                cdp.call("Network.enable", timeout=5)
+            except Exception:  # noqa: BLE001 - 个别版本不 enable 也能 setCookies
+                pass
+            cdp.call("Network.setCookies", {"cookies": cookies}, timeout=10)
+            if navigate:
+                cdp.call("Page.navigate", {"url": url}, timeout=15)
+        out.update(ok=True, count=len(cookies))
+    except Exception as exc:  # noqa: BLE001
+        out["error"] = str(exc)
+    return out
+
+
 def _spawn_detached(cmd: list):
     kwargs = {}
     if platform.system() == "Windows":
@@ -2867,24 +2918,26 @@ def build_account_browser_command(browser: str, profile_dir: str, ext_dirs: list
 
 def launch_account_browser(account_id: int, url: str, ext_roots: list = None,
                            browser: str = "", proxy_arg: str = "",
-                           debug_port: int = 0) -> dict:
+                           debug_port: int = 0, cookie: str = "",
+                           fallback_url: str = "") -> dict:
     """用带扩展的 Edge/Chrome 打开「这个账号」的 Dola 页面。
 
-    登录态怎么来的：启动参数里带的是 dola.com 的一次性 token；扩展
-    `extensions/dola-login` 读到后向本机 /api/desktop/bridge/cookies 取 CK，
-    再用 chrome.cookies.set 写进这个 profile，页面刷新就是登录态。
+    登录态：优先用 CDP 直接把 CK 写进浏览器（稳、不等扩展）；写不进去时
+    才退回本机桥接页 + extensions/dola-login 那条老路。
     """
+    info_extra = {"login": "url", "cookie_count": 0, "url_used": url}
     exts = discover_extensions(ext_roots)
     info = {"ok": False, "browser": "", "account_id": int(account_id or 0),
             "extensions": [e["name"] for e in exts], "command": "", "error": "",
             "profile": account_browser_profile(account_id), "warning": "",
             "load_extension_supported": True}
+    info.update(info_extra)
     if not exts:
         info["error"] = ("没找到扩展：把扩展放到程序目录的 extensions/ 下，"
                          "确保某一层目录里有 manifest.json")
         return info
-    if not any("CK 自动登录" in e["name"] or os.path.basename(e["path"]) == "dola-login"
-               for e in exts):
+    if (not cookie and not any("CK 自动登录" in e["name"]
+                               or os.path.basename(e["path"]) == "dola-login" for e in exts)):
         info["warning"] = ("没找到「Dola Pool · CK 自动登录」扩展，"
                            "窗口会打开但不会自动带入这个账号的登录态。")
     exe = browser or find_chromium_browser()
@@ -2901,9 +2954,15 @@ def launch_account_browser(account_id: int, url: str, ext_roots: list = None,
     except Exception as exc:  # noqa: BLE001
         info["error"] = "创建浏览器 profile 失败：%s" % exc
         return info
-    debug_port = int(debug_port or free_port())
+    # 用「每个账号固定的端口」而不是随机空闲端口：软件重启后还能接上同一个窗口，
+    # 也避免「同 profile 再启动 → Chrome 把任务转交给旧实例 → 新端口根本没开」。
+    debug_port = int(debug_port or account_debug_port(account_id) or free_port())
+    # 先开桥接页（扩展正常时它自己也能把 CK 写进去 = 兜底），
+    # 调试端口起来后程序再用 CDP 直接写 Cookie 并跳到 dola.com —— 双保险：
+    # 扩展没醒也不影响登录，扩展醒了就是两条路写同一份 CK。
+    open_url = (fallback_url or url) if cookie else url
     cmd = build_account_browser_command(exe, profile, [e["path"] for e in exts],
-                                        url, proxy_arg=proxy_arg, debug_port=debug_port)
+                                        open_url, proxy_arg=proxy_arg, debug_port=debug_port)
     info["browser"] = exe
     info["browser_version"] = browser_version(exe)
     info["debug_port"] = debug_port
@@ -2913,8 +2972,31 @@ def launch_account_browser(account_id: int, url: str, ext_roots: list = None,
         info["error"] = "启动浏览器失败：%s" % exc
         return info
     info.update(ok=True, pid=getattr(proc, "pid", 0), command=" ".join(cmd))
-    # 等调试端口就绪（最多 3 秒）：后面的「挂起 / 切换」都要用它
-    info["cdp"] = wait_cdp(debug_port, 3.0)
+    # 等调试端口就绪：后面的「写 CK / 挂起 / 切换」都要用它（冷启动要几秒）。
+    # DOLA_CDP_BOOT_WAIT 是给自检用的（假浏览器永远不会开端口，不用干等 15 秒）。
+    try:
+        boot_wait = float(os.getenv("DOLA_CDP_BOOT_WAIT") or 15.0)
+    except ValueError:
+        boot_wait = 15.0
+    info["cdp"] = wait_cdp(debug_port, boot_wait)
+    if cookie:
+        if info["cdp"]:
+            login = cdp_login(debug_port, cookie, url=url, navigate=True)
+            if login.get("ok"):
+                info.update(login="cdp", cookie_count=login.get("count") or 0,
+                            url_used=url)
+            else:
+                info["warning"] = ("CDP 写 Cookie 失败（%s），留给扩展走桥接页"
+                                   % (login.get("error") or "未知原因"))
+                info.update(login="bridge", url_used=fallback_url or url)
+        else:
+            # 端口没起来：页面上还是桥接页，扩展正常时照样能登录
+            info.update(login="bridge" if fallback_url else "no-cdp",
+                        url_used=fallback_url or url)
+            info["warning"] = (info["warning"] + " " + (
+                "没等到这个浏览器的调试端口（多半是这个账号的窗口早就开着、"
+                "但不是本程序启动的），这次改走扩展兜底；把那个窗口关掉再点一次"
+                "【🌐 网页】，就会用更稳的直写登录。")).strip()
     return info
 
 

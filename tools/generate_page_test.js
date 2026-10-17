@@ -50,7 +50,9 @@ const SHOT = process.env.DOLA_SHOT || '';   // 可选：把渲染后的 HTML 存
         } else if (url.includes('api/tasks')) {
           body = fakeTasks();
         } else if (url.includes('api/upload-image')) {
-          uploadCalls++; body = { ok: true, path: '/tmp/ref1.png', url: '/uploads/ref1.png' };
+          uploadCalls++;
+          body = { ok: true, path: '/tmp/ref' + uploadCalls + '.png',
+                   url: '/uploads/ref' + uploadCalls + '.png' };
         } else if (url.includes('api/proxy-status') || url.includes('api/stats')) {
           body = {};
         }
@@ -75,7 +77,9 @@ const SHOT = process.env.DOLA_SHOT || '';   // 可选：把渲染后的 HTML 存
 
   // 模拟用户：填提示词 + 选 3 张参考图（顺带验证上传调用）
   $('genPrompt').value = '第一行提示词\n第二行提示词';
+  $('genPrompt').dispatchEvent(new w.Event('input', { bubbles: true }));
   $('genCopies').value = '3';
+  $('genCopies').dispatchEvent(new w.Event('input', { bubbles: true }));
   const input = $('genRefs');
   const files = ['a.png', 'b.png', 'c.png'].map(n => new w.File([new Uint8Array([1, 2, 3])], n, { type: 'image/png' }));
   Object.defineProperty(input, 'files', { value: files, configurable: true });
@@ -84,6 +88,50 @@ const SHOT = process.env.DOLA_SHOT || '';   // 可选：把渲染后的 HTML 存
 
   out.push(['上传接口被调用 3 次', uploadCalls === 3, '实际 ' + uploadCalls + ' 次']);
   out.push(['缩略图出现 3 张', d.querySelectorAll('#refThumbs img').length === 3, '实际 ' + d.querySelectorAll('#refThumbs img').length + ' 张']);
+
+  // —— 指定账号：从账号池读，不用手填 ID ——
+  await new Promise(r => setTimeout(r, 300));
+  const accSel = $('genAccount');
+  out.push(['「指定账号」是下拉框（不是手填数字）',
+            !!accSel && accSel.tagName === 'SELECT', accSel ? accSel.tagName : '没有']);
+  out.push(['下拉里能选到账号池里的账号',
+            !!accSel && Array.from(accSel.options).some(o => o.value === '1' && /主号/.test(o.textContent)),
+            accSel ? Array.from(accSel.options).map(o => o.value + ':' + o.textContent).join(' | ') : '']);
+  accSel.value = '1';
+  accSel.dispatchEvent(new w.Event('change', { bubbles: true }));
+
+  // —— 切到别的页面再回来：提示词 / 选项 / 参考图都要还在 ——
+  await w.eval("go('tasks')");
+  await new Promise(r => setTimeout(r, 300));
+  await w.eval("go('generate')");
+  await new Promise(r => setTimeout(r, 700));
+  out.push(['切到别的页面再回来，提示词还在',
+            $('genPrompt') && $('genPrompt').value === '第一行提示词\n第二行提示词',
+            ($('genPrompt') || {}).value]);
+  out.push(['切回来后指定账号的选择也还在',
+            $('genAccount') && $('genAccount').value === '1', ($('genAccount') || {}).value]);
+  out.push(['切回来后参考图还在', d.querySelectorAll('#refThumbs img').length === 3,
+            d.querySelectorAll('#refThumbs img').length + ' 张']);
+
+  // —— 参考图能单张删除 ——
+  const delBtns = d.querySelectorAll('#refThumbs .ref-del');
+  out.push(['每张参考图都有单独的「✕」删除按钮', delBtns.length === 3, delBtns.length + ' 个']);
+  delBtns[0].dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+  await new Promise(r => setTimeout(r, 200));
+  out.push(['点 ✕ 只移除那一张（3 → 2）',
+            d.querySelectorAll('#refThumbs img').length === 2, d.querySelectorAll('#refThumbs img').length + ' 张']);
+  {
+    const left = w.eval("JSON.parse(localStorage.getItem('dola.genForm.v1')||'{}').refs") || [];
+    out.push(['删掉的是点的那一张（按位置删，不是把同名/全部图清空）',
+              left.length === 2 && left.every(r => r.path !== '/tmp/ref1.png'),
+              JSON.stringify(left)]);
+  }
+  // 补回一张，后面的「刷新不丢」断言仍按 3 张算
+  await w.eval("state.genRefs.push({path:'/tmp/ref4.png', url:'/uploads/ref4.png'})");
+  await w.eval("go('generate')");
+  await new Promise(r => setTimeout(r, 500));
+  out.push(['补回来的参考图会重新画出来', d.querySelectorAll('#refThumbs img').length === 3,
+            d.querySelectorAll('#refThumbs img').length + ' 张']);
 
   // —— 模型体检：时长联动 + 弹窗 + 结果渲染 ——
   const modelSel = $('genModel');
