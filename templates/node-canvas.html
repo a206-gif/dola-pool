@@ -9,10 +9,12 @@
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a0c0d;color:#e7eeee;overflow:hidden;height:100vh}
 
 /* 顶部工具栏 */
-.topbar{position:fixed;top:0;left:0;right:0;height:48px;background:rgba(20,25,28,0.95);backdrop-filter:blur(10px);border-bottom:1px solid rgba(48,59,62,0.5);display:flex;align-items:center;padding:0 16px;z-index:1000;gap:12px}
+.topbar{position:fixed;top:0;left:0;right:0;height:48px;background:rgba(20,25,28,0.95);backdrop-filter:blur(10px);border-bottom:1px solid rgba(48,59,62,0.5);display:flex;align-items:center;padding:0 12px;z-index:1000;gap:8px;overflow-x:auto;overflow-y:hidden;white-space:nowrap;scrollbar-width:thin}
+.topbar::-webkit-scrollbar{height:4px}
+.topbar::-webkit-scrollbar-thumb{background:#3a484b;border-radius:2px}
 .topbar h1{font-size:16px;color:#fff;margin:0}
 .topbar .spacer{flex:1}
-.topbar button{padding:6px 14px;background:#078d78;color:#fff;border:0;border-radius:4px;cursor:pointer;font-size:13px}
+.topbar button{padding:6px 11px;background:#078d78;color:#fff;border:0;border-radius:4px;cursor:pointer;font-size:13px;flex:0 0 auto}
 .topbar button:hover{background:#0ca58c}
 .topbar button.secondary{background:#2a3538;color:#b8c9cc}
 .topbar button.danger{background:#4a2428;color:#ff9b98}
@@ -122,6 +124,37 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .toast .item.show{opacity:1;transform:translateY(0)}
 .toast .item.err{background:#7a2b2f}
 
+/* 使用说明 / 演示 */
+.guide-modal{position:fixed;inset:0;z-index:3000;display:none;align-items:center;justify-content:center;
+    background:rgba(0,0,0,.62);backdrop-filter:blur(2px)}
+.guide-modal.show{display:flex}
+.guide-box{width:min(720px,92vw);max-height:86vh;overflow:auto;background:#111617;border:1px solid #2a3538;
+    border-radius:12px;padding:22px 24px;box-shadow:0 24px 60px rgba(0,0,0,.55)}
+.guide-box h2{margin:0 0 4px;font-size:19px;color:#fff}
+.guide-box .lead{color:#9aabad;font-size:13px;margin:0 0 16px}
+.guide-box h3{font-size:13.5px;color:#5fe3c8;margin:18px 0 8px}
+.guide-box ol,.guide-box ul{margin:0;padding-left:20px;font-size:13px;line-height:1.85;color:#cfdcd9}
+.guide-box b{color:#fff}
+.guide-box kbd{background:#20292b;border:1px solid #3a484b;border-bottom-width:2px;border-radius:4px;
+    padding:0 5px;font:12px ui-monospace,Consolas,monospace;color:#bff5e8}
+.guide-box .foot{display:flex;gap:10px;justify-content:flex-end;margin-top:20px}
+.guide-box .hint{font-size:12px;color:#7a8a8d;margin-top:14px;border-top:1px solid #222c2e;padding-top:12px}
+.guide-demo{display:flex;gap:8px;align-items:center;background:rgba(95,227,200,.08);
+    border:1px solid rgba(95,227,200,.3);border-radius:8px;padding:10px 12px;margin-top:14px;font-size:12.5px;color:#bff5e8}
+.guide-demo button{margin-left:auto;background:#078d78;color:#fff;border:0;border-radius:6px;padding:8px 14px;
+    font-size:13px;cursor:pointer;font-weight:600}
+.guide-demo button:hover{filter:brightness(1.1)}
+.guide-demo button:disabled{opacity:.55;cursor:wait}
+.canvas-welcome{position:fixed;top:66px;left:50%;transform:translateX(-50%);z-index:900;
+    background:rgba(15,20,22,.96);border:1px solid rgba(95,227,200,.35);border-radius:10px;
+    padding:12px 16px;font-size:13px;color:#cfdcd9;box-shadow:0 10px 30px rgba(0,0,0,.45);
+    display:flex;align-items:center;gap:12px;max-width:min(760px,90vw)}
+.canvas-welcome b{color:#fff}
+.canvas-welcome button{background:#1b2425;color:#bff5e8;border:1px solid #3a484b;border-radius:6px;
+    padding:6px 12px;font-size:12.5px;cursor:pointer;white-space:nowrap}
+.canvas-welcome button.primary{background:#078d78;border-color:#078d78;color:#fff;font-weight:600}
+.canvas-welcome .x{background:none;border:0;color:#7a8a8d;padding:0 2px;font-size:16px;cursor:pointer}
+
 /* 帮助提示 */
 .help-hint{position:fixed;bottom:16px;left:216px;font-size:11px;color:#5a6a6d;z-index:998;pointer-events:none}
 
@@ -204,16 +237,17 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
     <h1>⚡ 节点画布</h1>
     <button class="secondary" onclick="location.href='/'">← 返回</button>
     <div class="spacer"></div>
-    <button class="secondary" onclick="saveWorkflow()">💾 保存</button>
-    <button class="secondary" onclick="loadWorkflow()">📂 本地</button>
-    <button class="secondary" onclick="loadServerWorkflow()">☁ 服务端</button>
+    <button class="secondary" id="guideBtn" onclick="showGuide()" title="画布怎么用？三种连线方式 + 30 秒演示">❔</button>
+    <button class="secondary" onclick="saveWorkflow()" title="保存工作流（浏览器本地 + 可选服务端）">💾</button>
+    <button class="secondary" onclick="loadWorkflow()" title="加载本地保存的工作流">📂</button>
+    <button class="secondary" onclick="loadServerWorkflow()" title="加载服务端保存的工作流">☁</button>
     <button class="secondary" onclick="autoConnect()" title="按端口类型和左右位置，自动把能连的端口都连上">⚡ 自动连线</button>
-    <button class="secondary" onclick="autoLayout()" title="按连线的先后顺序把节点排成从左到右的几列">▤ 自动布局</button>
-    <button class="secondary" onclick="fitView()" title="缩放到能看见全部节点">⛶ 看全图</button>
-    <button class="secondary" onclick="undo()" title="撤销（Ctrl+Z）">↶ 撤销</button>
-    <button class="secondary" onclick="redo()" title="重做（Ctrl+Shift+Z / Ctrl+Y）">↷ 重做</button>
+    <button class="secondary" onclick="autoLayout()" title="按连线的先后顺序把节点排成从左到右的几列">▤</button>
+    <button class="secondary" onclick="fitView()" title="缩放到能看见全部节点">⛶</button>
+    <button class="secondary" onclick="undo()" title="撤销（Ctrl+Z）">↶</button>
+    <button class="secondary" onclick="redo()" title="重做（Ctrl+Shift+Z / Ctrl+Y）">↷</button>
     <button class="secondary" id="connToggle" onclick="toggleConnPanel()" title="列出所有连线，可定位/删除">◨ 连线 0</button>
-    <button class="danger" onclick="clearCanvas()">🗑 清空</button>
+    <button class="danger" onclick="clearCanvas()" title="清空画布（可撤销）">🗑</button>
     <button onclick="executeWorkflow()" style="background:#078d78">▶ 执行工作流</button>
     <button class="secondary" onclick="zoomReset()">100%</button>
     <span class="zoom-info" id="zoomInfo">100%</span>
@@ -301,6 +335,53 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
                 style="background:#2a3538;color:#b8c9cc">✕</button></h4>
     <div id="connList"></div>
     <div id="connEmpty" class="dim" style="font-size:12px">还没有连线。三种连法：① 按住输出圆点拖到目标 ② 点一下输出圆点再点输入圆点 ③ 双击任意端口自动找最近的可连端口</div>
+</div>
+
+<!-- 使用说明 -->
+<div class="guide-modal" id="guideModal">
+  <div class="guide-box">
+    <h2>❔ 节点画布 · 使用说明</h2>
+    <p class="lead">画布是「节点 + 连线」的工作流：左边拖节点进来，把输出圆点连到输入圆点，再点「▶ 执行工作流」。</p>
+
+    <h3>① 三种连线方式（都会显示彩色线 + 箭头 + 端口标签）</h3>
+    <ol>
+      <li><b>拖拽</b>：按住一个圆点，拖到另一个圆点松手。落点有 60px 容错，落在节点身上也算。</li>
+      <li><b>点两下</b>：点一下输出圆点（会高亮所有能连的端口），再点一下目标输入圆点。</li>
+      <li><b>双击端口</b>：双击任意圆点，自动连到最近的可连端口 —— 新手最快。</li>
+    </ol>
+
+    <h3>② 工具栏</h3>
+    <ul>
+      <li><b>⚡ 自动连线</b>：按端口类型 + 左→右位置，一次把该连的都连上。</li>
+      <li><b>◨ 连线 N</b>：右下角列出每条线「节点.端口 → 节点.端口」，可定位、断开、全部断开。</li>
+      <li><b>▤ 自动布局</b>：按连线方向排成左→右几列；<b>⛶ 看全图</b>：缩放到看见全部节点。</li>
+      <li><b>↶ / ↷</b>：撤销 / 重做（<kbd>Ctrl</kbd>+<kbd>Z</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd>）。</li>
+    </ul>
+
+    <h3>③ 颜色与提示</h3>
+    <ul>
+      <li>线的颜色按目标端口：<b style="color:#5fe3c8">文本=青</b>、<b style="color:#7bd1ff">提示词=蓝</b>、
+          <b style="color:#a78bfa">图片=紫</b>、<b style="color:#f5a623">视频=橙</b>；中点写着端口名。</li>
+      <li>悬停线变红、点击选中变金黄；右下角面板里点一条会白闪定位。</li>
+      <li>拖动节点吸附 10px 网格；画布自动存档，刷新会自动恢复。</li>
+      <li>执行前如果有输入端口没接线，会先列出来让你确认。</li>
+    </ul>
+
+    <div class="guide-demo">
+      <span>第一次用？让画布自己搭一个「文本 → AI 推理 → 视频生成」给你看。</span>
+      <button id="guideDemo" onclick="playDemo()">▶ 播放演示</button>
+    </div>
+    <div class="hint">演示会替换当前画布（之后可以点 ↶ 撤销回来）。演示只搭流程，不会提交生成、不消耗额度。</div>
+    <div class="foot"><button class="secondary" onclick="hideGuide()">知道了</button></div>
+  </div>
+</div>
+
+<!-- 空画布欢迎条 -->
+<div class="canvas-welcome" id="canvasWelcome">
+  <span>👋 先拖一个节点进来，或者 <b>双击端口</b> 自动连线。不会用？</span>
+  <button class="primary" onclick="playDemo()">▶ 看演示</button>
+  <button onclick="showGuide()">❔ 使用说明</button>
+  <button class="x" onclick="dismissWelcome()" title="关掉">×</button>
 </div>
 
 <!-- 提示 -->
@@ -927,6 +1008,80 @@ function scheduleAutosave() {
     _autosaveTimer = setTimeout(saveLocal, 500);
 }
 
+// ==================== 使用说明 / 30 秒演示 ====================
+let _demoSeq = 0;
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+function showGuide() { document.getElementById('guideModal').classList.add('show'); }
+function hideGuide() { document.getElementById('guideModal').classList.remove('show'); }
+function dismissWelcome() {
+    const el = document.getElementById('canvasWelcome');
+    if (el) el.style.display = 'none';
+    try { sessionStorage.setItem('dola_welcome_off', '1'); } catch (e) {}
+}
+function updateWelcome() {
+    const el = document.getElementById('canvasWelcome');
+    if (!el) return;
+    let off = false;
+    try { off = sessionStorage.getItem('dola_welcome_off') === '1'; } catch (e) {}
+    el.style.display = (!nodes.length && !off) ? 'flex' : 'none';
+}
+
+// 演示：一步步搭出「文本 + 参考图 → AI 推理 → 视频生成」，每步都有提示。
+// 只搭流程，不提交生成、不消耗额度。
+async function playDemo() {
+    const seq = ++_demoSeq;
+    hideGuide();
+    const btn = document.getElementById('guideDemo');
+    if (btn) { btn.disabled = true; }
+    try {
+        if (nodes.length && !window.confirm('演示会替换当前画布（之后可以点 ↶ 撤销），继续？')) return;
+        clearCanvas(false);
+        zoom = 0.85; panX = 30; panY = 20; updateTransform();
+
+        toast('演示 1/5：放一个「文本输入」，写入分镜原文');
+        const A = createNode('text_input', 60, 110);
+        updateNodeData(A.id, 'text', '一只橘猫在窗台上打哈欠，午后阳光，镜头缓慢推近');
+        const ta = document.querySelector('#' + A.id + ' textarea');
+        if (ta) ta.value = A.data.text;
+        hideProps();
+        await sleep(900); if (seq !== _demoSeq) return;
+
+        toast('演示 2/5：放一个「AI 推理」，把原文改写成视频提示词');
+        const B = createNode('ai_reason', 460, 110);
+        hideProps();
+        await sleep(800); if (seq !== _demoSeq) return;
+
+        toast('演示 3/5：放一个「图片输入」当参考图（也可以不接）');
+        const C = createNode('image_input', 60, 400);
+        hideProps();
+        await sleep(800); if (seq !== _demoSeq) return;
+
+        toast('演示 4/5：放一个「视频生成」，选 2.5 / 30 秒');
+        const D = createNode('video_gen', 850, 200);
+        updateNodeData(D.id, 'model', 'sd2.5');
+        updateNodeData(D.id, 'duration', 30);
+        hideProps();
+        await sleep(800); if (seq !== _demoSeq) return;
+
+        toast('演示 5/5：连线 —— 看颜色和箭头，中点写着端口名');
+        connectPorts({ nodeId: A.id, port: 'text', type: 'output' },
+                     { nodeId: B.id, port: 'text', type: 'input' });
+        await sleep(650); if (seq !== _demoSeq) return;
+        connectPorts({ nodeId: C.id, port: 'image', type: 'output' },
+                     { nodeId: B.id, port: 'image', type: 'input' });
+        await sleep(650); if (seq !== _demoSeq) return;
+        connectPorts({ nodeId: B.id, port: 'prompt', type: 'output' },
+                     { nodeId: D.id, port: 'input', type: 'input' });
+        await sleep(500); if (seq !== _demoSeq) return;
+
+        fitView();
+        toast('演示完成：4 个节点 / 3 条连线。点「◨ 连线」看清单，点「⚡ 自动连线」还能一键补全');
+    } finally {
+        if (btn) btn.disabled = false;
+    }
+}
+
 // ==================== 撤销 / 重做 ====================
 let _history = [], _future = [], _restoring = false;
 function canvasSnapshot() {
@@ -1070,6 +1225,7 @@ function updateConnections() {
     });
 
     renderConnList();
+    updateWelcome();
     scheduleAutosave();
 }
 

@@ -87,14 +87,21 @@ const SHOT = process.env.DOLA_SHOT || '';   // 可选：把渲染后的 HTML 存
 
   // —— 模型体检：时长联动 + 弹窗 + 结果渲染 ——
   const modelSel = $('genModel');
+  out.push(['生成页默认就是 Seedance 2.5 + 30 秒（不用再手动找）',
+            modelSel.value === 'seedance_v2.5' && $('genDuration').value === '30',
+            modelSel.value + ' / ' + $('genDuration').value + 's']);
+  out.push(['模型下拉写的是官方名字（Dreamina Seedance 2.5）',
+            /Dreamina Seedance 2\.5/.test(modelSel.options[modelSel.selectedIndex].textContent),
+            modelSel.options[modelSel.selectedIndex].textContent]);
   modelSel.value = 'seedance_v2.5';
   modelSel.dispatchEvent(new w.Event('change', { bubbles: true }));
   const d25 = Array.from($('genDuration').options).map(o => o.value).join(',');
-  out.push(['选 v2.5 时时长只剩 10/30 秒（不会被后端悄悄改成别的）', d25 === '10,30', d25]);
+  out.push(['选 v2.5 时时长只剩 30/10 秒，且默认 30 秒',
+            d25 === '30,10' && $('genDuration').value === '30', d25 + ' / 当前 ' + $('genDuration').value]);
   modelSel.value = 'seedance_v2.0';
   modelSel.dispatchEvent(new w.Event('change', { bubbles: true }));
   const d20 = Array.from($('genDuration').options).map(o => o.value).join(',');
-  out.push(['选 v2.0 时时长恢复 5/10/15 秒', d20 === '5,10,15', d20]);
+  out.push(['选 v2.0 时时长恢复 10/15/5 秒', d20 === '10,15,5', d20]);
 
   $('genProbe').dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
   await new Promise(r => setTimeout(r, 300));

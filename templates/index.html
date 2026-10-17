@@ -475,8 +475,11 @@ async function pageGenerate(){
       '<label class="f">提示词（每行一条）</label>' +
       '<textarea id="genPrompt" style="min-height:180px" placeholder="例：9:16 竖屏，女孩在雨后街道回头，霓虹倒影，慢动作水花，电影级光影，8K 超清"></textarea>' +
       '<div class="grid g4" style="margin-top:12px">' +
-        '<div><label class="f">模型</label><select id="genModel"><option>seedance_v2.0</option><option>seedance_v2.5</option></select></div>' +
-        '<div><label class="f">时长</label><select id="genDuration"><option>10</option><option>15</option><option>30</option><option>5</option></select></div>' +
+        '<div><label class="f">模型</label><select id="genModel">' +
+          '<option value="seedance_v2.5">Dreamina Seedance 2.5 · 30 秒（推荐）</option>' +
+          '<option value="seedance_v2.0">Dreamina Seedance 2.0 Fast · 5/10/15 秒</option>' +
+        '</select></div>' +
+        '<div><label class="f">时长</label><select id="genDuration"><option>30</option><option>10</option></select></div>' +
         '<div><label class="f">比例</label><select id="genRatio"><option>9:16</option><option>16:9</option><option>1:1</option></select></div>' +
         '<div><label class="f">画质</label><select id="genQuality"><option>720p</option><option>1080p</option><option>480p</option></select></div>' +
       '</div>' +
@@ -513,19 +516,21 @@ async function pageGenerate(){
   };
   paintRefs();
   // 2.5 只支持 10/30 秒，2.0 支持 5/10/15 —— 选错会被后端悄悄改掉，这里直接限制，别让人猜
-  const syncDurations = () => {
+  const syncDurations = (reset) => {
     const model = $('genModel').value;
-    const allowed = model === 'seedance_v2.5' ? ['10', '30'] : ['5', '10', '15'];
+    const allowed = model === 'seedance_v2.5' ? ['30', '10'] : ['10', '15', '5'];
     const sel = $('genDuration');
-    const keep = sel.value;
+    const keep = reset ? '' : sel.value;
     sel.innerHTML = allowed.map(v => '<option>' + v + '</option>').join('');
-    sel.value = allowed.indexOf(keep) >= 0 ? keep : allowed[0];
+    // 2.5 默认直接给 30 秒（官方最长）；2.0 默认 10 秒
+    sel.value = allowed.indexOf(keep) >= 0 ? keep : (model === 'seedance_v2.5' ? '30' : '10');
     const hint = $('genHint');
     if (hint) hint.textContent = model === 'seedance_v2.5'
-      ? 'v2.5 只支持 10 / 30 秒' : 'v2.0 支持 5 / 10 / 15 秒';
+      ? '已选 Dreamina Seedance 2.5 · 30 秒（v2.5 只支持 10 / 30 秒）'
+      : '已选 Dreamina Seedance 2.0 Fast（支持 5 / 10 / 15 秒）';
   };
-  $('genModel').onchange = syncDurations;
-  syncDurations();
+  $('genModel').onchange = () => syncDurations(true);
+  syncDurations(false);
 
   $('genProbe').onclick = () => probeModel();
 
@@ -684,8 +689,8 @@ async function probeModel(){
     '<div class="grid g2">' +
       '<div><label class="f">账号</label><select id="probeAccount">' + opts + '</select></div>' +
       '<div><label class="f">模型</label><select id="probeModel">' +
-        '<option value="seedance_v2.5"' + (model === 'seedance_v2.5' ? ' selected' : '') + '>seedance_v2.5</option>' +
-        '<option value="seedance_v2.0"' + (model === 'seedance_v2.0' ? ' selected' : '') + '>seedance_v2.0</option>' +
+        '<option value="seedance_v2.5"' + (model === 'seedance_v2.5' ? ' selected' : '') + '>Dreamina Seedance 2.5</option>' +
+        '<option value="seedance_v2.0"' + (model === 'seedance_v2.0' ? ' selected' : '') + '>Dreamina Seedance 2.0 Fast</option>' +
       '</select></div>' +
     '</div>' +
     '<p class="muted" style="font-size:12.5px;margin-top:10px">依次检查：生成核心 → 网络(DNS/TCP/TLS) → 站点与登录态 → 提交端点。' +
@@ -711,10 +716,24 @@ async function probeModel(){
           (s.hint ? '<div style="color:#f5c76b;font-size:11.5px">↳ ' + esc(s.hint) + '</div>' : '') +
           '</td></tr>';
       }).join('');
+      const realStep = (r.steps || []).find(s => s.name === '真实提交');
+      const hardFail = (r.steps || []).some(s => s.ok === false);
+      // 端点用 GET 确认不了时（ok=null），直接给一个「真实提交一次」按钮，
+      // 不用再让用户回去找勾选框 —— 这是唯一能 100% 确认的步骤。
+      const canReal = realStep && realStep.ok === null && !hardFail && !r.demo;
       $('probeResult').innerHTML =
         '<div class="panel" style="margin:0;padding:12px"><div style="font-size:13.5px;font-weight:600;margin-bottom:8px">' +
           esc(r.verdict || '') + '</div>' +
-        '<div class="scroll-x"><table style="font-size:13px"><tbody>' + rows + '</tbody></table></div></div>';
+        '<div class="scroll-x"><table style="font-size:13px"><tbody>' + rows + '</tbody></table></div>' +
+        (canReal ? '<div style="margin-top:12px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">' +
+          '<button class="btn primary" id="probeRealNow">🚀 真实提交一次，确认接口</button>' +
+          '<span class="dim" style="font-size:12px">会真的提交一个 10 秒任务（消耗一次额度、账号里多一条会话）</span></div>' : '') +
+        '</div>';
+      if ($('probeRealNow')) $('probeRealNow').onclick = () => {
+        if (!window.confirm('会真的提交一个 10 秒任务，消耗一次额度（账号里会多一条会话）。继续？')) return;
+        $('probeReal').checked = true;
+        $('probeRun').click();
+      };
     } catch(e){
       $('probeResult').innerHTML = '<div class="badge bad">体检失败：' + esc(e.message) + '</div>';
     } finally {

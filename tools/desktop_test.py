@@ -761,6 +761,7 @@ def network_checks():
             self.NavigationCompleted = _Evt()
             self.script_result = script_result
             self.script_calls = 0
+            self.script_texts = []
 
         def complete(self, url="https://www.dola.com/chat/", ok=True, http=200, err="WebErrorStatus.UnexpectedError"):
             class Sender:
@@ -783,6 +784,7 @@ def network_checks():
 
         def ExecuteScriptAsync(self, js):
             self.script_calls += 1
+            self.script_texts.append(js)
             result = self.script_result
 
             class Task:                      # 结果直接可用（不做真异步）
@@ -834,7 +836,9 @@ def network_checks():
               p2["nav_ok"] is True and p2["js_ok"] is True
               and desktop._judge_page_state(p2)[0] is True, desktop._judge_page_state(p2)[1])
         check("JS 探针走的是内核的 ExecuteScriptAsync（不是 pywebview 的 evaluate_js）",
-              core.script_calls == 1, core.script_calls)
+              any("html_len" in t for t in core.script_texts), core.script_calls)
+        check("真站加载完会顺带注入「生成助手」小条（同一条内核通道）",
+              any("__DLP_HELPER__" in t for t in core.script_texts), len(core.script_texts))
 
         # 脚本通道坏掉（返回 null）→ 只记一笔，绝不能挂住
         core2 = NavCore(script_result=None)

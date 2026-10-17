@@ -238,6 +238,27 @@ const BASE = process.env.DOLA_BASE || 'http://127.0.0.1:8000';
   const sx = w.eval("nodes[0].x"), sy = w.eval("nodes[0].y");
   out.push(['拖动时节点吸附到 10px 网格（不会歪）',
             Number.isFinite(sx) && sx % 10 === 0 && sy % 10 === 0, 'x=' + sx + ' y=' + sy]);
+
+  // —— 场景 19：使用说明 + 30 秒演示 ——
+  d.getElementById('guideBtn').dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+  const guide = d.getElementById('guideModal');
+  out.push(['点「使用说明」会弹出图文说明',
+            guide.classList.contains('show') &&
+            /双击端口/.test(guide.textContent) && /自动连线/.test(guide.textContent) &&
+            /Ctrl/.test(guide.textContent),
+            guide.classList.contains('show') ? '弹窗已打开' : '没打开']);
+
+  w.eval('playDemo()');
+  await new Promise(r => setTimeout(r, 6500));
+  out.push(['「播放演示」会自动搭出 4 个节点 / 3 条连线',
+            w.eval('nodes.length') === 4 && w.eval('connections.length') === 3,
+            w.eval('nodes.length') + ' 节点 / ' + w.eval('connections.length') + ' 连线']);
+  out.push(['演示搭出来的连线是可见的（带标签/箭头）',
+            d.querySelectorAll('#connLayer path.conn').length === 3 &&
+            d.querySelectorAll('#connLayer text.conn-label').length === 3,
+            d.querySelectorAll('#connLayer path.conn').length + ' 条']);
+  out.push(['演示结束后自动收起说明弹窗', !guide.classList.contains('show'), '']);
+  out.push(['画布不为空时，欢迎条自动隐藏', d.getElementById('canvasWelcome').style.display === 'none', '']);
   out.push(['无 JS 错误', errors.length === 0, errors.slice(0, 2).join(' | ')]);
   void toasts;
 

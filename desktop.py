@@ -810,6 +810,26 @@ def _hint_for_nav_error(code: str) -> str:
     return _NAV_ERROR_HINTS.get(name, "内核报的错误码：%s" % name)
 
 
+_HELPER_JS_CACHE = {"text": None}
+
+
+def _site_helper_js() -> str:
+    """账号网页里的「生成助手」小条（static/dola_helper.js）。
+
+    只在 dola.com 页面生效（脚本自己判断 host），注入失败也不影响页面。
+    """
+    if _HELPER_JS_CACHE["text"] is not None:
+        return _HELPER_JS_CACHE["text"]
+    try:
+        path = os.path.join(HERE, "static", "dola_helper.js")
+        with open(path, "r", encoding="utf-8") as f:
+            _HELPER_JS_CACHE["text"] = f.read()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[desktop] 读取生成助手脚本失败（不影响网页）：{exc}")
+        _HELPER_JS_CACHE["text"] = ""
+    return _HELPER_JS_CACHE["text"]
+
+
 def _install_page_probe(window, log=print, state: dict = None) -> dict:
     """在 UI 线程上装两样东西：.NET 的导航事件监听 + 一个不依赖 pywebview 的 JS 探针。
 
@@ -871,6 +891,16 @@ def _install_page_probe(window, log=print, state: dict = None) -> dict:
                     except Exception:  # noqa: BLE001
                         pass
                     state["done"] = True
+                    # 真站页面加载完 → 注入「生成助手」小条（纯 DOM，不碰 pywebview 桥）。
+                    # 不在 UI 线程等结果；注入失败就算了，页面照常用。
+                    try:
+                        _js = _site_helper_js()
+                        if _js:
+                            _c = _read_core()
+                            if _c is not None:
+                                _c.ExecuteScriptAsync(_js)
+                    except Exception:  # noqa: BLE001
+                        pass
 
                 core.NavigationStarting += on_started
                 core.NavigationCompleted += on_done

@@ -55,7 +55,7 @@ from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
                                RedirectResponse, Response)
 from fastapi.staticfiles import StaticFiles
 
-VERSION = "2.0.14"
+VERSION = "2.0.15"
 
 # --------------------------------------------------------------------------
 # 目录与配置
@@ -1383,7 +1383,10 @@ def _probe_model(account_id, model: str, duration: int, ratio: str, real: bool) 
     steps = []
 
     def add(name, ok, detail, hint=""):
-        steps.append({"name": name, "ok": bool(ok), "detail": detail, "hint": hint})
+        # 注意：ok=None 表示「没做这一步」，不能 bool() 成 False，
+        # 否则界面上会把「没勾真实提交」显示成 ❌，还会污染结论。
+        steps.append({"name": name, "ok": (None if ok is None else bool(ok)),
+                      "detail": detail, "hint": hint})
 
     model = (model or "seedance_v2.5").strip()
     if model not in MODEL_DURATIONS:
@@ -1470,18 +1473,50 @@ def _probe_model(account_id, model: str, duration: int, ratio: str, real: bool) 
         add("站点访问", False, "请求失败：%s" % exc, "网络层刚才是通的，这里失败多半是代理/超时")
 
     # 4) 提交端点还在不在
+    #    注意：GET 404 非常容易误判 —— 不少网关对「只接受 POST」的路由直接回 404。
+    #    所以 404 时再补两次探测：OPTIONS（看 Allow 头）和去掉查询串的同路径 GET。
     endpoint_ok = None
     if submit_url:
         try:
-            r2 = session.get(submit_url, headers={
+            send_headers = {
                 "User-Agent": ua, "Cookie": cookie, "Accept": "*/*",
                 "Origin": "https://www.dola.com", "Referer": "https://www.dola.com/chat/",
-            }, timeout=20, allow_redirects=False)
+            }
+            r2 = session.get(submit_url, headers=send_headers, timeout=20, allow_redirects=False)
             code = r2.status_code
             if code == 404:
-                endpoint_ok = False
-                add("提交端点", False, "HTTP 404：提交地址可能变了（接口改版）",
-                    "把这一条发我，我按新接口改")
+                allow = ""
+                opt_code = None
+                bare_code = None
+                try:
+                    o = session.options(submit_url, headers=send_headers, timeout=15, allow_redirects=False)
+                    opt_code = o.status_code
+                    allow = str(o.headers.get("Allow") or "")
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    bare = submit_url.split("?", 1)[0]
+                    rb = session.get(bare, headers=send_headers, timeout=15, allow_redirects=False)
+                    bare_code = rb.status_code
+                except Exception:  # noqa: BLE001
+                    pass
+                route_alive = (
+                    opt_code in (200, 204, 301, 302, 400, 405, 415, 422, 429)
+                    or "POST" in allow.upper()
+                    or bare_code in (200, 204, 301, 302, 400, 401, 403, 405, 415, 422, 429)
+                )
+                extra = "（OPTIONS=%s%s；去查询串 GET=%s）" % (
+                    opt_code, ("，Allow: " + allow[:60]) if allow else "", bare_code)
+                if route_alive:
+                    endpoint_ok = True
+                    add("提交端点", True,
+                        "HTTP 404 只说明这条路由不接受 GET，探测到它仍然存在 %s" % extra,
+                        "端点本身没问题；要确认能生成，勾选「真实提交一次」")
+                else:
+                    endpoint_ok = None
+                    add("提交端点", None,
+                        "GET 返回 404，OPTIONS / 同路径也探测不到 %s —— 可能只收 POST，也可能是接口改版" % extra,
+                        "先在网页里手动生成一次：能出片就说明没改版；一直失败就把这条发我")
             elif code in (401, 403):
                 endpoint_ok = False
                 add("提交端点", False, "HTTP %d：登录态被拒" % code, "重新导入 Cookie")
@@ -1521,6 +1556,10 @@ def _probe_model(account_id, model: str, duration: int, ratio: str, real: bool) 
         verdict = ("✅ 四层都通过了（网络 / 登录态 / 端点都在），%s 看起来可用；"
                    "想 100%% 确认就勾选「真实提交一次」" % model)
         ok = True
+    elif endpoint_ok is None and not any(s["ok"] is False for s in steps):
+        verdict = ("⚠️ 网络、登录态都正常，但提交端点用 GET 确认不了（多数网关只允许 POST）；"
+                   "这不代表接口坏了 —— 勾选「真实提交一次」就能一锤定音")
+        ok = None
     else:
         bad = [s["name"] for s in steps if s["ok"] is False]
         verdict = "❌ 有问题的是：%s —— 不是模型本身的问题，先按上面每条的提示处理" % "、".join(bad)
