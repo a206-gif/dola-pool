@@ -90,14 +90,14 @@ const SHOT = process.env.DOLA_SHOT || '';   // 可选：把渲染后的 HTML 存
   out.push(['生成页默认是能用的 Dreamina Seedance 2.0 Fast + 10 秒',
             modelSel.value === 'seedance_v2.0' && $('genDuration').value === '10',
             modelSel.value + ' / ' + $('genDuration').value + 's']);
-  out.push(['2.5 还在选项里，但明确标注「多数账号调不到」',
-            /Seedance 2\.5/.test(modelSel.textContent) && /调不到/.test(modelSel.textContent),
+  out.push(['2.5 还在选项里，并标注「🧩 扩展内核」',
+            /Seedance 2\.5/.test(modelSel.textContent) && /扩展内核/.test(modelSel.textContent),
             modelSel.textContent.replace(/\s+/g, ' ').slice(0, 80)]);
   modelSel.value = 'seedance_v2.5';
   modelSel.dispatchEvent(new w.Event('change', { bubbles: true }));
   const d25 = Array.from($('genDuration').options).map(o => o.value).join(',');
-  out.push(['选 v2.5 时时长只剩 30/10 秒，并给出「多数账号调不到」警告',
-            d25 === '30,10' && /调不到/.test(($('genHint') || {}).textContent || ''),
+  out.push(['选 v2.5 时时长只剩 30/10 秒，并说明走扩展内核',
+            d25 === '30,10' && /扩展内核/.test(($('genHint') || {}).textContent || ''),
             d25 + ' / ' + (($('genHint') || {}).textContent || '').slice(0, 40)]);
   modelSel.value = 'seedance_v2.0';
   modelSel.dispatchEvent(new w.Event('change', { bubbles: true }));

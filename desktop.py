@@ -27,6 +27,7 @@ import json
 import logging
 import logging.handlers
 import os
+import re
 import platform
 import select
 import shutil
@@ -1304,6 +1305,7 @@ class Control:
         self.net_note = ""          # 内核网络说明（代理还是直连），写进诊断页
         self.net_info = {}          # 内核网络细节（含 proxy_arg，真实浏览器窗口沿用同一个代理）
         self._browser_sessions = {} # account_id → 带扩展的外部浏览器会话（debug_port / pid / profile）
+        self._browser_gen_lock = threading.Lock()  # 同一时间只驱动一个窗口，免得抢焦点
         self.demo = False           # 演示模式：账号窗口不碰真站，走本机代理页
 
     def __call__(self, action: str, payload=None) -> None:
@@ -1319,6 +1321,9 @@ class Control:
             return
         if action == "account_browser":
             self.account_browser(payload or {})
+            return
+        if action == "browser_generate":
+            self.browser_generate(payload or {})
             return
         if action == "open_external":
             # 账号窗口里的「用系统浏览器打开」：走本机 HTTP 端点进来，不经任何 JS 桥
@@ -1446,6 +1451,90 @@ class Control:
                         pass
         print("[desktop] 扩展窗口 %s：%s" % (action, "成功" if result.get("ok") else result.get("error")))
         return result
+
+    # ---------------- 扩展内核：在带扩展的浏览器里提交 2.5 / 30 秒 ----------------
+    def browser_generate(self, payload: dict) -> None:
+        """后端任务线程调进来：页面自己带扩展提交，返回 conversation_id。
+
+        为什么不用生成核心直接提交 2.5/30：Dola 会对「账号没开放的能力」回
+        「只支持 4~15 秒」，而 30 秒入口本来就只有网页端扩展改写能力配置后才出现。
+        所以这一段必须由真浏览器完成；提交之后的轮询/下载仍走原来那套。
+        """
+        payload = payload or {}
+        out = payload.get("out")
+        account_id = int(payload.get("account_id") or 0)
+        result = {"ok": False, "error": "", "conversation_id": ""}
+        if not account_id:
+            result["error"] = "没有指定账号"
+            if isinstance(out, dict):
+                out.update(result)
+            return
+        with self._browser_gen_lock:
+            try:
+                sess = self._browser_sessions.get(account_id)
+                port = int((sess or {}).get("port") or 0)
+                if not port or not cdp_ready(port):
+                    # 软件重启后浏览器可能还活着：固定端口 / 上次记的端口都试一遍
+                    port = 0
+                    for candidate in (account_debug_port(account_id),
+                                      int((sess or {}).get("port") or 0)):
+                        if candidate and cdp_ready(candidate):
+                            port = candidate
+                            break
+                    if port:
+                        self._browser_sessions[account_id] = {
+                            "port": port, "browser": "", "recovered": True,
+                            "started_at": time.time(),
+                        }
+                        print("[desktop] 接上还开着的扩展窗口（端口 %d）" % port)
+                        self._session_note(account_id, "running")
+                    else:
+                        proxy_arg = str((getattr(self, "net_info", {}) or {}).get("proxy_arg") or "")
+                        launched = launch_account_browser(account_id, "about:blank",
+                                                          proxy_arg=proxy_arg,
+                                                          debug_port=port)
+                        if not launched.get("ok"):
+                            result["error"] = launched.get("error") or "启动带扩展的浏览器失败"
+                            if isinstance(out, dict):
+                                out.update(result)
+                            return
+                        port = int(launched.get("debug_port") or port)
+                        # 冷启动的 Edge 把调试端口开出来要几秒，别抢跑
+                        if not wait_cdp(port, 15):
+                            result["error"] = ("这个账号的浏览器已经开着，但不是本程序启动的"
+                                               "（连不上调试端口）。把它关掉再试一次。")
+                            if isinstance(out, dict):
+                                out.update(result)
+                            return
+                        self._browser_sessions[account_id] = {
+                            "port": port, "pid": launched.get("pid"),
+                            "browser": launched.get("browser"),
+                            "profile": launched.get("profile"),
+                            "browser_version": launched.get("browser_version"),
+                            "extensions": launched.get("extensions") or [],
+                            "started_at": time.time(),
+                        }
+                        self._session_note(account_id, "running")
+                # 拉到前台：contenteditable 的 insertText 在后台窗口里偶尔会丢
+                browser_window_action(port, "activate")
+                result = run_browser_generation(
+                    port,
+                    prompt=str(payload.get("prompt") or ""),
+                    cookie=str(payload.get("cookie") or ""),
+                    model=str(payload.get("model") or "seedance_v2.5"),
+                    duration=int(payload.get("duration") or 30),
+                    ratio=str(payload.get("ratio") or "9:16"),
+                    log=lambda msg: print("[desktop] " + str(msg)),
+                )
+                if result.get("ok"):
+                    self._session_note(account_id, "running")
+                    # 提交完就把窗口收进后台：轮询在服务里做，不需要它一直挡在前面
+                    browser_window_action(port, "park")
+            except Exception as exc:  # noqa: BLE001
+                result = {"ok": False, "error": "扩展内核异常：%s" % exc}
+        print("[desktop] 扩展内核提交：%s" % ("成功" if result.get("ok") else result.get("error")))
+        if isinstance(out, dict):
+            out.update(result)
 
     def session(self, payload: dict) -> None:
         """账号窗口的会话指令入口（由后端 /api/accounts/{id}/session 触发）。"""
@@ -2358,6 +2447,253 @@ def browser_window_action(port: int, action: str) -> dict:
         return out
 
 
+class _CdpPage:
+    """页面级 CDP 会话：能执行 JS / 导航 / 写 Cookie。
+
+    和 _Cdp 的区别：_Cdp 连的是浏览器级端点（只能管窗口），
+    Runtime.evaluate 必须连「具体某个标签页」的 webSocketDebuggerUrl。
+    """
+
+    def __init__(self, ws_url: str, timeout: float = 30.0):
+        self.sock = _CdpSocket(ws_url, timeout=timeout)
+        self._id = 0
+        self.timeout = timeout
+
+    def call(self, method: str, params: dict = None, timeout: float = None) -> dict:
+        self._id += 1
+        msg_id = self._id
+        self.sock.send_text(json.dumps({"id": msg_id, "method": method,
+                                        "params": params or {}}, ensure_ascii=False))
+        old = self.sock.sock.gettimeout()
+        self.sock.sock.settimeout(timeout or self.timeout)
+        try:
+            while True:
+                data = json.loads(self.sock.recv_text() or "{}")
+                if data.get("id") != msg_id:
+                    continue
+                if data.get("error"):
+                    raise RuntimeError(data["error"].get("message") or "CDP 调用失败")
+                return data.get("result") or {}
+        finally:
+            try:
+                self.sock.sock.settimeout(old)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def eval(self, expression: str, timeout: float = None, await_promise: bool = True):
+        """在页面里执行 JS 并把结果按值取回（dict / str / bool / None）。"""
+        result = self.call("Runtime.evaluate", {
+            "expression": expression,
+            "returnByValue": True,
+            "awaitPromise": bool(await_promise),
+            "userGesture": True,
+            "timeout": int((timeout or self.timeout) * 1000),
+        }, timeout=timeout)
+        if result.get("exceptionDetails"):
+            detail = result["exceptionDetails"]
+            text = (detail.get("exception") or {}).get("description") or detail.get("text") or "JS 执行异常"
+            raise RuntimeError(str(text).split("\n")[0][:300])
+        return (result.get("result") or {}).get("value")
+
+    def close(self) -> None:
+        self.sock.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+def _http_new_page(port: int, url: str = "about:blank", timeout: float = 5.0):
+    """新建标签页（新版 Chromium 要求 PUT /json/new）。失败返回 None。"""
+    try:
+        req = urllib.request.Request(
+            "http://127.0.0.1:%d/json/new?%s" % (int(port), urllib.parse.quote(url, safe="")),
+            method="PUT")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8", "replace") or "null")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def page_targets(port: int) -> list:
+    pages = _http_json(port, "/json/list", timeout=3) or []
+    return [t for t in pages if t.get("type") == "page" and t.get("webSocketDebuggerUrl")]
+
+
+def choose_page_target(port: int, create: bool = True):
+    """优先用已经打开的 dola.com 标签页，没有就用第一个页面，再没有就新建。"""
+    pages = page_targets(port)
+    for page in pages:
+        if "dola.com" in str(page.get("url") or ""):
+            return page
+    if pages:
+        return pages[0]
+    if create:
+        return _http_new_page(port)
+    return None
+
+
+def _cookie_entries(cookie_header: str, domain: str = ".dola.com") -> list:
+    """把 "a=1; b=2" 的 CK 拆成 CDP Network.setCookies 要的结构。
+
+    域统一写 .dola.com：CK 里很多条目本来没带 Domain，落到 host-only 会
+    出现「写进去了但 www.dola.com 读不到」。
+    """
+    out = []
+    for part in str(cookie_header or "").split(";"):
+        if "=" not in part:
+            continue
+        name, value = part.split("=", 1)
+        name, value = name.strip(), value.strip()
+        if not name or any(ch in name for ch in " \t\r\n"):
+            continue
+        out.append({"name": name, "value": value, "domain": domain,
+                    "path": "/", "secure": True})
+    return out
+
+
+def _kernel_source() -> str:
+    """扩展内核 JS（static/browser_kernel.js）。打包后同样在程序目录里。"""
+    path = os.path.join(HERE, "static", "browser_kernel.js")
+    with open(path, "r", encoding="utf-8") as fh:
+        return fh.read()
+
+
+def run_browser_generation(port: int, prompt: str, cookie: str = "",
+                           model: str = "seedance_v2.5", duration: int = 30,
+                           ratio: str = "9:16", log=print) -> dict:
+    """用「带扩展的账号浏览器」提交一次 2.5 / 30 秒任务。
+
+    做的事：把页面调到 视频生成 + 2.5 + 时长 + 比例，写入提示词并点发送，
+    然后旁路读出 conversation_id 交给生成核心去轮询下载。
+    生成核心（gen/dola_gen_clean.py）一行不改 —— 它只负责「提交之后」那段。
+    """
+    out = {"ok": False, "error": "", "conversation_id": "", "status": {},
+           "steps": [], "page_url": ""}
+    page = choose_page_target(port)
+    if not page:
+        out["error"] = "这个账号的浏览器没有可用的标签页"
+        return out
+    try:
+        with _CdpPage(page["webSocketDebuggerUrl"], timeout=30) as cdp:
+            cdp.call("Page.enable")
+            cdp.call("Runtime.enable")
+            if cookie:
+                cdp.call("Network.enable")
+                cookies = _cookie_entries(cookie)
+                if cookies:
+                    cdp.call("Network.setCookies", {"cookies": cookies}, timeout=10)
+                    log("[扩展内核] 已写入 %d 条 Cookie（不经过剪贴板）" % len(cookies))
+            # 每次导航都要重新注入：内核要在 document_start 就挂上 fetch/XHR 钩子
+            cdp.call("Page.addScriptToEvaluateOnNewDocument", {"source": _kernel_source()})
+            cdp.call("Page.navigate", {"url": "https://www.dola.com/chat/"}, timeout=20)
+
+            deadline = time.time() + 35
+            ready = False
+            while time.time() < deadline:
+                try:
+                    href = str(cdp.eval("String(location.href)", timeout=8) or "")
+                    state = str(cdp.eval("String(document.readyState)", timeout=8) or "")
+                except Exception:  # noqa: BLE001
+                    time.sleep(0.4)
+                    continue
+                out["page_url"] = href
+                if "dola.com" in href and state in ("interactive", "complete"):
+                    ready = True
+                    break
+                time.sleep(0.4)
+            if not ready:
+                out["error"] = "页面没打开（当前地址：%s）" % (out["page_url"] or "空")
+                return out
+            if "/login" in out["page_url"]:
+                out["error"] = ("这个账号的浏览器被踢到登录页了：CK 可能已失效。"
+                                "先在账号池点【🌐 网页】手动登录一次，再回来生成。")
+                return out
+
+            # 等内核挂上（导航后立即执行，一般 <1 秒）
+            kernel_ok = False
+            for _ in range(40):
+                try:
+                    if cdp.eval("!!(window.__dolaPoolKernel && window.__dolaPoolKernel.prepare)", timeout=5):
+                        kernel_ok = True
+                        break
+                except Exception:  # noqa: BLE001
+                    pass
+                time.sleep(0.25)
+            if not kernel_ok:
+                out["error"] = "页面内核没加载起来（可能被站点 CSP/跳转打断）"
+                return out
+
+            spec = {"model": model, "duration": int(duration), "ratio": ratio,
+                    "reset": True}
+            log("[扩展内核] 开始调页面：%s / %ss / %s" % (model, duration, ratio))
+            prep = cdp.eval("window.__dolaPoolKernel.prepare(%s)"
+                            % json.dumps(spec, ensure_ascii=False), timeout=90)
+            if not isinstance(prep, dict) or not prep.get("ok"):
+                detail = (prep or {}).get("error") if isinstance(prep, dict) else "页面没有返回结果"
+                out["steps"] = (prep or {}).get("steps") or []
+                out["error"] = "页面没切到目标档位：%s" % (detail or "未知原因")
+                out["status"] = (prep or {}).get("status") or {}
+                body = str(out["status"].get("body") or "")
+                if "登录" in body or "扫码" in body:
+                    out["error"] = ("页面停在登录界面：这个账号的 CK 可能已失效。"
+                                    "先在账号池点【🌐 网页】手动登录一次，再回来生成。")
+                else:
+                    hint = _prepare_hint(out["steps"])
+                    if hint:
+                        out["error"] += "；" + hint
+                return out
+            log("[扩展内核] 档位就绪：%s" % json.dumps(
+                {k: (prep.get("status") or {}).get(k) for k in ("model", "duration", "ratio")},
+                ensure_ascii=False))
+
+            sub = cdp.eval("window.__dolaPoolKernel.submit(%s)"
+                           % json.dumps(prompt, ensure_ascii=False), timeout=40)
+            if not isinstance(sub, dict) or not sub.get("ok"):
+                out["steps"] = (sub or {}).get("steps") or []
+                out["error"] = "发送失败：%s" % ((sub or {}).get("error") or "未知原因")
+                out["status"] = (sub or {}).get("status") or {}
+                return out
+            log("[扩展内核] 已点发送，等 conversation_id…")
+
+            conv = cdp.eval("window.__dolaPoolKernel.waitConversation(150000)", timeout=170)
+            status = (conv or {}).get("status") or {}
+            out["status"] = status
+            out["steps"] = status.get("steps") or []
+            if isinstance(conv, dict) and conv.get("ok"):
+                out.update(ok=True, conversation_id=str(conv.get("id") or ""))
+                log("[扩展内核] 提交成功，conversation_id=%s" % out["conversation_id"])
+            else:
+                snippet = str(status.get("lastCompletionText") or "")[:240]
+                out["error"] = ("发送后没等到 conversation_id（页面可能拒绝了这次请求）"
+                                + ("；服务端返回：" + snippet if snippet else ""))
+            return out
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc)
+        if re.search(r"attach|debugger|session", msg, re.I):
+            msg += ("（这个标签页的调试通道被别的 DevTools / 扩展占用了："
+                    "把那个窗口的 F12 关掉，或在扩展面板里关掉「自动嗅探」再试）")
+        out["error"] = "扩展内核执行失败：%s" % msg
+        return out
+
+
+def _prepare_hint(steps: list) -> str:
+    """把失败步骤翻译成人话，别让人对着「未知原因」猜。"""
+    for item in steps or []:
+        if item.get("ok"):
+            continue
+        name = str(item.get("name") or "")
+        if "30" in str(item.get("name") or "") or "30" in str(item.get("detail") or ""):
+            return "30 秒选项没出现：确认这个窗口是「带扩展」打开的，且扩展没被禁用"
+        if "模型" in name:
+            return "模型菜单里没有 2.5：扩展的能力注入没生效（不是带扩展的窗口）"
+        if "视频生成" in name:
+            return "页面没进视频生成模式：可能还停在普通对话，或页面改版了"
+    return ""
+
+
 def _spawn_detached(cmd: list):
     kwargs = {}
     if platform.system() == "Windows":
@@ -2473,6 +2809,16 @@ def launch_extension_browser(url: str = "https://www.dola.com/chat/",
     info["load_extension_supported"] = supported
     info["warning"] = warn
     return info
+
+
+def account_debug_port(account_id: int) -> int:
+    """每个账号一个固定的调试端口。
+
+    为什么不用 free_port()：软件重启后浏览器还开着，新进程如果换一个端口去连，
+    Chrome 会把「同 profile 再启动」转交给已有实例然后自己退出，新端口根本没开。
+    固定端口就能直接接上还活着的那个窗口。
+    """
+    return 19000 + (int(account_id or 0) % 2000)
 
 
 def account_browser_profile(account_id: int) -> str:

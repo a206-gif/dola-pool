@@ -55,7 +55,7 @@ from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
                                RedirectResponse, Response)
 from fastapi.staticfiles import StaticFiles
 
-VERSION = "2.0.18"
+VERSION = "2.0.19"
 
 # --------------------------------------------------------------------------
 # 目录与配置
@@ -670,6 +670,52 @@ def process_task(task_id: str) -> None:
         log.warning("task %s failed: %s", task_id, msg)
 
 
+def task_channel(task: dict) -> str:
+    """这条任务走哪条提交通道。
+
+    direct    = 生成核心直接 POST /chat/completion（2.0 Fast 走这条，和以前完全一样）
+    extension = 带扩展的浏览器里由页面自己提交（Seedance 2.5 必须走这条）
+
+    为什么 2.5 一定要走浏览器：30 秒 / 2.5 的入口不是接口参数，而是网页端在
+    document_start 改写「能力配置」后才出现的；服务端对没开放的账号直接回
+    「只支持 4~15 秒」。所以只能在真浏览器里让页面自己签名并提交。
+    """
+    model = str(task.get("model") or "seedance_v2.0").strip().lower()
+    if model == "seedance_v2.5":
+        return "extension"
+    return "direct"
+
+
+def _submit_via_browser_kernel(task: dict, cookie: str) -> str:
+    """让带扩展的账号浏览器提交，返回 conversation_id。"""
+    out = {}
+    account_id = task.get("account_id")
+    _update_task(task["id"], progress=18,
+                 result="正在用扩展内核提交（会自己操作带扩展的浏览器窗口）…")
+    _control_hook("browser_generate", {
+        "account_id": account_id,
+        "prompt": task.get("prompt") or "",
+        "model": task.get("model") or "seedance_v2.5",
+        "duration": int(task.get("duration") or 30),
+        "ratio": task.get("ratio") or "9:16",
+        "cookie": cookie,
+        "out": out,
+    })
+    if not out.get("ok"):
+        msg = out.get("error") or "扩展内核提交失败"
+        failed = [s for s in (out.get("steps") or []) if s.get("ok") is False]
+        if failed:
+            detail = "；".join("%s：%s" % (s.get("name"), str(s.get("detail") or "")[:100])
+                              for s in failed[-2:])
+            if detail and detail not in msg:
+                msg += "（" + detail + "）"
+        raise RuntimeError(msg)
+    conv_id = str(out.get("conversation_id") or "").strip()
+    if not conv_id:
+        raise RuntimeError("扩展内核提交后没拿到 conversation_id")
+    return conv_id
+
+
 def _render_task(task: dict, cookie: str) -> dict:
     """真实生成（gen/dola_gen_clean.py）或演示渲染。"""
     if DEMO_MODE:
@@ -687,12 +733,24 @@ def _render_task(task: dict, cookie: str) -> dict:
     model = task.get("model") or "seedance_v2.0"
 
     refs = [p.strip() for p in (task.get("ref_images") or "").split(",") if p.strip()]
-    _update_task(task["id"], progress=20, result="正在提交到 Dola…")
-    conv_id = dgc.submit_video(prompt, ratio, duration, model, cookie, image_paths=refs or None)
-    if not conv_id:
-        raise RuntimeError("提交失败：未返回 conversation_id")
+    channel = task_channel(task)
+    if channel == "extension" and not (DESKTOP_MODE and _control_hook and task.get("account_id")):
+        # 网页版没有本机浏览器可驱动。保持老行为（直连试一次），失败信息照实返回。
+        log.warning("task %s 需要扩展内核，但当前不是桌面版/没有账号，退回直连", task["id"])
+        channel = "direct"
 
-    _update_task(task["id"], progress=35, result="已提交，等待出片…")
+    _update_task(task["id"], progress=20, result="正在提交到 Dola…")
+    if channel == "extension":
+        if refs:
+            log.warning("task %s 走扩展内核，参考图暂不自动上传（请在页面里手动加）", task["id"])
+        conv_id = _submit_via_browser_kernel(task, cookie)
+        _update_task(task["id"], progress=35, result="🧩 扩展内核已提交，等待出片…")
+    else:
+        conv_id = dgc.submit_video(prompt, ratio, duration, model, cookie, image_paths=refs or None)
+        if not conv_id:
+            raise RuntimeError("提交失败：未返回 conversation_id")
+        _update_task(task["id"], progress=35, result="已提交，等待出片…")
+
     name = f"task_{task['id']}"
     video_path = dgc.poll_and_download(conv_id, cookie, OUTPUT_DIR, name, ratio, duration, model)
     if not video_path or not os.path.exists(video_path):

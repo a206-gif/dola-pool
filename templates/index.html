@@ -477,7 +477,7 @@ async function pageGenerate(){
       '<div class="grid g4" style="margin-top:12px">' +
         '<div><label class="f">模型</label><select id="genModel">' +
           '<option value="seedance_v2.0">Dreamina Seedance 2.0 Fast（默认，5/10/15 秒）</option>' +
-          '<option value="seedance_v2.5">Dreamina Seedance 2.5（多数账号调不到，别当默认）</option>' +
+          '<option value="seedance_v2.5">Dreamina Seedance 2.5（30 秒 · 🧩 扩展内核）</option>' +
         '</select></div>' +
         '<div><label class="f">时长</label><select id="genDuration"><option>10</option><option>15</option><option>5</option></select></div>' +
         '<div><label class="f">比例</label><select id="genRatio"><option>9:16</option><option>16:9</option><option>1:1</option></select></div>' +
@@ -525,8 +525,8 @@ async function pageGenerate(){
     sel.value = allowed.indexOf(keep) >= 0 ? keep : (model === 'seedance_v2.5' ? '30' : '10');
     const hint = $('genHint');
     if (hint) hint.textContent = model === 'seedance_v2.5'
-      ? '⚠️ 2.5 大多数账号调不到，先用 2.0 Fast；2.5 只支持 10 / 30 秒'
-      : '已选 Dreamina Seedance 2.0 Fast（支持 5 / 10 / 15 秒）';
+      ? '🧩 2.5 走扩展内核：提交时自动用这个账号的带扩展浏览器，页面自己签名（30 / 10 秒）'
+      : '已选 Dreamina Seedance 2.0 Fast（直连提交，支持 5 / 10 / 15 秒）';
   };
   $('genModel').onchange = () => syncDurations(true);
   syncDurations(false);
@@ -689,7 +689,7 @@ async function probeModel(){
       '<div><label class="f">账号</label><select id="probeAccount">' + opts + '</select></div>' +
       '<div><label class="f">模型</label><select id="probeModel">' +
         '<option value="seedance_v2.0"' + (model === 'seedance_v2.0' ? ' selected' : '') + '>Dreamina Seedance 2.0 Fast</option>' +
-        '<option value="seedance_v2.5"' + (model === 'seedance_v2.5' ? ' selected' : '') + '>Dreamina Seedance 2.5（多数账号调不到）</option>' +
+        '<option value="seedance_v2.5"' + (model === 'seedance_v2.5' ? ' selected' : '') + '>Dreamina Seedance 2.5（🧩 扩展内核）</option>' +
       '</select></div>' +
     '</div>' +
     '<p class="muted" style="font-size:12.5px;margin-top:10px">依次检查：生成核心 → 网络(DNS/TCP/TLS) → 站点与登录态 → 提交端点。' +
@@ -697,9 +697,22 @@ async function probeModel(){
       '那是唯一能 100% 确认模型可用的办法。</p>' +
     '<label class="row" style="gap:8px;font-size:13px;margin-top:6px">' +
       '<input type="checkbox" id="probeReal" style="width:auto"> 真实提交一次（消耗一次额度）</label>' +
+    '<div class="dim" id="probeRealNote" style="font-size:12px;margin-top:4px"></div>' +
     '<div id="probeResult" style="margin-top:12px"></div>' +
     '<div class="foot"><button class="btn" onclick="closeModal()">关闭</button>' +
       '<button class="btn primary" id="probeRun">开始体检</button></div>');
+  // 2.5 的真实提交走的是「扩展内核」（页面自己签名），直连体检对它没有参考价值：
+  // 直连被拒不代表浏览器里也不行，别让人误判成「这个账号不能用 2.5」。
+  const syncProbeReal = () => {
+    const is25 = $('probeModel').value === 'seedance_v2.5';
+    $('probeReal').disabled = is25;
+    if (is25) $('probeReal').checked = false;
+    $('probeRealNote').textContent = is25
+      ? '2.5 由扩展内核提交，这里的「真实提交」走的是直连接口，会得到「只支持 4~15 秒」的误判，已禁用。要试 2.5 请直接在生成页提交。'
+      : '';
+  };
+  $('probeModel').onchange = syncProbeReal;
+  syncProbeReal();
   $('probeRun').onclick = async () => {
     const btn = $('probeRun');
     btn.disabled = true; btn.textContent = '体检中…';
