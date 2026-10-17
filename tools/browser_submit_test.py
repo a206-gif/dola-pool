@@ -326,6 +326,79 @@ def main():
     check("老任务没有 model 字段 → 按 2.0 直连处理",
           webapp.task_channel({"duration": 10}) == "direct")
 
+    # 7) _render_task 真的会为 2.5 切到扩展内核，并且不再碰直连 submit_video
+    tmp_out = tempfile.mkdtemp()
+    webapp.DEMO_MODE = False
+    webapp.PROVIDER_URL = ""
+    webapp.DESKTOP_MODE = True
+
+    class FakeDgc:
+        called = {"submit": 0, "poll": 0}
+
+        @staticmethod
+        def submit_video(*a, **k):
+            FakeDgc.called["submit"] += 1
+            raise AssertionError("2.5 不应该再走直连提交")
+
+        @staticmethod
+        def poll_and_download(conv_id, cookie, output_dir, name, ratio, duration, model):
+            FakeDgc.called["poll"] += 1
+            path = os.path.join(tmp_out, name + ".mp4")
+            with open(path, "wb") as fh:
+                fh.write(b"x" * 16)
+            FakeDgc.conv = conv_id
+            return path
+
+    webapp.load_generator = lambda: (FakeDgc, "")
+    webapp._update_task = lambda *a, **k: None
+    webapp.OUTPUT_DIR = tmp_out
+    hook_calls = []
+
+    def bg_hook(action, payload=None):
+        hook_calls.append((action, dict(payload or {})))
+        (payload or {}).get("out", {}).update(ok=True, conversation_id="7123456789012345678")
+
+    webapp._control_hook = bg_hook
+    task = {"id": "t25", "prompt": "雨夜", "model": "seedance_v2.5", "duration": 30,
+            "ratio": "9:16", "account_id": 3, "ref_images": "", "min_bytes": 0}
+    res = webapp._render_task(task, "a=1")
+    check("2.5 任务：_render_task 调的是 browser_generate，不是直连 submit_video",
+          hook_calls and hook_calls[0][0] == "browser_generate" and FakeDgc.called["submit"] == 0,
+          "hook=%s submit=%s" % ([c[0] for c in hook_calls], FakeDgc.called))
+    check("2.5 任务：浏览器拿到的 conversation_id 交给了轮询/下载",
+          FakeDgc.called["poll"] == 1 and getattr(FakeDgc, "conv", "") == "7123456789012345678",
+          "poll=%s conv=%s" % (FakeDgc.called["poll"], getattr(FakeDgc, "conv", "")))
+    check("2.5 任务：最终产出照常返回给队列", res.get("url", "").startswith("/output/"), res)
+
+    # 2.0 任务仍然直连
+    class Dgc20(FakeDgc):
+        @staticmethod
+        def submit_video(*a, **k):
+            Dgc20.called = getattr(Dgc20, "called", {})
+            Dgc20.submit_called = True
+            return "7000000000000000001"
+
+    webapp.load_generator = lambda: (Dgc20, "")
+    hook_calls.clear()
+    task20 = {"id": "t20", "prompt": "雨夜", "model": "seedance_v2.0", "duration": 10,
+              "ratio": "9:16", "account_id": 3, "ref_images": "", "min_bytes": 0}
+    webapp._render_task(task20, "a=1")
+    check("2.0 任务：仍然直连提交，完全不碰浏览器", not hook_calls and getattr(Dgc20, "submit_called", False),
+          "hook=%s submit=%s" % ([c[0] for c in hook_calls], getattr(Dgc20, "submit_called", False)))
+
+    # 扩展内核失败时，错误要带出来（不能吞成「生成失败」）
+    def fail_hook(action, payload=None):
+        (payload or {}).get("out", {}).update(ok=False, error="时长菜单里没有 30s",
+                                              steps=[{"name": "选择时长 30", "ok": False, "detail": "30s 不在菜单里"}])
+
+    webapp._control_hook = fail_hook
+    try:
+        webapp._render_task(task, "a=1")
+        err = ""
+    except Exception as exc:  # noqa: BLE001
+        err = str(exc)
+    check("扩展内核失败时把页面给的原因带回任务错误", "30s" in err and "选择时长" in err, err)
+
     # 汇总
     bad = 0
     for name, ok, detail in OUT:
