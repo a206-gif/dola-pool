@@ -31,6 +31,7 @@ import platform
 import select
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -1302,6 +1303,7 @@ class Control:
         self._kernel_account = None # 内核 Cookie 里现在是谁的登录态
         self.net_note = ""          # 内核网络说明（代理还是直连），写进诊断页
         self.net_info = {}          # 内核网络细节（含 proxy_arg，真实浏览器窗口沿用同一个代理）
+        self._browser_sessions = {} # account_id → 带扩展的外部浏览器会话（debug_port / pid / profile）
         self.demo = False           # 演示模式：账号窗口不碰真站，走本机代理页
 
     def __call__(self, action: str, payload=None) -> None:
@@ -1368,19 +1370,101 @@ class Control:
             # 这个账号的 profile 里手动装扩展（Chrome 137+ 才需要）
             result = open_extension_manager(profile=account_browser_profile(account_id))
         else:
-            proxy_arg = str((getattr(self, "net_info", {}) or {}).get("proxy_arg") or "")
-            result = launch_account_browser(
-                account_id, str(payload.get("url") or "https://www.dola.com/chat/"),
-                proxy_arg=proxy_arg)
+            sess = self._browser_sessions.get(account_id)
+            if sess and cdp_ready(sess.get("port") or 0):
+                # 已经开着这个账号的扩展窗口：不再开第二个（同 profile 会抢实例），
+                # 直接把它叫到前台；登录态本来就在。
+                brought = browser_window_action(sess["port"], "activate")
+                result = {"ok": bool(brought.get("ok")), "reused": True,
+                          "browser": sess.get("browser") or "",
+                          "browser_version": sess.get("browser_version") or "",
+                          "extensions": sess.get("extensions") or [],
+                          "warning": "", "error": brought.get("error") or ""}
+                if result["ok"]:
+                    self._session_note(account_id, "running")
+            else:
+                proxy_arg = str((getattr(self, "net_info", {}) or {}).get("proxy_arg") or "")
+                result = launch_account_browser(
+                    account_id, str(payload.get("url") or "https://www.dola.com/chat/"),
+                    proxy_arg=proxy_arg)
+                if result.get("ok"):
+                    self._browser_sessions[account_id] = {
+                        "port": result.get("debug_port"), "pid": result.get("pid"),
+                        "browser": result.get("browser"), "profile": result.get("profile"),
+                        "browser_version": result.get("browser_version"),
+                        "extensions": result.get("extensions") or [],
+                        "started_at": time.time(),
+                    }
+                    self._session_note(account_id, "running")
         print("[desktop] 账号扩展窗口：%s" % ("已启动" if result.get("ok") else result.get("error")))
         if isinstance(out, dict):
             out.update(result)
 
     # ---------------- 账号会话：前台打开 / 后台挂起 / 切换 / 关闭 ----------------
+    def _session_note(self, account_id: int, state: str) -> None:
+        """把外部浏览器会话写回给后端（账号池的「窗口」列 / 窗口会话面板靠它）。"""
+        mod = _APP_MODULE
+        if mod is None:
+            return
+        notes = {
+            "running": "带扩展的浏览器 · 前台显示中（30 秒 / 无水印可用）",
+            "parked": "带扩展的浏览器 · 已挂起在后台（页面和登录态都还在）",
+        }
+        try:
+            mod.session_update(account_id, state, notes.get(state, ""),
+                               title="Dola · #%s（扩展窗口）" % account_id, kind="browser")
+        except Exception as exc:  # noqa: BLE001
+            print("[desktop] 回写浏览器会话失败：%s" % exc)
+
+    def browser_session_action(self, account_id: int, action: str) -> dict:
+        """挂起 / 切换 / 关闭 外部浏览器窗口（CDP）。"""
+        sess = self._browser_sessions.get(int(account_id))
+        if not sess:
+            return {"ok": False, "error": "这个账号还没有扩展窗口"}
+        mapping = {"open": "activate", "activate": "activate",
+                   "suspend": "park", "close": "close"}
+        result = browser_window_action(sess.get("port") or 0, mapping.get(action, "activate"))
+        if result.get("ok") and action == "close":
+            self._browser_sessions.pop(int(account_id), None)
+            mod = _APP_MODULE
+            if mod is not None:
+                try:
+                    mod.session_update(int(account_id), "closed")
+                except Exception:  # noqa: BLE001
+                    pass
+        elif result.get("ok"):
+            self._session_note(int(account_id), "parked" if action == "suspend" else "running")
+        else:
+            # 窗口已经不在了（用户自己关了浏览器）→ 清掉会话，别让界面一直显示「运行中」
+            if not (sess and cdp_ready(sess.get("port") or 0)):
+                self._browser_sessions.pop(int(account_id), None)
+                mod = _APP_MODULE
+                if mod is not None:
+                    try:
+                        mod.session_update(int(account_id), "closed")
+                    except Exception:  # noqa: BLE001
+                        pass
+        print("[desktop] 扩展窗口 %s：%s" % (action, "成功" if result.get("ok") else result.get("error")))
+        return result
+
     def session(self, payload: dict) -> None:
         """账号窗口的会话指令入口（由后端 /api/accounts/{id}/session 触发）。"""
         payload = payload or {}
         action = str(payload.get("action") or "open").strip().lower()
+        account_id = payload.get("account_id")
+        try:
+            account_key = int(account_id)
+        except (TypeError, ValueError):
+            account_key = 0
+        kind = str(payload.get("kind") or "").strip().lower()
+        if account_key in self._browser_sessions and kind != "native":
+            self.browser_session_action(account_key, action)
+            return
+        if kind == "native":
+            # 明确要开「原生窗口」：把带扩展的那个先收进后台，免得两个窗口抢同一个账号
+            sess = self._browser_sessions.pop(account_key, None)
+            if sess:
+                browser_window_action(sess.get("port") or 0, "park")
         if action == "close":
             self.close_session(payload.get("account_id"))
             return
@@ -2044,13 +2128,243 @@ def extension_manager_url(exe: str) -> str:
         else "chrome://extensions"
 
 
-def _spawn_detached(cmd: list) -> None:
+# --------------------------------------------------------------------------
+# 外部浏览器（带扩展的 Edge/Chrome）的会话控制
+#
+# 参考「豆啦啦无印浏览器」的做法：每个账号一个独立 profile + 独立进程，
+# 应用侧记住这个实例，用 CDP（DevTools 协议）管它的窗口 ——
+# 最小化 = 挂起（页面还活着、登录态还在），恢复 = 切换过去，Browser.close = 关闭。
+# 这样「后台挂起 / 切换」对带扩展的真实浏览器同样有效。
+# --------------------------------------------------------------------------
+_CDP_TIMEOUT = 6.0
+
+
+def free_port() -> int:
+    sock = socket.socket()
+    try:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+    finally:
+        sock.close()
+
+
+class _CdpSocket:
+    """够 CDP 用的一点点 WebSocket 客户端（RFC6455 文本帧 + 掩码）。
+
+    为什么自己写：不想为了「最小化一个窗口」给桌面版再加一个依赖。
+    Chromium 的 CDP 消息都是小 JSON，分片按最朴素的方式拼。
+    """
+
+    def __init__(self, url: str, timeout: float = _CDP_TIMEOUT):
+        parts = urllib.parse.urlparse(url)
+        self.sock = socket.create_connection((parts.hostname, parts.port or 80), timeout=timeout)
+        self.sock.settimeout(timeout)
+        key = base64.b64encode(os.urandom(16)).decode()
+        path = parts.path or "/"
+        if parts.query:
+            path += "?" + parts.query
+        req = ("GET %s HTTP/1.1\r\nHost: %s:%d\r\nUpgrade: websocket\r\n"
+               "Connection: Upgrade\r\nSec-WebSocket-Key: %s\r\n"
+               "Sec-WebSocket-Version: 13\r\n\r\n"
+               % (path, parts.hostname, parts.port or 80, key))
+        self.sock.sendall(req.encode())
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise RuntimeError("CDP 握手失败：连接被关闭")
+            head += chunk
+        if b"101" not in head.split(b"\r\n")[0]:
+            raise RuntimeError("CDP 握手失败：%s" % head.split(b"\r\n")[0][:80])
+        self._rest = head.split(b"\r\n\r\n", 1)[1]
+
+    def send_text(self, text: str) -> None:
+        data = text.encode("utf-8")
+        header = bytearray([0x81])
+        mask = os.urandom(4)
+        n = len(data)
+        if n < 126:
+            header.append(0x80 | n)
+        elif n < (1 << 16):
+            header.append(0x80 | 126)
+            header += struct.pack(">H", n)
+        else:
+            header.append(0x80 | 127)
+            header += struct.pack(">Q", n)
+        header += mask
+        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+        self.sock.sendall(bytes(header) + masked)
+
+    def _read(self, n: int) -> bytes:
+        while len(self._rest) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise RuntimeError("CDP 连接被关闭")
+            self._rest += chunk
+        out, self._rest = self._rest[:n], self._rest[n:]
+        return out
+
+    def recv_text(self) -> str:
+        while True:
+            b1, b2 = self._read(2)
+            opcode, fin = b1 & 0x0F, b1 & 0x80
+            masked, n = b2 & 0x80, b2 & 0x7F
+            if n == 126:
+                n = struct.unpack(">H", self._read(2))[0]
+            elif n == 127:
+                n = struct.unpack(">Q", self._read(8))[0]
+            mask = self._read(4) if masked else b""
+            payload = self._read(n)
+            if masked:
+                payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+            if opcode == 0x8:
+                raise RuntimeError("CDP 连接被对端关闭")
+            if opcode == 0x9:                     # ping → pong
+                self.sock.sendall(b"\x8a\x80" + os.urandom(4))
+                continue
+            if opcode == 0xA:                     # pong
+                continue
+            if opcode in (0x1, 0x0):
+                if fin:
+                    return payload.decode("utf-8", "replace")
+                buffered = payload
+                while True:                        # 分片：一直读到 FIN
+                    b1, b2 = self._read(2)
+                    n = b2 & 0x7F
+                    if n == 126:
+                        n = struct.unpack(">H", self._read(2))[0]
+                    elif n == 127:
+                        n = struct.unpack(">Q", self._read(8))[0]
+                    buffered += self._read(n)
+                    if b1 & 0x80:
+                        return buffered.decode("utf-8", "replace")
+
+    def close(self) -> None:
+        try:
+            self.sock.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+class _Cdp:
+    """CDP 会话：一次只发一条命令（窗口操作就够用）。"""
+
+    def __init__(self, port: int, timeout: float = _CDP_TIMEOUT):
+        self.port = int(port)
+        self.timeout = timeout
+        info = _http_json(self.port, "/json/version", timeout=timeout)
+        ws_url = (info or {}).get("webSocketDebuggerUrl") or ""
+        if not ws_url:
+            raise RuntimeError("这个浏览器没有开调试端口")
+        self.sock = _CdpSocket(ws_url, timeout=timeout)
+        self._id = 0
+
+    def call(self, method: str, params: dict = None, timeout: float = None) -> dict:
+        self._id += 1
+        msg_id = self._id
+        self.sock.send_text(json.dumps({"id": msg_id, "method": method,
+                                        "params": params or {}}, ensure_ascii=False))
+        old = self.sock.sock.gettimeout()
+        self.sock.sock.settimeout(timeout or self.timeout)
+        try:
+            while True:
+                data = json.loads(self.sock.recv_text() or "{}")
+                if data.get("id") != msg_id:
+                    continue                        # 事件消息，跳过
+                if data.get("error"):
+                    raise RuntimeError(data["error"].get("message") or "CDP 调用失败")
+                return data.get("result") or {}
+        finally:
+            try:
+                self.sock.sock.settimeout(old)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def close(self) -> None:
+        self.sock.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+def _http_json(port: int, path: str, timeout: float = 3.0):
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:%d%s" % (int(port), path),
+                                     timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8", "replace") or "null")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def cdp_ready(port: int) -> bool:
+    return bool(_http_json(port, "/json/version", timeout=1.5))
+
+
+def wait_cdp(port: int, timeout: float = 3.0) -> bool:
+    """等浏览器把调试端口开起来（点完「🌐 网页」马上点「挂起」也不至于报错）。"""
+    deadline = time.time() + max(0.0, timeout)
+    while time.time() < deadline:
+        if cdp_ready(port):
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def first_page_target(port: int):
+    pages = _http_json(port, "/json/list", timeout=3) or []
+    for t in pages:
+        if t.get("type") == "page" and t.get("webSocketDebuggerUrl"):
+            return t
+    return None
+
+
+def browser_window_action(port: int, action: str) -> dict:
+    """park（最小化=挂起）/ activate（还原并聚焦）/ close（关掉整个浏览器）。"""
+    action = str(action or "").lower()
+    out = {"ok": False, "action": action, "error": ""}
+    page = first_page_target(port)
+    if not page:
+        out["error"] = "连不上这个账号的浏览器（可能已经关掉了）"
+        return out
+    try:
+        with _Cdp(port) as cdp:
+            if action == "close":
+                try:
+                    cdp.call("Browser.close", {}, timeout=3)
+                except Exception:                # 关窗口时连接会断，属正常
+                    pass
+                out["ok"] = True
+                return out
+            win = cdp.call("Browser.getWindowForTarget", {"targetId": page["id"]})
+            window_id = win.get("windowId")
+            if window_id is None:
+                out["error"] = "拿不到窗口 id"
+                return out
+            state = "minimized" if action == "park" else "normal"
+            cdp.call("Browser.setWindowBounds",
+                     {"windowId": window_id, "bounds": {"windowState": state}})
+            if action != "park":
+                try:
+                    cdp.call("Target.activateTarget", {"targetId": page["id"]})
+                except Exception:                # 聚焦失败不影响「已还原」
+                    pass
+            out.update(ok=True, window_id=window_id)
+            return out
+    except Exception as exc:  # noqa: BLE001
+        out["error"] = str(exc)
+        return out
+
+
+def _spawn_detached(cmd: list):
     kwargs = {}
     if platform.system() == "Windows":
         kwargs["creationflags"] = 0x00000008      # DETACHED_PROCESS
     else:
         kwargs["start_new_session"] = True
-    subprocess.Popen(cmd, **kwargs)
+    return subprocess.Popen(cmd, **kwargs)
 
 
 def open_extension_manager(browser: str = "", roots: list = None,
@@ -2168,8 +2482,8 @@ def account_browser_profile(account_id: int) -> str:
 
 
 def build_account_browser_command(browser: str, profile_dir: str, ext_dirs: list,
-                                  url: str, proxy_arg: str = "") -> list:
-    """带扩展 + 代理的账号窗口启动参数（单独抽出来便于不开浏览器自检）。"""
+                                  url: str, proxy_arg: str = "", debug_port: int = 0) -> list:
+    """带扩展 + 代理 + 调试端口的账号窗口启动参数（抽出来便于不开浏览器自检）。"""
     joined = ",".join(ext_dirs)
     cmd = [
         browser,
@@ -2180,6 +2494,10 @@ def build_account_browser_command(browser: str, profile_dir: str, ext_dirs: list
         "--disable-extensions-except=" + joined,
         "--load-extension=" + joined,
     ]
+    if debug_port:
+        # 只开在本机回环上：给「挂起 / 切换 / 关闭」用（CDP），不对外
+        cmd += ["--remote-debugging-address=127.0.0.1",
+                "--remote-debugging-port=%d" % int(debug_port)]
     if proxy_arg:
         cmd += ["--proxy-server=" + proxy_arg, _PROXY_BYPASS]
     cmd.append(url)
@@ -2187,7 +2505,8 @@ def build_account_browser_command(browser: str, profile_dir: str, ext_dirs: list
 
 
 def launch_account_browser(account_id: int, url: str, ext_roots: list = None,
-                           browser: str = "", proxy_arg: str = "") -> dict:
+                           browser: str = "", proxy_arg: str = "",
+                           debug_port: int = 0) -> dict:
     """用带扩展的 Edge/Chrome 打开「这个账号」的 Dola 页面。
 
     登录态怎么来的：启动参数里带的是 dola.com 的一次性 token；扩展
@@ -2221,17 +2540,20 @@ def launch_account_browser(account_id: int, url: str, ext_roots: list = None,
     except Exception as exc:  # noqa: BLE001
         info["error"] = "创建浏览器 profile 失败：%s" % exc
         return info
+    debug_port = int(debug_port or free_port())
     cmd = build_account_browser_command(exe, profile, [e["path"] for e in exts],
-                                        url, proxy_arg=proxy_arg)
+                                        url, proxy_arg=proxy_arg, debug_port=debug_port)
     info["browser"] = exe
     info["browser_version"] = browser_version(exe)
-    info["command"] = " ".join(cmd)
+    info["debug_port"] = debug_port
     try:
-        _spawn_detached(cmd)
+        proc = _spawn_detached(cmd)
     except Exception as exc:  # noqa: BLE001
         info["error"] = "启动浏览器失败：%s" % exc
         return info
-    info["ok"] = True
+    info.update(ok=True, pid=getattr(proc, "pid", 0), command=" ".join(cmd))
+    # 等调试端口就绪（最多 3 秒）：后面的「挂起 / 切换」都要用它
+    info["cdp"] = wait_cdp(debug_port, 3.0)
     return info
 
 

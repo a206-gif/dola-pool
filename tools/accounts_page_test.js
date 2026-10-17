@@ -190,6 +190,16 @@ const BASE = process.env.DOLA_BASE || 'http://127.0.0.1:8000';
   out.push(['点「🪟 原生」仍然走老的原生窗口', accountNativeCalls === 1, '原生 ' + accountNativeCalls + ' 次']);
   out.push(['token 用完后前端会轮询状态并弹「已登录」', /已用 CK 登录/.test(d.body.textContent), '']);
 
+  // ⑥ 带扩展的浏览器窗口：也要出现在「窗口」列，并带 🧩 标记
+  sessions.sessions[0].kind = 'browser';
+  sessions.sessions[0].state = 'parked';
+  sessions.sessions[0].note = '带扩展的浏览器 · 已挂起在后台';
+  await w.eval('refreshSessions()');
+  await new Promise(r => setTimeout(r, 400));
+  out.push(['带扩展的窗口在「窗口」列有 🧩 标记和「切换过去」',
+            /🧩/.test($('sess-1').textContent) && /切换过去/.test($('sess-1').textContent),
+            $('sess-1').textContent.slice(0, 60)]);
+
   out.push(['无 JS 错误', errors.length === 0, errors.slice(0, 2).join(' | ')]);
 
   let bad = 0;

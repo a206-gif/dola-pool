@@ -55,7 +55,7 @@ from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
                                RedirectResponse, Response)
 from fastapi.staticfiles import StaticFiles
 
-VERSION = "2.0.17"
+VERSION = "2.0.18"
 
 # --------------------------------------------------------------------------
 # 目录与配置
@@ -305,7 +305,8 @@ _desktop_sessions: dict = {}
 SESSION_STATES = ("closed", "preparing", "running", "parked", "stale")
 
 
-def session_update(account_id, state: str, note: str = "", title: str = "", url: str = "") -> None:
+def session_update(account_id, state: str, note: str = "", title: str = "",
+                   url: str = "", kind: str = "") -> None:
     """桌面版窗口会话状态回写（由 desktop.py 调用）。"""
     try:
         account_id = int(account_id)
@@ -318,6 +319,7 @@ def session_update(account_id, state: str, note: str = "", title: str = "", url:
         state = "closed"
     _desktop_sessions[account_id] = {
         "state": state, "note": note, "title": title, "url": url, "updated_at": utcnow(),
+        "kind": kind or (_desktop_sessions.get(account_id) or {}).get("kind") or "native",
     }
 
 
@@ -3134,7 +3136,7 @@ def api_account_web(account_id: int):
         try:
             # pywebview 要求「start() 之后 + 非主线程」才会立刻建窗口，
             # 这里和 restart / quit 一样丢到线程里执行
-            payload = dict(payload, action="open")
+            payload = dict(payload, action="open", kind="native")
             threading.Thread(target=_control_hook, args=("session", payload), daemon=True).start()
             return {"ok": True, "mode": "desktop", "url": payload["url"], "title": payload["title"],
                     "real": payload["real"], "cookie_domain": payload["domain"]}
@@ -3364,7 +3366,8 @@ def api_desktop_sessions() -> dict:
     for account_id, info in sorted(_desktop_sessions.items()):
         items.append({"account_id": account_id, "name": names.get(account_id, ""),
                       "state": info.get("state") or "closed", "note": info.get("note") or "",
-                      "title": info.get("title") or "", "updated_at": info.get("updated_at") or ""})
+                      "title": info.get("title") or "", "updated_at": info.get("updated_at") or "",
+                      "kind": info.get("kind") or "native"})
     return {"mode": "desktop" if (DESKTOP_MODE and _control_hook) else "web",
             "can_manage": bool(DESKTOP_MODE and _control_hook), "sessions": items}
 

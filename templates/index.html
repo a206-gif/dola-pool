@@ -1089,7 +1089,8 @@ function sessionCell(a){
   }
   const s = (state.sessions && state.sessions[a.id]) || {state:'closed'};
   const st = s.state || 'closed';
-  const label = {closed:'已关闭', preparing:'正在准备', running:'前台显示中', parked:'后台挂起', stale:'挂起（需重连）'}[st] || st;
+  const extTag = s.kind === 'browser' ? '🧩 ' : '';
+  const label = extTag + ({closed:'已关闭', preparing:'正在准备', running:'前台显示中', parked:'后台挂起', stale:'挂起（需重连）'}[st] || st);
   const cls = st === 'running' ? 'ok' : st === 'parked' ? 'dim' : st === 'stale' ? 'bad' : st === 'preparing' ? 'dim' : 'dim';
   let btns = '';
   if (st === 'closed') {
@@ -1116,7 +1117,8 @@ function sessionList(){
     .sort((x, y) => (order[x.state] ?? 9) - (order[y.state] ?? 9) || x.account_id - y.account_id)
     .map(s => {
       const st = s.state || 'closed';
-      const label = {running:'▶ 运行中', preparing:'◌ 准备中', parked:'❚❚ 已挂起', stale:'⚠ 需重连'}[st] || st;
+      const label = (s.kind === 'browser' ? '🧩 ' : '') +
+        ({running:'▶ 运行中', preparing:'◌ 准备中', parked:'❚❚ 已挂起', stale:'⚠ 需重连'}[st] || st);
       const cls = st === 'running' ? 'ok' : st === 'stale' ? 'bad' : 'dim';
       const acc = (state.accounts || []).find(a => a.id === s.account_id) || {};
       const act = st === 'running'
@@ -1288,6 +1290,7 @@ async function watchBridgeLogin(token, id){
     catch(e){ return; }
     if (st && st.used){
       toast('✅ #' + id + ' 已用 CK 登录（写入 ' + st.count + ' 个 Cookie）');
+      if (typeof refreshSessions === 'function') refreshSessions();
       return;
     }
     if (st && st.known === false) return;
